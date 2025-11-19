@@ -1,0 +1,13 @@
+[package]
+name = "deimos-rising"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]  # build a Windows .dll
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
