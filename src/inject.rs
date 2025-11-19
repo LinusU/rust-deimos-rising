@@ -2,7 +2,6 @@ use std::ffi::c_void;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    fn GetModuleHandleA(lpModuleName: *const u8) -> *mut c_void;
     fn VirtualProtect(
         lpAddress: *mut c_void,
         dwSize: usize,
@@ -23,11 +22,7 @@ const EXE_IMAGE_BASE: usize = 0x00400000;
 /// `new_fn` is the function pointer (e.g. `_GetDirectXVersion as usize`).
 pub unsafe fn replace_exe_function(orig_va: usize, new_fn: usize) {
     // 1. Get the base address of the main module in this process.
-    //    Passing NULL gets the handle of the EXE.
-    let exe_base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
-    if exe_base == 0 {
-        panic!("GetModuleHandleA failed");
-    }
+    let exe_base = crate::exe::exe_base();
 
     // 2. Convert the Ghidra VA to an RVA, then to the real runtime address.
     //
