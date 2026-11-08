@@ -875,6 +875,9 @@ fn flag_census() {
             ("do_burst", u.do_burst),
             ("do_implode", u.do_implode),
             ("destruct_draw_to_terrain", u.destruct_draw_to_terrain),
+            ("init_hunts_closest", u.initially_hunts_closest_player),
+            ("use_owner_heading", u.use_owner_heading),
+            ("heading_set_in_editor", u.initial_heading_set_in_editor),
         ] {
             if v {
                 *counts.entry(n).or_default() += 1;
