@@ -431,6 +431,101 @@ pub struct BlurSprite {
     key: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Weapon crosshair (G_WeaponHandler draw list): per-player reticle from the
+// ground weapon def; locked frame when an enemy is under the ship.
+// ---------------------------------------------------------------------------
+
+#[derive(Component)]
+pub struct Crosshair {
+    pub slot: usize,
+}
+
+/// Sync the per-player weapon crosshair sprites.
+pub fn sync_crosshair(
+    mut commands: Commands,
+    sim_res: Res<GameSim>,
+    flow: Res<Flow>,
+    mut assets: ResMut<GameAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut book: ResMut<TextureBook>,
+    mut q: Query<(Entity, &Crosshair, &mut Sprite, &mut Transform)>,
+) {
+    let sim = &sim_res.0;
+    if flow.state != FlowState::Playing {
+        for (e, _, _, _) in q.iter() {
+            commands.entity(e).despawn();
+        }
+        return;
+    }
+    for slot in 0..2 {
+        let Some(p) = sim.players[slot].as_ref() else { continue };
+        if p.phase != PlayerPhase::Active {
+            continue;
+        }
+        let Some(wdef) = assets.weapons.get(&p.ground_weapon).cloned() else { continue };
+        if wdef.crosshair_face == crate::pak::NONE_ID {
+            continue;
+        }
+        // Locked frame when a ground-class enemy sits under the player
+        // (original: player loc inside entity bounds → Crosshair_Hilite).
+        let ps = Vec2::new(p.screen.x, p.screen.y);
+        let locked = sim.entities.iter().any(|e| {
+            !e.dead
+                && assets
+                    .units
+                    .get(&e.unit)
+                    .map(|d| d.terrain_effect)
+                    .unwrap_or(false)
+                && {
+                    let es = e.screen_pos(sim);
+                    (es.x - ps.x).abs() < 40.0 && es.y > ps.y - 10.0 && es.y < ps.y + 160.0
+                }
+        });
+        let (rid, frame) = if locked
+            && wdef.crosshair_locked_face != crate::pak::NONE_ID
+        {
+            (wdef.crosshair_locked_face, wdef.crosshair_locked_frame)
+        } else {
+            (wdef.crosshair_face, wdef.crosshair_frame)
+        };
+        let Some(handle) = frame_image(&mut *assets, &mut *images, &mut *book, rid, frame) else { continue };
+        // Crosshair offsets are screen-space; +y is down-screen.
+        let pos = Vec2::new(
+            ps.x + wdef.crosshair_x_offset as f32,
+            ps.y + wdef.crosshair_y_offset as f32,
+        );
+        let wpos = to_world(pos.x, pos.y);
+        let mut found = None;
+        for (be, ch, sprite, transform) in q.iter_mut() {
+            if ch.slot == slot {
+                found = Some((sprite, transform));
+                break;
+            }
+        }
+        if let Some((mut sprite, mut transform)) = found {
+            transform.translation = wpos;
+            sprite.image = handle;
+        } else {
+            commands.spawn((
+                Sprite::from_image(handle),
+                Transform::from_translation(wpos),
+                Crosshair { slot },
+            ));
+        }
+    }
+    // Despawn crosshairs for inactive/missing players.
+    for (be, ch, _, _) in q.iter() {
+        let active = sim.players[ch.slot]
+            .as_ref()
+            .map(|p| p.phase == PlayerPhase::Active)
+            .unwrap_or(false);
+        if !active {
+            commands.entity(be).despawn();
+        }
+    }
+}
+
 /// Input state gathered from Bevy keys.
 #[derive(Resource, Default)]
 pub struct FrameInput {
@@ -745,22 +840,26 @@ use bevy::window::{Window, WindowPlugin, WindowResolution};
 
 /// Build the input state from keyboard state.
 fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut fi: ResMut<FrameInput>) {
-    // P1: WASD + Space fire + LeftShift bomb. P2: Arrows + Enter fire + RShift bomb.
+    // Documented defaults (Deimos Rising Player Guide): P1 = Arrows move,
+    // LCtrl fire air, LShift select weapon, LAlt fire ground. P2 shares the
+    // keyboard on the left side: WASD move, Space fire, Q select, Z ground.
     fi.p1 = SlotInput {
+        up: keys.pressed(KeyCode::ArrowUp),
+        down: keys.pressed(KeyCode::ArrowDown),
+        left: keys.pressed(KeyCode::ArrowLeft),
+        right: keys.pressed(KeyCode::ArrowRight),
+        fire: keys.pressed(KeyCode::ControlLeft),
+        bomb: keys.pressed(KeyCode::AltLeft),
+        cycle: keys.just_pressed(KeyCode::ShiftLeft),
+    };
+    fi.p2 = SlotInput {
         up: keys.pressed(KeyCode::KeyW),
         down: keys.pressed(KeyCode::KeyS),
         left: keys.pressed(KeyCode::KeyA),
         right: keys.pressed(KeyCode::KeyD),
         fire: keys.pressed(KeyCode::Space),
-        bomb: keys.pressed(KeyCode::ShiftLeft),
-    };
-    fi.p2 = SlotInput {
-        up: keys.pressed(KeyCode::ArrowUp),
-        down: keys.pressed(KeyCode::ArrowDown),
-        left: keys.pressed(KeyCode::ArrowLeft),
-        right: keys.pressed(KeyCode::ArrowRight),
-        fire: keys.pressed(KeyCode::Enter) || keys.pressed(KeyCode::NumpadEnter),
-        bomb: keys.pressed(KeyCode::ShiftRight),
+        bomb: keys.pressed(KeyCode::KeyZ),
+        cycle: keys.just_pressed(KeyCode::KeyQ),
     };
 }
 
@@ -1105,6 +1204,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sync_terrain,
                 sync_particles,
                 sync_blurs,
+                sync_crosshair,
                 sync_entities,
                 sync_players,
                 hud_system,

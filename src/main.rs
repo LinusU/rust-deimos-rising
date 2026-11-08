@@ -546,6 +546,7 @@ fn test_sim() {
                 right: (t * 0.03).cos() < -0.5,
                 fire,
                 bomb: false,
+                cycle: false,
             },
             p2: SlotInput::default(),
         };

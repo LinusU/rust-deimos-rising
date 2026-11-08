@@ -1147,6 +1147,18 @@ impl Sim {
         // ground = bomb held).
         self.step_powerup(assets, slot, false, inp.fire);
         self.step_powerup(assets, slot, true, inp.bomb);
+        // Select Air Weapon key: cycle to the next available PEAA weapon
+        // (G_WeaponHandler inC → GetNextRefPtrByType).
+        if inp.cycle {
+            if let Some(p) = self.players[slot].as_mut() {
+                if let Some(w) = next_weapon_after(assets, id("PEAA"), p.air_weapon, self.level_number) {
+                    if w != p.air_weapon {
+                        p.air_weapon = w;
+                        self.events.push(SimEvent::PlayerEvent(slot, "weapon_cycle"));
+                    }
+                }
+            }
+        }
     }
 
     fn two_player_active(&self) -> bool {
@@ -2847,6 +2859,8 @@ pub struct SlotInput {
     pub right: bool,
     pub fire: bool,
     pub bomb: bool,
+    /// Select/cycle air weapon (original input[6], inC).
+    pub cycle: bool,
 }
 
 impl PlayerInput {
