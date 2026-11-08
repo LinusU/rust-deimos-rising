@@ -754,7 +754,9 @@ impl Sim {
             lives: def.life_num_initial,
             score: 0,
             money: 0,
-            shields: 0.0,
+            // Shields_Reset(true) at level start: m_shieldStart =
+            // defaultShieldPercentage.
+            shields: def.default_shield_percentage as f64,
             power: 0.0,
             air_weapon: id("aiic"),  // Ion Cannon
             ground_weapon: id("plbo"), // Plasma Bomb
@@ -1863,9 +1865,19 @@ impl Sim {
             }
             PlayerPhase::Dying => {
                 p.phase_time += 1;
-                if p.phase_time >= def.death_duration as u32 {
+                // Priv_ProcessState state 3: finalDyingTime on the last
+                // life, dyingTime otherwise. The life is consumed when the
+                // death anim completes, not at the hit.
+                let dur = if p.lives == 1 {
+                    def.final_dying_time
+                } else {
+                    def.dying_time
+                };
+                if p.phase_time >= dur.max(1) as u32 {
+                    p.lives = (p.lives - 1).max(0);
                     if p.lives > 0 {
-                        // Respawn.
+                        // Priv_Appear: reposition, reset shields and weapon
+                        // charge state, replay the entry effect.
                         p.phase = PlayerPhase::Active;
                         let (ex, ey) = if two_p {
                             (def.entry_multi_start_x as f32, def.entry_multi_start_y as f32)
@@ -1874,12 +1886,32 @@ impl Sim {
                         };
                         p.screen = Vec2::new(PLAY_LEFT + ex, ey);
                         p.vel = Vec2::ZERO;
-                        p.shields = 100.0;
+                        p.shields = def.default_shield_percentage as f64;
                         p.invuln = def.entry_invulnerability_time as u32;
                         p.phase_time = 0;
+                        p.air_power = PowerupRt::default();
+                        p.gnd_power = PowerupRt::default();
+                        p.power = 0.0;
+                        p.gpower = 0.0;
+                        if def.entry_spawn != NONE_ID {
+                            let w = Vec2::new(
+                                p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
+                                self.scroll + SCREEN_H - p.screen.y,
+                            );
+                            self.request_spawn(SpawnReq {
+                                unit: def.entry_spawn,
+                                pos: w,
+                                heading: None,
+                                owner: usize::MAX,
+                                spawner_player: slot as i32,
+                                stationary: false,
+                                state: None,
+                            });
+                        }
                     } else {
                         p.phase = PlayerPhase::Dead;
                         p.phase_time = 0;
+                        self.events.push(SimEvent::PlayerEvent(slot, "dead"));
                     }
                 }
                 return;
@@ -3715,28 +3747,28 @@ impl Sim {
                 state: None,
             });
         }
-        // Money burst on ship destruction (G_Player::Destroy): remaining
-        // money converts to coin pickups scattered at the wreck, then the
-        // purse resets. Collected after the `p` borrow ends.
+        // Money burst + death-spawn object on ship destruction
+        // (G_Player::Destroy): remaining money converts to coin pickups
+        // scattered at the wreck, then the purse resets. Collected after
+        // the `p` borrow ends.
         let mut money_burst: Option<(i64, Vec2)> = None;
+        let mut death_spawn: Option<(ResId, Vec2)> = None;
         let p = self.players[slot].as_mut().unwrap();
         if p.shields < 0.0 {
             p.shields = 0.0;
-            p.lives -= 1;
+            let pos = Vec2::new(
+                p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
+                self.scroll + SCREEN_H - p.screen.y,
+            );
+            death_spawn = Some((pdef.death_spawn, pos));
             if p.money > 0 {
-                let wx = p.screen.x + self.cam_x - WORLD_TO_SCREEN_X;
-                let wy = self.scroll + SCREEN_H - p.screen.y;
-                money_burst = Some((p.money, Vec2::new(wx, wy)));
+                money_burst = Some((p.money, pos));
                 p.money = 0;
             }
             self.events.push(SimEvent::PlayerEvent(slot, "shield_break"));
-            if p.lives <= 0 {
-                p.phase = PlayerPhase::Dead;
-                self.events.push(SimEvent::PlayerEvent(slot, "dead"));
-            } else {
-                p.phase = PlayerPhase::Dying;
-                p.phase_time = 0;
-            }
+            // State 3 (dying); the life is consumed when the anim ends.
+            p.phase = PlayerPhase::Dying;
+            p.phase_time = 0;
         } else if amount > 0.0 && !p.shield_warned
             && (p.shields as i64) <= pdef.shield_warning_percentage
             && pdef.active_shield_warning_object != NONE_ID
@@ -3753,6 +3785,20 @@ impl Sim {
                 stationary: true,
                 state: None,
             });
+        }
+        // Death-spawn object (m_field0xba, spawned by G_Player::Destroy).
+        if let Some((unit, pos)) = death_spawn {
+            if unit != NONE_ID {
+                self.request_spawn(SpawnReq {
+                    unit,
+                    pos,
+                    heading: None,
+                    owner: usize::MAX,
+                    spawner_player: slot as i32,
+                    stationary: true,
+                    state: None,
+                });
+            }
         }
         // Burst the purse into coin pickups (50/10/5/1 denominations).
         if let Some((mut money, pos)) = money_burst {
