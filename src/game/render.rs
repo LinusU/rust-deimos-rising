@@ -1661,6 +1661,31 @@ pub fn sync_menu(
     }
 }
 
+/// Mission order recovered from the retail exe's `g_demoLevelNames`
+/// table: 12×64-byte slots of `#indentifier_STR` values, nibble-swap +
+/// XOR-0xFF encrypted (the same `U_Utils_String_Encrypt` cipher used for
+/// pak strings). Slot order is campaign order — Lucena (Mariner
+/// Valley) is sector 1, matching the player guide.
+const MISSION_ORDER: [&str; 12] = [
+    "Lucena", "Yippe", "Vista", "Swoop", "Conrad", "Delos", "Sparta",
+    "Saratoga", "Hannibal", "Leonidas", "Thebes", "Yamato",
+];
+
+/// Campaign position (0-based) of a level rid; unknown ids sort last.
+fn mission_rank(assets: &GameAssets, rid: ResId) -> usize {
+    assets
+        .levels
+        .get(&rid)
+        .and_then(|l| MISSION_ORDER.iter().position(|id| l.identifier == *id))
+        .unwrap_or(usize::MAX)
+}
+
+fn mission_sorted_level_ids(assets: &GameAssets) -> Vec<ResId> {
+    let mut ids: Vec<ResId> = assets.levels.keys().copied().collect();
+    ids.sort_by_key(|&r| mission_rank(assets, r));
+    ids
+}
+
 /// Start a level: build Sim + spawn players.
 pub fn start_level(
     assets: &mut GameAssets,
@@ -1670,9 +1695,8 @@ pub fn start_level(
 ) -> Option<Sim> {
     let level = assets.levels.get(&level_id)?.clone();
     let mut sim = Sim::new(level, level_id, seed);
-    // 1-based level number for weapon level-availability filtering.
-    let mut level_ids: Vec<ResId> = assets.levels.keys().copied().collect();
-    level_ids.sort();
+    // 1-based mission number for weapon level-availability filtering.
+    let level_ids = mission_sorted_level_ids(assets);
     sim.level_number = level_ids.iter().position(|&r| r == level_id).map(|i| i as i64 + 1).unwrap_or(1);
     sim.phase = crate::game::sim::Phase::Playing;
     for slot in 0..players.min(2) {
@@ -1684,8 +1708,7 @@ pub fn start_level(
 /// Run the game. `assets` must already be opened + `load_all_data()` called.
 pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
     let mut assets = assets;
-    let mut level_ids: Vec<ResId> = assets.levels.keys().copied().collect();
-    level_ids.sort();
+    let mut level_ids = mission_sorted_level_ids(&assets);
     if level_ids.is_empty() {
         level_ids.push(level_id);
     }

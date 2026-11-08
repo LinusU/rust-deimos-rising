@@ -529,14 +529,14 @@ fn test_strings() {
     for k in keys {
         let s = &a.strings[&k];
         println!("=== stli {:08x} ({} strings)", k, s.strings.len());
-        for (i, line) in s.strings.iter().enumerate().take(12) {
+        for (i, line) in s.strings.iter().enumerate() {
             println!("  [{}] {}", i, line);
         }
     }
     for (rid, l) in &a.levels {
         println!(
-            "LEVEL {:08x} name={:?} briefing={:08x} music={:08x} objs={}",
-            rid, l.name, l.briefing, l.music, l.objects.len()
+            "LEVEL {:08x} name={:?} id={:?} briefing={:08x} music={:08x} objs={}",
+            rid, l.name, l.identifier, l.briefing, l.music, l.objects.len()
         );
         if l.briefing != pak::NONE_ID {
             if let Some(s) = a.strings.get(&l.briefing) {
