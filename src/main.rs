@@ -148,6 +148,200 @@ fn dump_data() {
 }
 
 /// List the permanent list resources (flli/reli/coli/edli/stli) with names.
+fn film_probe() {
+    let dir = data_dir();
+    let mut set = PakSet::open_dir(&dir).expect("open paks");
+    let entries: Vec<_> = set.entries_of_tag(Tag::Film).into_iter().map(|e| (e.rid, e.display.clone())).collect();
+    for (rid, display) in entries {
+        let Some(data) = set.read_raw(Tag::Film, rid) else { continue };
+        println!("=== {} {:08x} ({} bytes)", display, rid, data.len());
+        if data.len() < 16 {
+            continue;
+        }
+        let u32be = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        let u32le = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        // Version 0x2715 detects endianness (decomp SwapULong fallback).
+        let le_file = u32le(0) == 0x2715;
+        let g = |o: usize| if le_file { u32le(o) } else { u32be(o) };
+        println!("  version={:#x} seed={:#x} level={:08x} gameType={}", g(0), g(4), g(8), g(12));
+        for p in 0..2 {
+            let base = 16 + p * 0x4eac;
+            if base + 12 > data.len() {
+                break;
+            }
+            let frames = g(base);
+            let field1 = g(base + 4);
+            let field2 = g(base + 8);
+            let input = &data[base + 12..(base + 12 + 0x4ea0).min(data.len())];
+            let n = (frames as usize).min(input.len());
+            // Per-bit on counts + pairwise co-occurrence.
+            let mut on = [0usize; 7];
+            let mut both = [[0usize; 7]; 7];
+            for &b in input.iter().take(n) {
+                for i in 0..7 {
+                    if b & (1 << i) != 0 {
+                        on[i] += 1;
+                        for j in 0..7 {
+                            if i != j && b & (1 << j) != 0 {
+                                both[i][j] += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            println!(
+                "  p{}: frames={} field1={:#x} field2={:08x} bits_on={:?}",
+                p, frames, field1, field2, on
+            );
+            // Print co-occurrence matrix compactly.
+            for i in 0..7 {
+                let row: Vec<String> = (0..7)
+                    .map(|j| format!("{:>5}", if i == j { "-".to_string() } else { both[i][j].to_string() }))
+                    .collect();
+                println!("    bit{}: {}", i, row.join(" "));
+            }
+        }
+    }
+}
+
+/// Brute-force the retail film bit→action mapping using the score oracle:
+/// field1 records score+0xb3ac2 at the last frame, and the sim is
+/// deterministic given the film seed.
+fn film_test() {
+    use game::sim::{PlayerInput, Sim, SlotInput};
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    // --filmtest <rid-hex> [--map b0,b1,...,b6]
+    let args: Vec<String> = std::env::args().collect();
+    let pos = args.iter().position(|x| x == "--filmtest").unwrap();
+    let film_rid = u32::from_str_radix(&args[pos + 1], 16).unwrap();
+    let film = a.film(film_rid).expect("film");
+    println!(
+        "film {:08x}: level={:08x} seed={:#x} gt={} frames={:?} score_marks={:?}",
+        film_rid, film.level_id, film.seed, film.game_type, film.frames, film.score_marks
+    );
+    // Debug single replay: --filmedbg (with --filmtest) shows per-10s status.
+    if args.iter().any(|a| a == "--filmedbg") {
+        let film = a.film(film_rid).expect("film");
+        let players = if film.frames[1] > 0 { 2 } else { 1 };
+        // Recovered mapping (G_Film bit -> input byte -> action):
+        // bit0=left bit1=right bit2=up bit3=down bit4=fire bit5=ground-fire bit6=cycle.
+        let map = [2usize, 3, 0, 1, 4, 5, 6];
+        let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64).expect("level");
+        let n = film.frames[0].min(20000);
+        for t in 0..n {
+            let mk = |p: usize| -> SlotInput {
+                let b = film.inputs[p].get(t).copied().unwrap_or(0);
+                let mut s = SlotInput::default();
+                for (bit, &f) in map.iter().enumerate() {
+                    if b & (1 << bit) != 0 {
+                        match f {
+                            0 => s.up = true, 1 => s.down = true, 2 => s.left = true,
+                            3 => s.right = true, 4 => s.fire = true, 5 => s.bomb = true,
+                            _ => s.cycle = true,
+                        }
+                    }
+                }
+                s
+            };
+            sim.advance(&a, &PlayerInput { p1: mk(0), p2: mk(1) }, 1.0 / 60.0);
+            if t % 600 == 599 {
+                let p = sim.players[0].as_ref().unwrap();
+                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} ent={}",
+                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.entities.len());
+            }
+        }
+        return;
+    }
+    let players = if film.frames[1] > 0 { 2 } else { 1 };
+
+    // Field ids: 0=up 1=down 2=left 3=right 4=fire 5=bomb 6=cycle.
+    // bits {0,1} and {2,3} are the two axis pairs; bits {4,5,6} are the
+    // action buttons in some order. Try every axis/order/action assignment.
+    //
+    // NOTE: the true retail mapping is already recovered from the decomp —
+    // G_Film::GetInputs permutes the byte into m_unk0..6 and G_Player reads
+    // inputs[0..6] = up/right/down/left/air-fire/ground-fire/cycle, giving
+    // map=[2,3,0,1,4,5,6] (bit0=left bit1=right bit2=up bit3=down
+    // bit4=fire bit5=ground-fire bit6=cycle). Exact score replay still fails
+    // because rand()-stream parity needs every call site ordered like the
+    // original (spawn scatter, flee table, player respawn rolls are not all
+    // ported), so this search remains a diagnostic, not an oracle.
+    let perms = [
+        [4usize, 5, 6],
+        [4, 6, 5],
+        [5, 4, 6],
+        [5, 6, 4],
+        [6, 4, 5],
+        [6, 5, 4],
+    ];
+    let mut cands: Vec<[usize; 7]> = Vec::new();
+    for swap_axes in 0..2 {
+        for s0 in 0..2 {
+            for s1 in 0..2 {
+                let (ax, ay) = if swap_axes == 0 {
+                    ((0usize, 1usize), (2usize, 3usize))
+                } else {
+                    ((2usize, 3usize), (0usize, 1usize))
+                };
+                let mut map = [usize::MAX; 7];
+                map[0] = if s0 == 0 { ax.0 } else { ax.1 };
+                map[1] = if s0 == 0 { ax.1 } else { ax.0 };
+                map[2] = if s1 == 0 { ay.0 } else { ay.1 };
+                map[3] = if s1 == 0 { ay.1 } else { ay.0 };
+                for perm in perms {
+                    let mut m = map;
+                    m[4] = perm[0];
+                    m[5] = perm[1];
+                    m[6] = perm[2];
+                    cands.push(m);
+                }
+            }
+        }
+    }
+    let mut best: Vec<(i64, i64, [usize; 7])> = Vec::new();
+    for map in cands {
+        // Replay.
+        let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64)
+            .expect("level");
+        let n = film.frames[0].min(20000);
+        for t in 0..n {
+            let mk = |p: usize| -> SlotInput {
+                let b = film.inputs[p].get(t).copied().unwrap_or(0);
+                let mut s = SlotInput::default();
+                for (bit, &f) in map.iter().enumerate() {
+                    if b & (1 << bit) != 0 {
+                        match f {
+                            0 => s.up = true,
+                            1 => s.down = true,
+                            2 => s.left = true,
+                            3 => s.right = true,
+                            4 => s.fire = true,
+                            5 => s.bomb = true,
+                            _ => s.cycle = true,
+                        }
+                    }
+                }
+                s
+            };
+            let inp = PlayerInput { p1: mk(0), p2: mk(1) };
+            sim.advance(&a, &inp, 1.0 / 60.0);
+        }
+        let score = sim.players[0].as_ref().map(|p| p.score).unwrap_or(-1);
+        let alive = sim.players[0]
+            .as_ref()
+            .map(|p| p.lives)
+            .unwrap_or(0);
+        best.push((score, alive, map));
+    }
+    best.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    for (s, l, m) in best.iter().take(10) {
+        println!("score={:>8} lives={} diff={:>8} map={:?}", s, l, (s - film.score_marks[0]).abs(), m);
+    }
+    println!("expected score_marks={:?}", film.score_marks);
+}
+
 fn perm_probe() {
     let dir = data_dir();
     let set = PakSet::open_dir(&dir).expect("open paks");
@@ -245,6 +439,14 @@ fn main() {
     }
     if args.iter().any(|a| a == "--perm") {
         perm_probe();
+        return;
+    }
+    if args.iter().any(|a| a == "--films") {
+        film_probe();
+        return;
+    }
+    if args.iter().any(|a| a == "--filmtest") {
+        film_test();
         return;
     }
     if args.iter().any(|a| a == "--pickups") {

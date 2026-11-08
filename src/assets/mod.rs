@@ -67,7 +67,67 @@ pub struct GameAssets {
     pub text_formats: HashMap<ResId, crate::data::TextFormat>,
 }
 
+/// Parsed `film` resource (G_Film): header + per-player 7-bit input
+/// streams, one byte per frame. Numeric longs are big-endian except the
+/// fourCC-style ID fields (levelID/field2), which read little-endian.
+pub struct FilmData {
+    pub seed: u32,
+    pub level_id: ResId,
+    /// Raw game-type field (1 = single player in retail demos).
+    pub game_type: u32,
+    /// `field1` of each record = final score + 0xb3ac2 (score oracle).
+    pub score_marks: [i64; 2],
+    /// Input bytes per player, `frames[i]` long.
+    pub inputs: [Vec<u8>; 2],
+    pub frames: [usize; 2],
+}
+
+fn be32(d: &[u8], o: usize) -> u32 {
+    u32::from_be_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+fn le32(d: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([d[o], d[o + 1], d[o + 2], d[o + 3]])
+}
+
+impl FilmData {
+    pub fn parse(data: &[u8]) -> Option<FilmData> {
+        if data.len() < 16 + 2 * 0x4eac {
+            return None;
+        }
+        // Version sanity: 0x2715 stored big-endian (Mac-recorded films).
+        if be32(data, 0) != 0x2715 {
+            return None;
+        }
+        let mut inputs: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        let mut frames = [0usize; 2];
+        let mut score_marks = [0i64; 2];
+        for p in 0..2 {
+            let base = 16 + p * 0x4eac;
+            let n = be32(data, base) as usize;
+            frames[p] = n.min(0x4e20);
+            score_marks[p] = be32(data, base + 4) as i64 - 0xb3ac2;
+            let start = base + 12;
+            let end = (start + frames[p]).min(data.len());
+            inputs[p] = data[start..end].to_vec();
+        }
+        Some(FilmData {
+            seed: be32(data, 4),
+            level_id: le32(data, 8),
+            game_type: le32(data, 12),
+            score_marks,
+            inputs,
+            frames,
+        })
+    }
+}
+
 impl GameAssets {
+    /// Load and parse a `film` demo resource.
+    pub fn film(&mut self, rid: ResId) -> Option<FilmData> {
+        let raw = self.set.read_raw(crate::pak::Tag::Film, rid)?;
+        FilmData::parse(&raw)
+    }
+
     pub fn open(data_dir: &Path) -> std::io::Result<GameAssets> {
         let set = PakSet::open_dir(data_dir)?;
         Ok(GameAssets {
