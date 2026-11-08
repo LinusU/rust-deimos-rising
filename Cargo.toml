@@ -9,6 +9,7 @@ gif = "0.14.2"
 glam = "0.33"
 rand = "0.8"
 image = { version = "0.25", default-features = false, features = ["tga"] }
+rodio = "0.23.0"
 # bevy = "0.20"
 
 [profile.dev]

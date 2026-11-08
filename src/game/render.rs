@@ -303,24 +303,6 @@ pub fn sync_players(
     }
 }
 
-/// Drain sim events (sounds etc.) — stub for now, audio comes later.
-pub fn drain_events(mut sim_res: ResMut<GameSim>) {
-    let events = std::mem::take(&mut sim_res.0.events);
-    for ev in events {
-        match ev {
-            crate::game::sim::SimEvent::Sound(rid) => {
-                eprintln!("[snd] {:08x}", rid);
-            }
-            crate::game::sim::SimEvent::PlayerEvent(slot, kind) => {
-                eprintln!("[player {}] {}", slot, kind);
-            }
-            crate::game::sim::SimEvent::LevelComplete => {
-                eprintln!("[level complete]");
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // App wiring
 // ---------------------------------------------------------------------------
@@ -408,6 +390,9 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             level_index: 0,
         })
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.05)));
+    if let Some(engine) = crate::game::audio::AudioEngine::new() {
+        app.insert_resource(engine);
+    }
 
     app.add_systems(Startup, setup)
         .add_systems(
@@ -415,7 +400,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             (
                 gather_input,
                 sim_system,
-                drain_events,
+                crate::game::audio::drain_events,
                 sync_terrain,
                 sync_entities,
                 sync_players,
