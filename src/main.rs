@@ -618,7 +618,14 @@ fn flag_census() {
     a.load_all_data();
     let mut counts: std::collections::HashMap<&'static str, usize> = Default::default();
     let mut names: std::collections::HashMap<&'static str, Vec<String>> = Default::default();
+    let mut notice_users = 0usize;
     for (rid, u) in &a.units {
+        if !u.entry_notice.is_empty() || !u.destruct_notice.is_empty() {
+            notice_users += 1;
+            if notice_users <= 10 {
+                println!("notice user {:08x} {} entry='{:.30}' destruct='{:.30}'", rid, u.name, u.entry_notice, u.destruct_notice);
+            }
+        }
         for st in &u.states {
             let checks: &[(&'static str, bool)] = &[
                 ("is_targetable", st.is_targetable),
@@ -670,6 +677,7 @@ fn flag_census() {
             }
         }
     }
+    println!("notice-string users: {}", notice_users);
     let mut ks: Vec<_> = counts.keys().collect();
     ks.sort();
     for k in ks {
