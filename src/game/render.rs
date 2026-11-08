@@ -643,7 +643,8 @@ pub fn sync_crosshair(
                 return false;
             }
             let Some(d) = assets.units.get(&e.unit) else { return false };
-            if !d.is_ground_based {
+            // Original also requires canBeHitByPlayerProjectile (fileData+0x104).
+            if !d.is_ground_based || !d.can_be_hit_by_player_projectile {
                 return false;
             }
             let targetable = d
