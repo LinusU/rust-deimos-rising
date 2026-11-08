@@ -608,6 +608,75 @@ pub struct Crosshair {
     pub slot: usize,
 }
 
+/// Weapon-selector popup marker (world-space text near the ship).
+#[derive(Component)]
+pub struct WeaponPopup {
+    pub slot: usize,
+}
+
+/// Sync the weapon-name popup shown for ~60 ticks after cycling
+/// (WepSelectorAppearanceTime).
+pub fn sync_weapon_popup(
+    mut commands: Commands,
+    sim_res: Res<GameSim>,
+    flow: Res<Flow>,
+    assets: Res<GameAssets>,
+    mut q: Query<(Entity, &WeaponPopup, &mut Text2d, &mut TextColor, &mut Transform)>,
+) {
+    let sim = &sim_res.0;
+    let mut seen = [false; 2];
+    if flow.state == FlowState::Playing {
+        for slot in 0..2 {
+            let Some(p) = sim.players[slot].as_ref() else { continue };
+            if p.weapon_popup == 0 || p.phase != crate::game::sim::PlayerPhase::Active {
+                continue;
+            }
+            seen[slot] = true;
+            let name = assets
+                .weapons
+                .get(&p.air_weapon)
+                .map(|w| w.name.clone())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            // Fade out over the last 20 ticks.
+            let alpha = (p.weapon_popup.min(20) as f32 / 20.0).clamp(0.0, 1.0);
+            let pos = to_world(p.screen.x, p.screen.y - 34.0);
+            let mut found = None;
+            for (be, wp, text, col, tr) in q.iter_mut() {
+                if wp.slot == slot {
+                    found = Some((be, text, col, tr));
+                    break;
+                }
+            }
+            if let Some((_, mut text, mut col, mut tr)) = found {
+                if text.0 != name {
+                    text.0 = name;
+                }
+                tr.translation = pos;
+                col.0 = Color::srgba(0.7, 0.9, 1.0, alpha);
+            } else {
+                commands.spawn((
+                    Text2d::new(name.clone()),
+                    TextFont {
+                        font_size: bevy::text::FontSize::Px(11.0),
+                        ..default()
+                    },
+                    TextColor(Color::srgba(0.7, 0.9, 1.0, alpha)),
+                    Transform::from_translation(pos),
+                    WeaponPopup { slot },
+                ));
+            }
+        }
+    }
+    for (be, wp, _, _, _) in q.iter() {
+        if !seen[wp.slot] {
+            commands.entity(be).despawn();
+        }
+    }
+}
+
 /// Sync the per-player weapon crosshair sprites.
 pub fn sync_crosshair(
     mut commands: Commands,
@@ -1617,6 +1686,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sync_particles,
                 sync_blurs,
                 sync_crosshair,
+                sync_weapon_popup,
                 sync_entities,
                 sync_players,
                 sync_scorebar,

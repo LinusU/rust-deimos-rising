@@ -328,6 +328,8 @@ pub struct Player {
     pub money_tally: MoneyTally,
     /// Pickup glow ticks remaining (G_Player::Glow_Start on coin collect).
     pub glow_ticks: u8,
+    /// Weapon-selector popup ticks remaining (WepSelectorAppearanceTime=60).
+    pub weapon_popup: u32,
     /// Low-shield warning already shown (pad7[1] latch).
     pub shield_warned: bool,
     /// Age in ticks.
@@ -563,6 +565,7 @@ impl Sim {
             last_hit_fx: 0,
             money_tally: MoneyTally::default(),
             glow_ticks: 0,
+            weapon_popup: 0,
             shield_warned: false,
             age: 0,
             entry_entity: usize::MAX,
@@ -1263,6 +1266,9 @@ impl Sim {
         if p.glow_ticks > 0 {
             p.glow_ticks -= 1;
         }
+        if p.weapon_popup > 0 {
+            p.weapon_popup -= 1;
+        }
 
         match p.phase {
             PlayerPhase::Entering => {
@@ -1377,6 +1383,7 @@ impl Sim {
                 if let Some(w) = next_weapon_after(assets, id("PEAA"), p.air_weapon, self.level_number) {
                     if w != p.air_weapon {
                         p.air_weapon = w;
+                        p.weapon_popup = 60;
                         self.events.push(SimEvent::PlayerEvent(slot, "weapon_cycle"));
                     }
                 }
