@@ -151,6 +151,91 @@ impl HighScores {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Demo/attract mode (G_Film port): record per-player input bitmasks during
+// play, replay them on the title screen after idle. Local file only.
+// ---------------------------------------------------------------------------
+
+const DEMO_PATH: &str = "deimos-demo.bin";
+const DEMO_MAX_FRAMES: usize = 20000; // original pad is 0x4e20 bytes
+
+/// Recorded input stream for one player: 7 bits/frame
+/// (up,down,left,right,fire,bomb,cycle).
+#[derive(Default)]
+pub struct DemoRec {
+    pub level: Option<ResId>,
+    pub seed: u64,
+    pub p1: Vec<u8>,
+    pub p2: Vec<u8>,
+}
+
+impl DemoRec {
+    fn pack(s: &SlotInput) -> u8 {
+        (s.up as u8)
+            | ((s.down as u8) << 1)
+            | ((s.left as u8) << 2)
+            | ((s.right as u8) << 3)
+            | ((s.fire as u8) << 4)
+            | ((s.bomb as u8) << 5)
+            | ((s.cycle as u8) << 6)
+    }
+    fn unpack(b: u8) -> SlotInput {
+        SlotInput {
+            up: b & 1 != 0,
+            down: b & 2 != 0,
+            left: b & 4 != 0,
+            right: b & 8 != 0,
+            fire: b & 16 != 0,
+            bomb: b & 32 != 0,
+            cycle: b & 64 != 0,
+        }
+    }
+    fn frames(&self) -> usize {
+        self.p1.len().max(self.p2.len())
+    }
+    fn save(&self) {
+        if let Some(lvl) = self.level {
+            let mut buf = Vec::with_capacity(16 + self.p1.len() + self.p2.len());
+            buf.extend_from_slice(&lvl.to_le_bytes());
+            buf.extend_from_slice(&self.seed.to_le_bytes());
+            buf.extend_from_slice(&(self.p1.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&self.p1);
+            buf.extend_from_slice(&(self.p2.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&self.p2);
+            let _ = std::fs::write(DEMO_PATH, buf);
+        }
+    }
+    fn load() -> Option<Self> {
+        let buf = std::fs::read(DEMO_PATH).ok()?;
+        if buf.len() < 24 {
+            return None;
+        }
+        let lvl = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+        let seed = u64::from_le_bytes(buf[4..12].try_into().ok()?);
+        let n1 = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+        if buf.len() < 16 + n1 + 4 {
+            return None;
+        }
+        let p1 = buf[16..16 + n1].to_vec();
+        let n2 = u32::from_le_bytes(buf[16 + n1..20 + n1].try_into().ok()?) as usize;
+        if buf.len() < 20 + n1 + n2 {
+            return None;
+        }
+        let p2 = buf[20 + n1..20 + n1 + n2].to_vec();
+        Some(DemoRec { level: Some(lvl), seed, p1, p2 })
+    }
+}
+
+/// Demo recorder + playback cursor.
+#[derive(Resource, Default)]
+pub struct Demo {
+    /// Inputs recorded during the current run.
+    pub rec: DemoRec,
+    /// Playback state: demo being replayed + frame cursor.
+    pub playback: Option<DemoRec>,
+    pub frame: usize,
+}
+
 /// Full-screen menu backdrop sprite (menu TGA / level preview).
 #[derive(Component)]
 pub struct MenuBg;
@@ -950,12 +1035,31 @@ fn sim_system(
     fi: Res<FrameInput>,
     flow: Res<Flow>,
     mut sim: ResMut<GameSim>,
+    mut demo: ResMut<Demo>,
     assets: Res<GameAssets>,
 ) {
     if flow.state != FlowState::Playing || flow.paused {
         return;
     }
-    let input = PlayerInput { p1: fi.p1, p2: fi.p2 };
+    let input = if let Some(pb) = &demo.playback {
+        // Attract playback: feed recorded inputs at the frame cursor.
+        let f = demo.frame;
+        PlayerInput {
+            p1: pb.p1.get(f).map(|b| DemoRec::unpack(*b)).unwrap_or_default(),
+            p2: pb.p2.get(f).map(|b| DemoRec::unpack(*b)).unwrap_or_default(),
+        }
+    } else {
+        PlayerInput { p1: fi.p1, p2: fi.p2 }
+    };
+    // Record real (non-playback) input, one byte per player per frame.
+    if demo.playback.is_none() {
+        if demo.rec.p1.len() < DEMO_MAX_FRAMES {
+            demo.rec.p1.push(DemoRec::pack(&fi.p1));
+            demo.rec.p2.push(DemoRec::pack(&fi.p2));
+        }
+    } else {
+        demo.frame += 1;
+    }
     sim.0.advance(&*assets, &input, time.delta_secs());
 }
 
@@ -967,10 +1071,43 @@ pub fn flow_system(
     mut sim: ResMut<GameSim>,
     mut assets: ResMut<GameAssets>,
     mut scores: ResMut<HighScores>,
+    mut demo: ResMut<Demo>,
     mut audio: Option<ResMut<crate::game::audio::AudioEngine>>,
     mut menu_q: Query<&mut Text, With<MenuText>>,
 ) {
     flow.ticks += 1;
+    // Any key aborts attract playback back to the title.
+    if demo.playback.is_some() && flow.state == FlowState::Playing {
+        if keys.get_just_pressed().next().is_some() {
+            demo.playback = None;
+            demo.frame = 0;
+            flow.state = FlowState::Title;
+            flow.ticks = 0;
+        }
+    }
+    // Title idle ~20s: start attract playback if a demo exists.
+    if flow.state == FlowState::Title
+        && demo.playback.is_none()
+        && flow.ticks > 60 * 20
+    {
+        if let Some(pb) = DemoRec::load() {
+            if let Some(lid) = pb.level {
+                if let Some(new_sim) = start_level(&mut *assets, lid, 1, pb.seed) {
+                    sim.0 = new_sim;
+                    demo.playback = Some(pb);
+                    demo.frame = 0;
+                    if let Some(audio) = audio.as_deref_mut() {
+                        let mr = sim.0.level.music;
+                        if mr != crate::pak::NONE_ID {
+                            audio.ensure_music(&mut *assets, mr);
+                        }
+                    }
+                    flow.state = FlowState::Playing;
+                    flow.ticks = 0;
+                }
+            }
+        }
+    }
     // Caps Lock toggles pause during play (documented default).
     if keys.just_pressed(KeyCode::CapsLock) && flow.state == FlowState::Playing {
         flow.paused = !flow.paused;
@@ -1025,6 +1162,15 @@ pub fn flow_system(
                                 audio.ensure_music(&mut *assets, mr);
                             }
                         }
+                        // Start a fresh input recording for this run.
+                        demo.rec = DemoRec {
+                            level: Some(lid),
+                            seed: 0xC0FFEE,
+                            p1: Vec::new(),
+                            p2: Vec::new(),
+                        };
+                        demo.playback = None;
+                        demo.frame = 0;
                         flow.state = FlowState::Playing;
                         flow.ticks = 0;
                         flow.paused = false;
@@ -1033,6 +1179,15 @@ pub fn flow_system(
             }
         }
         FlowState::Playing => {
+            // Attract playback finished its recorded frames.
+            if let Some(pb) = &demo.playback {
+                if demo.frame >= pb.frames() {
+                    demo.playback = None;
+                    demo.frame = 0;
+                    flow.state = FlowState::Title;
+                    flow.ticks = 0;
+                }
+            }
             if sim.0.phase == crate::game::sim::Phase::LevelEnd {
                 flow.state = FlowState::Cleared;
                 flow.ticks = 0;
@@ -1092,6 +1247,11 @@ pub fn flow_system(
                     flow.state = FlowState::NameEntry;
                 } else {
                     flow.state = FlowState::Title;
+                }
+                // Persist the recorded run as the attract demo (G_Film_Save
+                // "last").
+                if !demo.rec.p1.is_empty() {
+                    demo.rec.save();
                 }
                 flow.ticks = 0;
             }
@@ -1374,6 +1534,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             name_idx: 0,
         })
         .insert_resource(HighScores::load())
+        .insert_resource(Demo::default())
         .insert_resource(Particles::default())
         .insert_resource(Blurs::default());
     if let Some(engine) = crate::game::audio::AudioEngine::new() {
