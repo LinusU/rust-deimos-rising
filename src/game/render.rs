@@ -6,7 +6,7 @@
 //! Bevy world→NDC: camera centered, so bevy_pos = (screen_x - 320, 240 - screen_y).
 
 use crate::assets::GameAssets;
-use crate::game::sim::{Entity as SimEntity, PlayerPhase, Sim, SCREEN_H, SCREEN_W};
+use crate::game::sim::{Entity as SimEntity, PlayerPhase, Sim, SpawnReq, SCREEN_H, SCREEN_W};
 use crate::pak::ResId;
 use bevy::prelude::*;
 use rand::Rng;
@@ -1409,6 +1409,21 @@ pub fn flow_system(
                 if any_slot && !any_alive {
                     flow.state = FlowState::GameOver;
                     flow.ticks = 0;
+                    // Notice_GameOver object (perm 0x18), once.
+                    if let Some(rid) = assets.object_ids.entries.get(0x18).map(|e| e.1) {
+                        if rid != crate::pak::NONE_ID {
+                            let pos = Vec2::new(sim.0.cam_x + 240.0, sim.0.scroll + 240.0);
+                            sim.0.request_spawn(SpawnReq {
+                                unit: rid,
+                                pos,
+                                heading: None,
+                                owner: usize::MAX,
+                                spawner_player: -1,
+                                stationary: true,
+                                state: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1710,6 +1725,23 @@ pub fn start_level(
     sim.phase = crate::game::sim::Phase::Playing;
     for slot in 0..players.min(2) {
         sim.add_player(assets, slot, players > 1);
+    }
+    // Level-start notice banner: perm object levelNum + 9
+    // (Notice_Level_01..12), spawned screen-centered like sub_41fc80.
+    let nidx = sim.level_number as usize + 9;
+    if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
+        if rid != crate::pak::NONE_ID {
+            let pos = Vec2::new(sim.cam_x + 240.0, sim.scroll + 240.0);
+            sim.request_spawn(SpawnReq {
+                unit: rid,
+                pos,
+                heading: None,
+                owner: usize::MAX,
+                spawner_player: -1,
+                stationary: true,
+                state: None,
+            });
+        }
     }
     Some(sim)
 }

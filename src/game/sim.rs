@@ -1326,6 +1326,25 @@ impl Sim {
                 self.end_seq_drain_t = self.game_time;
                 self.end_seq_counter = 0;
                 self.level_end_complete = false;
+                // Level-end notice object: perm 0x16 (Notice_LevelEnd) or
+                // 0x17 (Notice_AllLevelsCompleted) on a full-campaign
+                // finale, spawned screen-centered.
+                let finale = self.level_number == 12 && self.levels_played == 12;
+                let nidx = if finale { 0x17 } else { 0x16 };
+                if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
+                    if rid != NONE_ID {
+                        let pos = Vec2::new(self.cam_x + 240.0, self.scroll + 240.0);
+                        self.request_spawn(SpawnReq {
+                            unit: rid,
+                            pos,
+                            heading: None,
+                            owner: usize::MAX,
+                            spawner_player: -1,
+                            stationary: true,
+                            state: None,
+                        });
+                    }
+                }
             }
         }
 
