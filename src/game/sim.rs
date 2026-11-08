@@ -1926,25 +1926,26 @@ impl Sim {
         // recover via "shie" pickups and respawn resets only. The power
         // meters are driven by the weapon power-up state machine.
 
-        // Movement: velocity approaches ±max_speed by delta per tick,
-        // decays toward 0 when input released.
+        // Movement (G_Player::Process Result_0): each axis is independent —
+        // a held direction adds ±delta clamped to ±max_speed, a released
+        // axis decays toward 0 by delta. Diagonals therefore reach
+        // max_speed on both axes at once.
         let max_speed = def.active_default_max_speed as f32;
         let step = def.active_velocity_delta as f32;
-        let mut tv = Vec2::ZERO;
-        if inp.up { tv.y -= 1.0; }
-        if inp.down { tv.y += 1.0; }
-        if inp.left { tv.x -= 1.0; }
-        if inp.right { tv.x += 1.0; }
-        if tv.length_squared() > 0.0 {
-            tv = tv.normalize() * max_speed;
+        if inp.up { p.vel.y -= step; }
+        if inp.down { p.vel.y += step; }
+        if inp.left { p.vel.x -= step; }
+        if inp.right { p.vel.x += step; }
+        if !inp.left && !inp.right {
+            if p.vel.x < 0.0 { p.vel.x = (p.vel.x + step).min(0.0); }
+            else if p.vel.x > 0.0 { p.vel.x = (p.vel.x - step).max(0.0); }
         }
-        p.vel += (tv - p.vel).clamp_length_max(step);
-        if tv == Vec2::ZERO {
-            p.vel *= 0.85;
-            if p.vel.length() < 0.05 {
-                p.vel = Vec2::ZERO;
-            }
+        if !inp.up && !inp.down {
+            if p.vel.y < 0.0 { p.vel.y = (p.vel.y + step).min(0.0); }
+            else if p.vel.y > 0.0 { p.vel.y = (p.vel.y - step).max(0.0); }
         }
+        p.vel.x = p.vel.x.clamp(-max_speed, max_speed);
+        p.vel.y = p.vel.y.clamp(-max_speed, max_speed);
         p.screen += p.vel;
 
         p.tilt_frame = if inp.left { 4 }
