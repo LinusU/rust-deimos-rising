@@ -283,6 +283,8 @@ pub struct Player {
     pub last_hit_fx: u32,
     /// Level-end money→score tally (G_Player::MoneyCounter port).
     pub money_tally: MoneyTally,
+    /// Pickup glow ticks remaining (G_Player::Glow_Start on coin collect).
+    pub glow_ticks: u8,
     /// Low-shield warning already shown (pad7[1] latch).
     pub shield_warned: bool,
     /// Age in ticks.
@@ -517,6 +519,7 @@ impl Sim {
             last_hit_time: 0,
             last_hit_fx: 0,
             money_tally: MoneyTally::default(),
+            glow_ticks: 0,
             shield_warned: false,
             age: 0,
             entry_entity: usize::MAX,
@@ -1203,6 +1206,9 @@ impl Sim {
         let two_p = self.two_player_active();
         let p = self.players[slot].as_mut().unwrap();
         p.age += 1;
+        if p.glow_ticks > 0 {
+            p.glow_ticks -= 1;
+        }
 
         match p.phase {
             PlayerPhase::Entering => {
@@ -3029,6 +3035,8 @@ impl Sim {
             self.events.push(SimEvent::PlayerEvent(slot, "weapon_ground"));
         } else if pickup == id("coin") {
             p.money += def.pickup_value;
+            // Glow_Start(0x7fff, 6, false) — brief ship flash on collect.
+            p.glow_ticks = 6;
             self.events.push(SimEvent::PlayerEvent(slot, "coin"));
         } else if pickup == id("mult") {
             // 1→2→3→4→5→10, then stuck (G_Player::Multiplier_Advance).

@@ -251,6 +251,10 @@ fn main() {
         pickups_probe();
         return;
     }
+    if args.iter().any(|a| a == "--flags") {
+        flag_census();
+        return;
+    }
     if args.iter().any(|a| a == "--sprite") {
         let s = std::env::args().nth(2).unwrap();
         sprite_probe(&s);
@@ -557,6 +561,42 @@ fn pickups_probe() {
     v.sort();
     for (rid, name, pt, pv) in v {
         println!("{:08x} {:30} pickup={:08x} val={}", rid, name, pt, pv);
+    }
+}
+
+
+fn flag_census() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut counts: std::collections::HashMap<&'static str, usize> = Default::default();
+    let mut names: std::collections::HashMap<&'static str, Vec<String>> = Default::default();
+    for (rid, u) in &a.units {
+        for st in &u.states {
+            let checks: &[(&'static str, bool)] = &[
+                ("is_targetable", st.is_targetable),
+                ("destroy_owner_on_destruction", st.destroy_owner_on_destruction),
+                ("use_owners_visibility", st.use_owners_visibility),
+                ("use_owners_scale", st.use_owners_scale),
+                ("visually_reflect_owner_hits", st.visually_reflect_owner_hits),
+                ("pickup_no_appearance_change", st.pickup_no_appearance_change),
+                ("reverse_direction_on_reaction", st.reverse_direction_on_reaction),
+                ("draw_to_terrain", st.draw_to_terrain),
+                ("use_on_shield_depletion", st.use_on_shield_depletion),
+                ("do_not_glow_on_collision", st.do_not_glow_on_collision),
+            ];
+            for (n, v) in checks {
+                if *v {
+                    *counts.entry(n).or_default() += 1;
+                    names.entry(n).or_default().push(format!("{}:{}", u.name, rid));
+                }
+            }
+        }
+    }
+    let mut ks: Vec<_> = counts.keys().collect();
+    ks.sort();
+    for k in ks {
+        println!("{}: {}  {:?}", k, counts[k], &names[k][..names[k].len().min(6)]);
     }
 }
 

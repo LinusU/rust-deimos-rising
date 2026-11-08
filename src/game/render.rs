@@ -634,20 +634,28 @@ pub fn sync_crosshair(
         if wdef.crosshair_face == crate::pak::NONE_ID {
             continue;
         }
-        // Locked frame when a ground-class enemy sits under the player
-        // (original: player loc inside entity bounds → Crosshair_Hilite).
+        // Locked frame when a ground-class, state-targetable enemy sits
+        // under the player (original: unit class "grnd" + stateIsTargetable
+        // + player loc inside entity bounds → Crosshair_Hilite).
         let ps = Vec2::new(p.screen.x, p.screen.y);
         let locked = sim.entities.iter().any(|e| {
-            !e.dead
-                && assets
-                    .units
-                    .get(&e.unit)
-                    .map(|d| d.terrain_effect)
-                    .unwrap_or(false)
-                && {
-                    let es = e.screen_pos(sim);
-                    (es.x - ps.x).abs() < 40.0 && es.y > ps.y - 10.0 && es.y < ps.y + 160.0
-                }
+            if e.dead {
+                return false;
+            }
+            let Some(d) = assets.units.get(&e.unit) else { return false };
+            if !d.is_ground_based {
+                return false;
+            }
+            let targetable = d
+                .states
+                .get(e.state)
+                .map(|st| st.is_targetable)
+                .unwrap_or(false);
+            if !targetable {
+                return false;
+            }
+            let es = e.screen_pos(sim);
+            (es.x - ps.x).abs() < 40.0 && es.y > ps.y - 10.0 && es.y < ps.y + 160.0
         });
         let (rid, frame) = if locked
             && wdef.crosshair_locked_face != crate::pak::NONE_ID
@@ -980,7 +988,15 @@ pub fn sync_players(
         if let Some((_, mut sprite, mut transform)) = found {
             sprite.image = handle;
             transform.translation = wpos;
-            sprite.color = if blink { Color::srgba(1.0, 1.0, 1.0, 0.4) } else { Color::WHITE };
+            // Pickup glow flash (G_Player::Glow_Start) — brief overbright
+            // tint while glow_ticks counts down; invuln blink takes priority.
+            sprite.color = if blink {
+                Color::srgba(1.0, 1.0, 1.0, 0.4)
+            } else if p.glow_ticks > 0 {
+                Color::srgba(2.5, 2.5, 2.5, 1.0)
+            } else {
+                Color::WHITE
+            };
         } else {
             commands.spawn((
                 Sprite::from_image(handle),
