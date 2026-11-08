@@ -40,6 +40,46 @@ pub struct PlayerSprite {
 #[derive(Resource)]
 pub struct GameSim(pub Sim);
 
+// ---------------------------------------------------------------------------
+// Game flow: title → sector select → briefing → play → cleared/game over
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlowState {
+    Title,
+    Sectors,
+    Briefing,
+    Playing,
+    Cleared,
+    GameOver,
+    Credits,
+}
+
+#[derive(Resource)]
+pub struct Flow {
+    pub state: FlowState,
+    /// Selected sector index into `level_ids`.
+    pub sector: usize,
+    /// Chosen player count for the next run.
+    pub players: usize,
+    /// Ticks spent in the current state.
+    pub ticks: u32,
+    /// Level rids in mission order (sorted le01..le12).
+    pub level_ids: Vec<ResId>,
+}
+
+/// Full-screen menu backdrop sprite (menu TGA / level preview).
+#[derive(Component)]
+pub struct MenuBg;
+
+/// Logo sprite shown on title/credits screens.
+#[derive(Component)]
+pub struct MenuLogo;
+
+/// Centered menu text block.
+#[derive(Component)]
+pub struct MenuText;
+
 /// Input state gathered from Bevy keys.
 #[derive(Resource, Default)]
 pub struct FrameInput {
@@ -125,6 +165,7 @@ pub fn to_world(sx: f32, sy: f32) -> Vec3 {
 pub fn sync_entities(
     mut commands: Commands,
     sim_res: Res<GameSim>,
+    flow: Res<Flow>,
     mut assets: ResMut<GameAssets>,
     mut images: ResMut<Assets<Image>>,
     mut book: ResMut<TextureBook>,
@@ -134,13 +175,15 @@ pub fn sync_entities(
 
     // Desired set: unique_num -> (sprite rid, frame, screen pos).
     let mut desired: HashMap<u32, (ResId, i64, Vec2, f32)> = HashMap::new();
-    for e in &sim.entities {
+    if flow.state == FlowState::Playing {
+        for e in &sim.entities {
         if e.dead || e.activate_in > 0 {
             continue;
         }
         let (rid, frame) = entity_sprite(&*assets, e);
         let sp = e.screen_pos(sim);
         desired.insert(e.unique_num, (rid, frame, sp, e.hit_flash as f32));
+        }
     }
 
     // Despawn removed.
@@ -208,11 +251,18 @@ fn entity_sprite(assets: &GameAssets, e: &SimEntity) -> (ResId, i64) {
 pub fn sync_terrain(
     mut commands: Commands,
     sim_res: Res<GameSim>,
+    flow: Res<Flow>,
     mut assets: ResMut<GameAssets>,
     mut images: ResMut<Assets<Image>>,
     mut book: ResMut<TextureBook>,
     mut q: Query<(Entity, &TerrainSprite, &mut Sprite, &mut Transform), Without<PlayerSprite>>,
 ) {
+    if flow.state != FlowState::Playing {
+        for (e, _, _, _) in q.iter() {
+            commands.entity(e).despawn();
+        }
+        return;
+    }
     let sim = &sim_res.0;
     let rid = sim.level.background_image;
     let Some(handle) = image16_handle(&mut *assets, &mut *images, &mut *book, rid) else {
@@ -251,6 +301,7 @@ pub fn sync_terrain(
 pub fn sync_players(
     mut commands: Commands,
     sim_res: Res<GameSim>,
+    flow: Res<Flow>,
     mut assets: ResMut<GameAssets>,
     mut images: ResMut<Assets<Image>>,
     mut book: ResMut<TextureBook>,
@@ -258,6 +309,7 @@ pub fn sync_players(
 ) {
     let sim = &sim_res.0;
     let mut seen = [false; 2];
+    if flow.state == FlowState::Playing {
     for slot in 0..2 {
         let p = match sim.players[slot].as_ref() {
             Some(p) if p.phase != PlayerPhase::Dead => p,
@@ -294,6 +346,7 @@ pub fn sync_players(
                 PlayerSprite { slot },
             ));
         }
+    }
     }
     // Despawn dead/absent players.
     for (bevy_e, ps, _, _) in q.iter() {
@@ -334,11 +387,263 @@ fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut fi: ResMut<FrameInput>) {
 fn sim_system(
     time: Res<Time>,
     fi: Res<FrameInput>,
+    flow: Res<Flow>,
     mut sim: ResMut<GameSim>,
     assets: Res<GameAssets>,
 ) {
+    if flow.state != FlowState::Playing {
+        return;
+    }
     let input = PlayerInput { p1: fi.p1, p2: fi.p2 };
     sim.0.advance(&*assets, &input, time.delta_secs());
+}
+
+/// Menu/flow state machine. Drives title → sectors → briefing → play →
+/// cleared/game-over → credits using the retail `lgsp`/`cred` strings.
+pub fn flow_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut flow: ResMut<Flow>,
+    mut sim: ResMut<GameSim>,
+    mut assets: ResMut<GameAssets>,
+    mut audio: Option<ResMut<crate::game::audio::AudioEngine>>,
+    mut menu_q: Query<&mut Text, With<MenuText>>,
+) {
+    flow.ticks += 1;
+    let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
+    let space = keys.just_pressed(KeyCode::Space);
+    let any = enter || space;
+    let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
+    let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
+    let esc = keys.just_pressed(KeyCode::Escape);
+
+    match flow.state {
+        FlowState::Title => {
+            if keys.just_pressed(KeyCode::Digit1) || enter {
+                flow.players = 1;
+                flow.state = FlowState::Sectors;
+            } else if keys.just_pressed(KeyCode::Digit2) {
+                flow.players = 2;
+                flow.state = FlowState::Sectors;
+            } else if keys.just_pressed(KeyCode::KeyC) {
+                flow.state = FlowState::Credits;
+            }
+        }
+        FlowState::Sectors => {
+            let n = flow.level_ids.len();
+            if n > 0 {
+                if up {
+                    flow.sector = (flow.sector + n - 1) % n;
+                }
+                if down {
+                    flow.sector = (flow.sector + 1) % n;
+                }
+            }
+            if enter || space {
+                flow.state = FlowState::Briefing;
+                flow.ticks = 0;
+            } else if esc {
+                flow.state = FlowState::Title;
+            }
+        }
+        FlowState::Briefing => {
+            if flow.ticks > 80 || any {
+                let lid = flow.level_ids.get(flow.sector).copied();
+                if let Some(lid) = lid {
+                    if let Some(new_sim) =
+                        start_level(&mut *assets, lid, flow.players, 0xC0FFEE)
+                    {
+                        sim.0 = new_sim;
+                        if let Some(audio) = audio.as_deref_mut() {
+                            let mr = sim.0.level.music;
+                            if mr != crate::pak::NONE_ID {
+                                audio.ensure_music(&mut *assets, mr);
+                            }
+                        }
+                        flow.state = FlowState::Playing;
+                        flow.ticks = 0;
+                    }
+                }
+            }
+        }
+        FlowState::Playing => {
+            if sim.0.phase == crate::game::sim::Phase::LevelEnd {
+                flow.state = FlowState::Cleared;
+                flow.ticks = 0;
+            } else {
+                let any_alive = sim
+                    .0
+                    .players
+                    .iter()
+                    .flatten()
+                    .any(|p| p.phase != PlayerPhase::Dead);
+                let any_slot = sim.0.players.iter().any(|p| p.is_some());
+                if any_slot && !any_alive {
+                    flow.state = FlowState::GameOver;
+                    flow.ticks = 0;
+                }
+            }
+        }
+        FlowState::Cleared => {
+            if any {
+                if flow.sector + 1 < flow.level_ids.len() {
+                    flow.sector += 1;
+                    flow.state = FlowState::Briefing;
+                } else {
+                    flow.state = FlowState::Credits;
+                }
+                flow.ticks = 0;
+            }
+        }
+        FlowState::GameOver => {
+            if enter {
+                flow.state = FlowState::Title;
+                flow.ticks = 0;
+            }
+        }
+        FlowState::Credits => {
+            if any {
+                flow.state = FlowState::Title;
+                flow.ticks = 0;
+            }
+        }
+    }
+
+    // Menu text.
+    let text = menu_text(&flow, &sim.0, &assets);
+    for mut t in menu_q.iter_mut() {
+        t.0 = text.clone();
+    }
+}
+
+fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets) -> String {
+    let name_of = |i: usize| -> String {
+        flow.level_ids
+            .get(i)
+            .and_then(|r| assets.levels.get(r))
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| "???".into())
+    };
+    match flow.state {
+        FlowState::Title => "DEIMOS RISING\n\n1 PLAYER  .... press 1\n2 PLAYERS .... press 2\nCREDITS ...... press C\n\nA MODERN REMAKE".to_string(),
+        FlowState::Sectors => {
+            let mut s = String::from("CHOOSE A STARTING SECTOR\n\n");
+            for (i, _) in flow.level_ids.iter().enumerate() {
+                let cur = if i == flow.sector { "> " } else { "  " };
+                s.push_str(&format!("{}{}\n", cur, name_of(i)));
+            }
+            s.push_str("\nARROWS select - ENTER launch - ESC back");
+            s
+        }
+        FlowState::Briefing => {
+            format!(
+                "SECTOR {}: {}\n\nPRESS ANY KEY TO LAUNCH",
+                flow.sector + 1,
+                name_of(flow.sector).to_uppercase()
+            )
+        }
+        FlowState::Cleared => {
+            "ALL MISSION TARGETS DESTROYED!!!\n\nPRESS ANY KEY".to_string()
+        }
+        FlowState::GameOver => {
+            let score: i64 = sim.players.iter().flatten().map(|p| p.score).sum();
+            let money: i64 = sim.players.iter().flatten().map(|p| p.money).sum();
+            format!("GAME OVER\n\nSCORE {:>8}   BONUS ${}\n\nPRESS ENTER", score, money)
+        }
+        FlowState::Credits => {
+            let mut s = String::new();
+            // 'cred' still-text page: developer/publisher/unit/music credits.
+            if let Some(st) = assets.strings.get(&crate::pak::id("cred")) {
+                let mut page = 0usize;
+                for line in &st.strings {
+                    if line.starts_with("<page") {
+                        page += 1;
+                        if page > 1 {
+                            break;
+                        }
+                        continue;
+                    }
+                    if line.starts_with('<') {
+                        continue;
+                    }
+                    s.push_str(line);
+                    s.push('\n');
+                }
+            }
+            if s.is_empty() {
+                s = "DEIMOS RISING\n\nSWOOP SOFTWARE\nAMBROSIA SOFTWARE".into();
+            }
+            s.push_str("\n\nPRESS ANY KEY");
+            s
+        }
+        FlowState::Playing => String::new(),
+    }
+}
+
+/// Spawn/despawn the full-screen menu backdrop + logo.
+pub fn sync_menu(
+    mut commands: Commands,
+    flow: Res<Flow>,
+    mut assets: ResMut<GameAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut book: ResMut<TextureBook>,
+    mut bg_q: Query<(Entity, &MenuBg, &mut Sprite, &mut Transform)>,
+    mut logo_q: Query<(Entity, &MenuLogo, &mut Sprite, &mut Transform), Without<MenuBg>>,
+) {
+    let in_menu = flow.state != FlowState::Playing;
+    // Backdrop: level preview during briefing, menu TGA otherwise.
+    let bg_rid = if flow.state == FlowState::Briefing {
+        flow.level_ids
+            .get(flow.sector)
+            .and_then(|r| assets.levels.get(r))
+            .map(|l| l.preview_image)
+            .filter(|r| *r != crate::pak::NONE_ID)
+            .unwrap_or_else(|| crate::pak::id("menu"))
+    } else {
+        crate::pak::id("menu")
+    };
+    if in_menu {
+        let handle = image16_handle(&mut *assets, &mut *images, &mut *book, bg_rid);
+        let center = to_world(SCREEN_W * 0.5, SCREEN_H * 0.5);
+        if let Some(h) = handle {
+            if let Some((_, _, mut sprite, mut transform)) = bg_q.iter_mut().next() {
+                sprite.image = h;
+                transform.translation = center;
+            } else {
+                commands.spawn((
+                    Sprite::from_image(h),
+                    Transform::from_translation(center),
+                    MenuBg,
+                ));
+            }
+        }
+        // Logo on title/credits.
+        let show_logo = matches!(flow.state, FlowState::Title | FlowState::Credits);
+        if show_logo {
+            if let Some(h) = frame_image(&mut *assets, &mut *images, &mut *book, crate::pak::id("galo"), 0) {
+                let pos = to_world(SCREEN_W * 0.5, 90.0);
+                if let Some((_, _, mut sprite, mut transform)) = logo_q.iter_mut().next() {
+                    sprite.image = h;
+                    transform.translation = pos;
+                } else {
+                    commands.spawn((
+                        Sprite::from_image(h),
+                        Transform::from_translation(pos),
+                        MenuLogo,
+                    ));
+                }
+            }
+        }
+    }
+    if !in_menu || !matches!(flow.state, FlowState::Title | FlowState::Credits) {
+        for (e, _, _, _) in logo_q.iter() {
+            commands.entity(e).despawn();
+        }
+    }
+    if !in_menu {
+        for (e, _, _, _) in bg_q.iter() {
+            commands.entity(e).despawn();
+        }
+    }
 }
 
 /// Start a level: build Sim + spawn players.
@@ -364,6 +669,11 @@ pub fn start_level(
 /// Run the game. `assets` must already be opened + `load_all_data()` called.
 pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
     let mut assets = assets;
+    let mut level_ids: Vec<ResId> = assets.levels.keys().copied().collect();
+    level_ids.sort();
+    if level_ids.is_empty() {
+        level_ids.push(level_id);
+    }
     let sim = start_level(&mut assets, level_id, players, 0xC0FFEE)
         .expect("level not found");
 
@@ -389,18 +699,27 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             players,
             level_index: 0,
         })
-        .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.05)));
+        .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.05)))
+        .insert_resource(Flow {
+            state: FlowState::Title,
+            sector: 0,
+            players: players.clamp(1, 2),
+            ticks: 0,
+            level_ids,
+        });
     if let Some(engine) = crate::game::audio::AudioEngine::new() {
         app.insert_resource(engine);
     }
 
-    app.add_systems(Startup, (setup, setup_hud))
+    app.add_systems(Startup, (setup, setup_hud, setup_menu))
         .add_systems(
             Update,
             (
                 gather_input,
+                flow_system,
                 sim_system,
                 crate::game::audio::drain_events,
+                sync_menu,
                 sync_terrain,
                 sync_entities,
                 sync_players,
@@ -448,14 +767,49 @@ pub fn setup_hud(mut commands: Commands) {
     }
 }
 
+/// Centered menu text block (hidden during play).
+pub fn setup_menu(mut commands: Commands) {
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .with_child((
+            Text::new(""),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(20.0),
+                ..default()
+            },
+            TextColor(Color::srgb(0.9, 0.95, 1.0)),
+            TextLayout {
+                justify: bevy::text::Justify::Center,
+                ..default()
+            },
+            MenuText,
+        ));
+}
+
 /// Refresh HUD text from sim state each frame.
 pub fn hud_system(
     sim_res: Res<GameSim>,
+    flow: Res<Flow>,
     assets: Res<GameAssets>,
     mut q: Query<(&HudText, &mut Text)>,
 ) {
     let sim = &sim_res.0;
     for (hud, mut text) in q.iter_mut() {
+        if flow.state != FlowState::Playing {
+            text.0 = String::new();
+            continue;
+        }
         let slot = hud.slot;
         let Some(p) = sim.players[slot].as_ref() else {
             text.0 = String::new();

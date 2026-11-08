@@ -3,7 +3,7 @@ mod data;
 mod game;
 mod pak;
 
-use pak::{id, PakSet, Tag, NONE_ID};
+use pak::{id, PakSet, ResId, Tag, NONE_ID};
 use std::path::PathBuf;
 
 fn data_dir() -> PathBuf {
@@ -253,6 +253,10 @@ fn main() {
         dump_rules();
         return;
     }
+    if args.iter().any(|a| a == "--strings") {
+        test_strings();
+        return;
+    }
     if args.iter().any(|a| a == "--test-sim") {
         test_sim();
         return;
@@ -432,6 +436,34 @@ fn test_defs() {
         println!("LEVEL le01 bg={:?} img={:08x} music={:08x} objs={}", l.background, l.background_image, l.music, l.objects.len());
         for o in l.objects.iter().take(15) {
             println!("  obj unit={:08x} layer={:08x} x={} y={} hdg={} stat={} terr={}", o.unit_id,o.layer_id,o.x,o.y,o.heading_degrees,o.stationary,o.terrain_effects);
+        }
+    }
+}
+
+fn test_strings() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut keys: Vec<ResId> = a.strings.keys().copied().collect();
+    keys.sort();
+    for k in keys {
+        let s = &a.strings[&k];
+        println!("=== stli {:08x} ({} strings)", k, s.strings.len());
+        for (i, line) in s.strings.iter().enumerate().take(12) {
+            println!("  [{}] {}", i, line);
+        }
+    }
+    for (rid, l) in &a.levels {
+        println!(
+            "LEVEL {:08x} name={:?} briefing={:08x} music={:08x} objs={}",
+            rid, l.name, l.briefing, l.music, l.objects.len()
+        );
+        if l.briefing != pak::NONE_ID {
+            if let Some(s) = a.strings.get(&l.briefing) {
+                for line in s.strings.iter().take(10) {
+                    println!("    brief: {}", line);
+                }
+            }
         }
     }
 }
