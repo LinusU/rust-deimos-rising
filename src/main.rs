@@ -359,7 +359,7 @@ fn test_floats() {
         for i in 0x30usize..0x45 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
-        for i in 0xc8usize..0xe0 {
+        for i in 0x98usize..0xb0 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
     }

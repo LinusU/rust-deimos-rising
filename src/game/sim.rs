@@ -47,6 +47,8 @@ pub mod pf {
     pub const PLAYER_TOP_LIMIT: usize = 0xb7; // 13
     pub const WEAPON_BASE_BOMBS: usize = 0x97;
     pub const WEAPON_MAX_BOMBS: usize = 0x98;
+    /// Damage dealt to the owner entity on pass-hits contact (pf 0xa1 = 100).
+    pub const PASS_HITS_TO_OWNER: usize = 0xa1;
 }
 
 pub fn pf(assets: &GameAssets, i: usize) -> f32 {
@@ -110,6 +112,8 @@ pub struct Entity {
     pub hit_cooldown: u32,
     /// Ticks of post-hit glow remaining.
     pub hit_flash: u32,
+    /// game_time of the last on-hit state change (rate limit).
+    pub hit_change_time: u32,
     /// Marks entities to be removed.
     pub dead: bool,
     /// Removed via the Destroy (destruct) path rather than Delete —
@@ -433,6 +437,7 @@ impl Sim {
             spawn_timers: vec![SpawnSetRt::default(); state.spawn_sets.len()],
             hit_cooldown: 0,
             hit_flash: 0,
+            hit_change_time: 0,
             dead: false,
             destroyed: false,
             tracking: false,
@@ -1213,6 +1218,29 @@ impl Sim {
             Some(d) => d.clone(),
             None => return,
         };
+        // State-level invulnerability gates (0x321/0x322).
+        let cur_state = def
+            .states
+            .get(self.entities[idx].state)
+            .cloned()
+            .unwrap_or_default();
+        if cur_state.invulnerable_until_owner_destroyed {
+            let owner_uid = self.entities[idx].owner;
+            if owner_uid != u32::MAX
+                && self
+                    .entities
+                    .iter()
+                    .any(|o| o.unique_num == owner_uid && !o.dead)
+            {
+                return;
+            }
+        }
+        if cur_state.invulnerable_until_children_destroyed {
+            let my_uid = self.entities[idx].unique_num;
+            if self.entities.iter().any(|c| !c.dead && c.owner == my_uid) {
+                return;
+            }
+        }
         let e = &mut self.entities[idx];
         e.shields -= amount;
         e.hit_cooldown = 2;
@@ -1228,11 +1256,21 @@ impl Sim {
             self.destroy_entity(assets, idx, from_player);
         } else {
             // Non-fatal hit: shield vs unshielded sound (hit particles
-            // aren't ported yet).
+            // aren't ported yet) + on-hit state change (0x3b2/0x596).
             let shields_left = self.entities[idx].shields;
             let snd = if shields_left > 0.0 { def.shield_sound } else { def.unshielded_sound };
             if snd.id != NONE_ID {
                 self.events.push(SimEvent::Sound(snd.id));
+            }
+            let oc = cur_state.on_hit_change_to.trim();
+            if !oc.is_empty()
+                && !oc.eq_ignore_ascii_case("none")
+                && self.game_time
+                    > self.entities[idx].hit_change_time
+                        + cur_state.on_hit_change_state_delay.max(0) as u32
+            {
+                self.entities[idx].hit_change_time = self.game_time;
+                self.apply_state_change(idx, &cur_state.on_hit_change_to, assets);
             }
         }
     }
@@ -1408,7 +1446,7 @@ impl Sim {
         // Pass B: player-owned projectiles vs hittable entities.
         let mut hits: Vec<(usize, f64, i32)> = Vec::new(); // (target idx, dmg, owner)
         let mut shots: Vec<usize> = Vec::new();            // projectile idx that hit
-        let mut player_hits: Vec<(usize, f64)> = Vec::new();
+        let mut player_hits: Vec<(usize, usize, f64)> = Vec::new();
         let mut pickups: Vec<(usize, usize)> = Vec::new();  // (entity idx, player slot)
 
         let ppos: Vec<Vec2> = self.players.iter()
@@ -1440,7 +1478,7 @@ impl Sim {
                     && !def.terrain_effect
                     && def.damage > 0.0
                 {
-                    player_hits.push((slot, def.damage));
+                    player_hits.push((i, slot, def.damage));
                 }
             }
         }
@@ -1504,8 +1542,28 @@ impl Sim {
         for (j, dmg, pl) in hits {
             self.damage_entity(assets, j, dmg, pl);
         }
-        for (slot, dmg) in player_hits {
+        for (eidx, slot, dmg) in player_hits {
             self.damage_player(slot, dmg);
+            // pass_hits_to_owner (state 0x327): the owner entity soaks
+            // pf(0xa1) damage credited to the contacting player.
+            let pass = self.entities.get(eidx).and_then(|e| {
+                assets
+                    .units
+                    .get(&e.unit)
+                    .and_then(|d| d.states.get(e.state))
+                    .map(|st| (st.pass_hits_to_owner, e.owner))
+            });
+            if let Some((true, owner_uid)) = pass {
+                if owner_uid != u32::MAX {
+                    if let Some(oidx) = self
+                        .entities
+                        .iter()
+                        .position(|o| o.unique_num == owner_uid && !o.dead)
+                    {
+                        self.damage_entity(assets, oidx, pf(assets, pf::PASS_HITS_TO_OWNER) as f64, slot as i32);
+                    }
+                }
+            }
         }
     }
 
