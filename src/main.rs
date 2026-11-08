@@ -885,8 +885,10 @@ fn state_probe(ridv: u32) {
     if let Some(u) = a.units.get(&ridv) {
         for (i, st) in u.states.iter().enumerate() {
             println!(
-                "state[{}] '{}' spr={:08x} timer={}..{} -> '{}' onrange={}.. changeto='{}' entrysnd={:08x}",
-                i, st.name, st.sprite_face, st.on_timer_min, st.on_timer_max,
+                "state[{}] '{}' spr={:08x} f={}..{} dirs={} fpd={} timer={}..{} -> '{}' onrange={}.. changeto='{}' entrysnd={:08x}",
+                i, st.name, st.sprite_face, st.sprite_frame_min, st.sprite_frame_max,
+                st.num_directions, st.frames_per_direction,
+                st.on_timer_min, st.on_timer_max,
                 st.on_timer_change_to, st.on_range, st.on_range_change_to,
                 st.entry_sound.id
             );
