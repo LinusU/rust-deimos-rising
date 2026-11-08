@@ -796,7 +796,7 @@ pub fn sync_entities(
     let sim = &sim_res.0;
 
     // Desired set: unique_num -> (sprite rid, frame, screen pos, fx).
-    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32, f32, f32, f32, u32)> = HashMap::new();
+    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32, f32, f32, f32, u32, bool)> = HashMap::new();
     if flow.state == FlowState::Playing {
         for e in &sim.entities {
         if e.dead || e.activate_in > 0 || e.vis <= 0.0 {
@@ -804,12 +804,19 @@ pub fn sync_entities(
         }
         let (rid, frame) = entity_sprite(&*assets, e);
         let sp = e.screen_pos(sim);
-        let tint_color = assets
-            .units
-            .get(&e.unit)
-            .and_then(|d| d.states.get(e.state.min(d.states.len().saturating_sub(1))))
+        let udef = assets.units.get(&e.unit);
+        let state_idx = e.state.min(
+            udef.map(|d| d.states.len().saturating_sub(1))
+                .unwrap_or(0),
+        );
+        let tint_color = udef
+            .and_then(|d| d.states.get(state_idx))
             .map(|s| s.tint_color)
             .unwrap_or(0);
+        let terrain = udef
+            .and_then(|d| d.states.get(state_idx))
+            .map(|s| s.draw_to_terrain)
+            .unwrap_or(false);
         desired.insert(
             e.unique_num,
             (
@@ -821,6 +828,7 @@ pub fn sync_entities(
                 e.tint,
                 e.scale,
                 tint_color,
+                terrain,
             ),
         );
         }
@@ -837,7 +845,7 @@ pub fn sync_entities(
     }
 
     // Spawn/update.
-    for (key, (rid, frame, sp, flash, vis, tint, scale, tint_color)) in &desired {
+    for (key, (rid, frame, sp, flash, vis, tint, scale, tint_color, terrain)) in &desired {
         let handle = match frame_image(&mut *assets, &mut *images, &mut *book, *rid, *frame) {
             Some(h) => h,
             None => continue,
@@ -850,7 +858,11 @@ pub fn sync_entities(
                 break;
             }
         }
-        let wpos = to_world(sp.x, sp.y);
+        let mut wpos = to_world(sp.x, sp.y);
+        // stateDrawToTerrain: render beneath normal sprites (terrain pass).
+        if *terrain {
+            wpos.z = -1.0;
+        }
         // Visibility fade → alpha; tint% blends toward tint_color.
         let alpha = (*vis / 100.0).clamp(0.0, 1.0);
         let t = (*tint / 100.0).clamp(0.0, 1.0);
