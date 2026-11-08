@@ -422,6 +422,26 @@ fn test_defs() {
         }
     }
     println!("PARTICLES destruct={} hit={} state={} stateRepeat={}", dp,hp,sp,spr);
+    // Notice census.
+    let mut dn=0; let mut en=0; let mut ed=0;
+    for u in a.units.values() {
+        if !u.destruct_notice.is_empty() && u.destruct_notice != "none" {dn+=1;}
+        if !u.entry_notice.is_empty() && u.entry_notice != "none" {en+=1; if u.entry_notice_delay>0 {ed+=1;}}
+    }
+    println!("NOTICES destruct={} entry={} entryDelay={}", dn,en,ed);
+    for u in a.units.values() {
+        if !u.entry_notice.is_empty() && u.entry_notice != "none" {
+            println!("  entryNotice '{}' delay={} unit?", &u.entry_notice[..u.entry_notice.len().min(60)], u.entry_notice_delay);
+        }
+    }
+    // State sound-loop census.
+    let mut sl=0; let mut slm=0; let mut sr=0; let mut so=0; let mut snd=0;
+    for u in a.units.values() { for st in &u.states {
+        if st.entry_sound.id != pak::NONE_ID {snd+=1;}
+        if st.sound_loop {sl+=1;} if st.sound_max_num_to_play>0 {slm+=1;}
+        if st.sound_repeat_on_state_change {sr+=1;} if st.sound_allow_only_one_instance {so+=1;}
+    }}
+    println!("STATE-SND entry={} loop={} maxNum={} repeatChg={} oneInst={}", snd,sl,slm,sr,so);
     // pickup units: do their states set collides/collidesWithPlayers?
     let mut pu=0; let mut pcoll=0; let mut pcwp=0; let mut pnames=Vec::new();
     for (rid,u) in &a.units {

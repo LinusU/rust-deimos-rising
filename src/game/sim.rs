@@ -166,6 +166,11 @@ pub struct Entity {
     /// m_field_ec/m_field_e8 for stateParticles_* repeats).
     pub particle_bursts: u32,
     pub particle_last: u32,
+    /// State-sound bookkeeping (m_fielde0 play count, m_fielddc last-play
+    /// tick, and the per-state-index "already played" flags at +0x144).
+    pub sound_play_count: u32,
+    pub sound_last_play: u32,
+    pub state_sound_played: Vec<bool>,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -658,6 +663,9 @@ impl Sim {
             scale_delta: 0.0,
             particle_bursts: 0,
             particle_last: 0,
+            sound_play_count: 0,
+            sound_last_play: 0,
+            state_sound_played: vec![false; def.states.len()],
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
@@ -1409,6 +1417,47 @@ impl Sim {
                 }
             }
 
+            // --- state sound loop/repeat (G_EntityGroup flag3c block) ---
+            {
+                let (play, under_cap) = {
+                    let e = &self.entities[i];
+                    let mut play = false;
+                    if state.entry_sound.id != NONE_ID {
+                        if state.sound_loop {
+                            // Repeat every sound_loop_delay ticks.
+                            if e.sound_last_play == 0
+                                || self.game_time
+                                    >= e.sound_last_play + state.sound_loop_delay.max(0) as u32
+                            {
+                                play = true;
+                            }
+                        } else if e
+                            .state_sound_played
+                            .get(e.state)
+                            .copied()
+                            .unwrap_or(false)
+                            && e.sound_play_count == 0
+                        {
+                            play = true;
+                        } else if state.sound_repeat_on_state_change && e.sound_play_count == 0 {
+                            play = true;
+                        }
+                    }
+                    let under_cap = state.sound_max_num_to_play <= 0
+                        || e.sound_play_count < state.sound_max_num_to_play as u32;
+                    (play, under_cap)
+                };
+                if play && under_cap {
+                    // max_num_to_play caps total plays; 0 = uncapped here
+                    // (the original gates the whole block on it — entry
+                    // sounds still fire once via change_state).
+                    self.events.push(SimEvent::Sound(state.entry_sound.id));
+                    let e = &mut self.entities[i];
+                    e.sound_play_count += 1;
+                    e.sound_last_play = self.game_time;
+                }
+            }
+
             // --- spawn sets ---
             self.step_spawn_sets(i, &state);
 
@@ -1446,6 +1495,7 @@ impl Sim {
     fn change_state(&mut self, idx: usize, new_state: usize, def: &UnitDef) {
         let e = &mut self.entities[idx];
         e.state = new_state.min(def.states.len() - 1);
+        let state_idx = e.state;
         e.state_time = 0;
         e.dir_index = -1;
         let st = &def.states[e.state];
@@ -1458,14 +1508,25 @@ impl Sim {
         e.tracking = false;
         e.particle_bursts = 0;
         e.particle_last = 0;
+        e.sound_play_count = 0;
+        e.sound_last_play = 0;
+        if e.state_sound_played.len() < def.states.len() {
+            e.state_sound_played.resize(def.states.len(), false);
+        }
         let has_link = st.lock_to_owner_loc || st.link_to_owner_loc || st.orbit_owner;
         let orbit = st.orbit_owner;
         self.cache_owner_link(idx, has_link, orbit);
         self.init_cyclic(idx, st);
         self.set_visual_targets(idx, st);
-        // stateEntrySound plays on every state entry.
-        if st.entry_sound.id != NONE_ID {
-            self.events.push(SimEvent::Sound(st.entry_sound.id));
+        // stateEntrySound plays on every state entry; the per-state-index
+        // flag (entity +0x144 array) records it has played once.
+        let entry_sound = st.entry_sound.id;
+        if entry_sound != NONE_ID {
+            self.events.push(SimEvent::Sound(entry_sound));
+            let e = &mut self.entities[idx];
+            if e.state_sound_played.len() > state_idx {
+                e.state_sound_played[state_idx] = true;
+            }
         }
     }
 
