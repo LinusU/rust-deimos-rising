@@ -61,6 +61,8 @@ pub struct GameAssets {
     pub color_list: Option<crate::data::ColorList>,
     pub object_ids: crate::data::IdList,
     pub sprite_ids: crate::data::IdList,
+    /// `Sounds[gaso]` perm sound list — positional via `G_Res_GetPermSoundID`.
+    pub sound_ids: crate::data::IdList,
     pub strings: HashMap<ResId, crate::data::StillText>,
     pub text_formats: HashMap<ResId, crate::data::TextFormat>,
 }
@@ -83,6 +85,7 @@ impl GameAssets {
             color_list: None,
             object_ids: crate::data::IdList { entries: Vec::new() },
             sprite_ids: crate::data::IdList { entries: Vec::new() },
+            sound_ids: crate::data::IdList { entries: Vec::new() },
             strings: HashMap::new(),
             text_formats: HashMap::new(),
         })
@@ -124,6 +127,8 @@ impl GameAssets {
                 self.object_ids = list;
             } else if d.contains("sprite") {
                 self.sprite_ids = list;
+            } else if d.contains("sound") {
+                self.sound_ids = list;
             }
         }
 

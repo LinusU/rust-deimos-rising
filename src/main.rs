@@ -397,6 +397,9 @@ fn test_floats() {
         for i in 0x98usize..0xb0 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
+        for i in 0xb0usize..0xd0 {
+            println!("flli[0x{:02x}] = {}", i, fl.get(i));
+        }
     }
     println!("object_ids: {} entries", a.object_ids.entries.len());
     for (i, (n, r)) in a.object_ids.entries.iter().enumerate().take(0x28) {

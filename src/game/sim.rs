@@ -222,6 +222,24 @@ pub enum PlayerPhase {
     Dead,
 }
 
+/// Level-end money tally state — `G_Player::MoneyCounter` phases 1..8.
+/// The original stages a text sequence then drains the purse one coin per
+/// `MoneyCounter_Delay` ticks, awarding `chunk` score each drain until the
+/// bonus (`money * factor`) is fully converted.
+#[derive(Clone, Copy, Default)]
+pub struct MoneyTally {
+    /// 0 = inactive; otherwise the original's m_moneyCounter phase (1-8).
+    pub phase: u8,
+    /// Phase start time (m_moneyCounter0/m_moneyCounter3).
+    pub t0: u32,
+    /// Last drain tick (m_moneyCounter3 during phase 6).
+    pub drain_t: u32,
+    /// Bonus score left to award (m_moneyCounter5).
+    pub remaining: i64,
+    /// Score awarded per drain tick (m_moneyCounter6).
+    pub chunk: i64,
+}
+
 pub struct Player {
     pub slot: usize,
     pub def_id: ResId,
@@ -263,6 +281,8 @@ pub struct Player {
     pub last_hit_time: u32,
     /// Game time of last hit-effect spawn (m_shieldReset2 throttle).
     pub last_hit_fx: u32,
+    /// Level-end money→score tally (G_Player::MoneyCounter port).
+    pub money_tally: MoneyTally,
     /// Low-shield warning already shown (pad7[1] latch).
     pub shield_warned: bool,
     /// Age in ticks.
@@ -496,6 +516,7 @@ impl Sim {
             life_bonus_acc: 0,
             last_hit_time: 0,
             last_hit_fx: 0,
+            money_tally: MoneyTally::default(),
             shield_warned: false,
             age: 0,
             entry_entity: usize::MAX,
@@ -1026,15 +1047,29 @@ impl Sim {
                         false,
                         assets,
                     );
+                    // MoneyCounter_Start: stage the tally — the purse drains
+                    // gradually in step_money_tallies (phase 6) so score and
+                    // extra-life thresholds accrue over ~100+ ticks.
                     if money > 0 {
-                        self.add_score(
-                            slot,
-                            money * pf(assets, 0xab) as i64,
-                            false,
-                            assets,
-                        );
                         if let Some(p) = self.players[slot].as_mut() {
-                            p.money = 0;
+                            let factor = if pf(assets, 0xaa) != 0.0 {
+                                pf(assets, 0xab) * self.level_number as f32
+                            } else {
+                                pf(assets, 0xab)
+                            };
+                            let remaining = (money as f32 * factor) as i64;
+                            let mut chunk = (remaining as f32 * pf(assets, 0xc8)) as i64;
+                            let cap = pf(assets, 0xc7) as i64;
+                            if cap < chunk {
+                                chunk = cap;
+                            }
+                            p.money_tally = MoneyTally {
+                                phase: 1,
+                                t0: self.game_time,
+                                drain_t: self.game_time,
+                                remaining,
+                                chunk: chunk.max(1),
+                            };
                         }
                     }
                 }
@@ -1085,6 +1120,78 @@ impl Sim {
 
         // --- cleanup ---
         self.entities.retain(|e| !e.dead);
+
+        // --- level-end money tallies (G_Player::MoneyCounter_Process) ---
+        if self.phase == Phase::LevelEnd {
+            self.step_money_tallies(assets);
+        }
+    }
+
+    /// Advance each player's money tally through the original's 8 phases.
+    /// Phase timing uses the same perm floats: appear 10, then 20/20/20/30
+    /// staged waits, a 2-tick drain cadence, then 30/20 fade-out waits.
+    fn step_money_tallies(&mut self, assets: &GameAssets) {
+        for slot in 0..2 {
+            let mut tally = match self.players[slot].as_ref() {
+                Some(p) if p.money_tally.phase != 0 => p.money_tally,
+                _ => continue,
+            };
+            let now = self.game_time;
+            let elapsed = now.saturating_sub(tally.t0) as i64;
+            match tally.phase {
+                // Staged waits: 1→2 (10), 2→3 (20), 3→4 (20), 4→5 (20),
+                // 5→6 (30), then phase 6 drains, 7→8 (30), 8→done (20).
+                1 | 2 | 3 | 4 | 5 => {
+                    let need = match tally.phase {
+                        1 => pf(assets, 0xac) as i64,
+                        5 => pf(assets, 0xae) as i64,
+                        _ => pf(assets, 0xad) as i64,
+                    };
+                    if elapsed > need {
+                        tally.phase += 1;
+                        tally.t0 = now;
+                        if tally.phase == 6 {
+                            tally.drain_t = now;
+                        }
+                    }
+                }
+                6 => {
+                    if tally.remaining > 0 {
+                        let delay = pf(assets, 0xb0) as u32;
+                        if now.saturating_sub(tally.drain_t) >= delay {
+                            tally.drain_t = now;
+                            if let Some(p) = self.players[slot].as_mut() {
+                                if p.money > 0 {
+                                    p.money -= 1;
+                                }
+                            }
+                            self.add_score(slot, tally.chunk, false, assets);
+                            tally.remaining -= tally.chunk;
+                            self.events
+                                .push(SimEvent::PlayerEvent(slot, "money_tick"));
+                        }
+                    } else {
+                        tally.phase = 7;
+                        tally.t0 = now;
+                    }
+                }
+                7 => {
+                    if elapsed > pf(assets, 0xae) as i64 {
+                        tally.phase = 8;
+                        tally.t0 = now;
+                    }
+                }
+                8 => {
+                    if elapsed > pf(assets, 0xaf) as i64 {
+                        tally.phase = 0;
+                    }
+                }
+                _ => tally.phase = 0,
+            }
+            if let Some(p) = self.players[slot].as_mut() {
+                p.money_tally = tally;
+            }
+        }
     }
 
     fn step_player(&mut self, assets: &GameAssets, slot: usize, input: &PlayerInput) {
