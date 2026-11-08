@@ -9,6 +9,7 @@ use crate::assets::GameAssets;
 use crate::game::sim::{Entity as SimEntity, PlayerPhase, Sim, SCREEN_H, SCREEN_W};
 use crate::pak::ResId;
 use bevy::prelude::*;
+use rand::Rng;
 use std::collections::HashMap;
 
 /// Cache of decoded sprite frames → Bevy images.
@@ -79,6 +80,260 @@ pub struct MenuLogo;
 /// Centered menu text block.
 #[derive(Component)]
 pub struct MenuText;
+
+// ---------------------------------------------------------------------------
+// Particles (G_Particle port): spark bursts in screen space
+// ---------------------------------------------------------------------------
+
+/// One live particle.
+#[derive(Clone)]
+struct PPart {
+    pos: Vec2,
+    vel: Vec2,
+    /// Growth/life counter 0..32 (original m_field6).
+    grow: f32,
+    active: bool,
+    color: Color,
+}
+
+struct PGroup {
+    /// Scroll with the terrain (original m_field414, ground-class units).
+    scroll: bool,
+    parts: Vec<PPart>,
+}
+
+/// Velocity lookup tables: 100 entries each, generated once like
+/// G_Particle_LoadHeader (random unit vectors; table1 gets a random
+/// magnitude class {1, 32, 65535}, table2 stays unit length).
+struct ParticleTables {
+    t1: Vec<Vec2>,
+    t2: Vec<Vec2>,
+    idx1: usize,
+    idx2: usize,
+}
+
+#[derive(Resource, Default)]
+pub struct Particles {
+    groups: Vec<PGroup>,
+    tables: Option<ParticleTables>,
+    last_scroll: f32,
+    white: Option<Handle<Image>>,
+}
+
+impl Particles {
+    fn tables(&mut self) -> &mut ParticleTables {
+        if self.tables.is_none() {
+            let mut rng = rand::thread_rng();
+            let mut t1 = Vec::with_capacity(100);
+            let mut t2 = Vec::with_capacity(100);
+            for _ in 0..100 {
+                // Random point in the 416x480 view → normalized vector
+                // toward the center-ish target (invRange - rand).
+                let rx = rng.gen_range(0.0..416.0f32);
+                let ry = rng.gen_range(0.0..480.0f32);
+                let dx = 208.0 - rx;
+                let dy = 240.0 - ry;
+                let len = (dx * dx + dy * dy).sqrt().max(0.001);
+                let v = Vec2::new(dx / len, dy / len);
+                t2.push(v);
+                let mult = match rng.gen_range(0..4) {
+                    1 => 32.0,
+                    2 => 65535.0,
+                    _ => 1.0,
+                };
+                t1.push(v * mult);
+            }
+            self.tables = Some(ParticleTables { t1, t2, idx1: 0, idx2: 0 });
+        }
+        self.tables.as_mut().unwrap()
+    }
+
+    /// `G_Particle_NewGroup`: spawn a spark burst. `circular` selects the
+    /// unit-vector table (hitParticleDoCircularBurst / "icem" type).
+    pub fn burst(
+        &mut self,
+        x: f32,
+        y: f32,
+        kind: ResId,
+        color: u32,
+        scroll: bool,
+        circular: bool,
+    ) {
+        // (count, fast?, unit_table?) per particle type.
+        let (count, fast, unit_tbl) = match kind {
+            k if k == crate::pak::id("med ") => (20usize, false, false),
+            k if k == crate::pak::id("larg") => (40, false, false),
+            k if k == crate::pak::id("laci") => (20, false, false),
+            k if k == crate::pak::id("icem") => (40, false, true),
+            k if k == crate::pak::id("tici") => (5, true, false),
+            k if k == crate::pak::id("smci") => (10, true, false),
+            k if k == crate::pak::id("smal") => (10, true, false),
+            k if k == crate::pak::id("tiny") => (5, true, false),
+            _ => return,
+        };
+        let use_t2 = unit_tbl || circular;
+        let speed_mul = if fast { 5.0 } else { -32.0 };
+        // Shade variants: base * (1 - i*0.12), secondary set *0.6.
+        let base = [
+            ((color >> 16) & 0xff) as f32 / 255.0,
+            ((color >> 8) & 0xff) as f32 / 255.0,
+            (color & 0xff) as f32 / 255.0,
+        ];
+        let shades: Vec<Color> = (0..5)
+            .flat_map(|i| {
+                let f = 1.0 - i as f32 * 0.12;
+                [f, f * 0.6].map(move |s| {
+                    Color::srgba(
+                        (base[0] * s).min(1.0),
+                        (base[1] * s).min(1.0),
+                        (base[2] * s).min(1.0),
+                        1.0,
+                    )
+                })
+            })
+            .collect();
+        let mut parts = Vec::with_capacity(count);
+        let mut rng = rand::thread_rng();
+        for _ in 0..count {
+            let (vx, vy) = {
+                let t = self.tables();
+                if use_t2 {
+                    let i = t.idx2;
+                    t.idx2 = (t.idx2 + 1) % 99;
+                    let v = t.t2[i];
+                    (v.x, v.y)
+                } else {
+                    let i = t.idx1;
+                    t.idx1 = (t.idx1 + 1) % 99;
+                    let v = t.t1[i];
+                    (v.x, v.y)
+                }
+            };
+            parts.push(PPart {
+                pos: Vec2::new(x, y),
+                vel: Vec2::new(vx * speed_mul, vy * speed_mul),
+                grow: 0.0,
+                active: true,
+                color: shades[rng.gen_range(0..shades.len())],
+            });
+        }
+        self.groups.push(PGroup { scroll, parts });
+        if self.groups.len() > 64 {
+            self.groups.remove(0);
+        }
+    }
+}
+
+/// Advance particles one 60 Hz tick (G_Particle_Process).
+fn particle_tick(p: &mut Particles, scroll_delta: f32) {
+    // Bounds in screen space (original: x[-32,448] y[0,480] of the
+    // 480-wide world view → mapped into the 640-wide display).
+    const BX1: f32 = 592.0;
+    const BY0: f32 = -32.0;
+    const BY1: f32 = 512.0;
+    p.groups.retain_mut(|g| {
+        let mut any = false;
+        for pt in g.parts.iter_mut() {
+            if !pt.active {
+                continue;
+            }
+            if g.scroll {
+                pt.pos.y += scroll_delta;
+            }
+            pt.vel *= 0.96; // pf(0x90)
+            pt.pos += pt.vel;
+            if (pt.pos.x < -32.0 || pt.pos.x + 7.0 > BX1 || pt.pos.y < BY0 || pt.pos.y + 7.0 > BY1) {
+                pt.active = false;
+                continue;
+            }
+            pt.grow += 1.0; // pf(0x94)
+            if pt.grow > 32.0 {
+                pt.active = false;
+            } else {
+                any = true;
+            }
+        }
+        any
+    });
+}
+
+/// Spawn/despawn particle sprites each frame.
+pub fn sync_particles(
+    mut commands: Commands,
+    mut parts: ResMut<Particles>,
+    sim_res: Res<GameSim>,
+    flow: Res<Flow>,
+    time: Res<Time>,
+    mut images: ResMut<Assets<Image>>,
+    mut q: Query<(Entity, &ParticleSprite, &mut Sprite, &mut Transform)>,
+) {
+    if flow.state != FlowState::Playing {
+        for (e, _, _, _) in q.iter() {
+            commands.entity(e).despawn();
+        }
+        parts.groups.clear();
+        return;
+    }
+    // Fixed-step at 60 Hz.
+    let ticks = (time.delta_secs() * 60.0) as u32;
+    let scroll_delta = sim_res.0.scroll - parts.last_scroll;
+    parts.last_scroll = sim_res.0.scroll;
+    for _ in 0..ticks.min(4) {
+        particle_tick(&mut parts, scroll_delta);
+    }
+    // White 2x2 tex for particle quads.
+    if parts.white.is_none() {
+        let px = [255u8, 255, 255, 255].repeat(4);
+        parts.white = Some(images.add(rgba_image(2, 2, &px)));
+    }
+    let white = parts.white.clone().unwrap();
+
+    // Desired: (group, part) -> (pos, color, grow)
+    let mut desired: Vec<(u32, Vec2, Color, f32)> = Vec::new();
+    for (gi, g) in parts.groups.iter().enumerate() {
+        for (pi, p) in g.parts.iter().enumerate() {
+            if p.active {
+                desired.push(((gi * 64 + pi) as u32, p.pos, p.color, p.grow));
+            }
+        }
+    }
+    // Despawn missing.
+    for (bevy_e, ps, _, _) in q.iter() {
+        if !desired.iter().any(|d| d.0 == ps.key) {
+            commands.entity(bevy_e).despawn();
+        }
+    }
+    for (key, pos, color, grow) in desired {
+        let wpos = to_world(pos.x, pos.y);
+        // Quick fade-in over first 8 ticks of growth.
+        let alpha = (grow / 8.0).min(1.0);
+        let col = Color::srgba(color.to_srgba().red, color.to_srgba().green, color.to_srgba().blue, alpha);
+        let mut found = None;
+        for (_bevy_e, ps, sprite, transform) in q.iter_mut() {
+            if ps.key == key {
+                found = Some((sprite, transform));
+                break;
+            }
+        }
+        if let Some((mut sprite, mut transform)) = found {
+            transform.translation = wpos;
+            sprite.color = col;
+        } else {
+            let mut sprite = Sprite::from_image(white.clone());
+            sprite.color = col;
+            commands.spawn((
+                sprite,
+                Transform::from_translation(wpos),
+                ParticleSprite { key },
+            ));
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct ParticleSprite {
+    key: u32,
+}
 
 /// Input state gathered from Bevy keys.
 #[derive(Resource, Default)]
@@ -735,7 +990,8 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             players: players.clamp(1, 2),
             ticks: 0,
             level_ids,
-        });
+        })
+        .insert_resource(Particles::default());
     if let Some(engine) = crate::game::audio::AudioEngine::new() {
         app.insert_resource(engine);
     }
@@ -750,6 +1006,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 crate::game::audio::drain_events,
                 sync_menu,
                 sync_terrain,
+                sync_particles,
                 sync_entities,
                 sync_players,
                 hud_system,

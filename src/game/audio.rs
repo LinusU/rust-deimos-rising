@@ -7,7 +7,7 @@
 //! so every `sfx.add(source)` overlaps freely.
 
 use crate::assets::{GameAssets, Sound};
-use crate::game::render::GameSim;
+use crate::game::render::{GameSim, Particles};
 use crate::game::sim::SimEvent;
 use crate::pak::ResId;
 use bevy::prelude::*;
@@ -110,9 +110,24 @@ impl AudioEngine {
 pub fn drain_events(
     mut sim_res: ResMut<GameSim>,
     mut assets: ResMut<GameAssets>,
+    mut parts: ResMut<Particles>,
     audio: Option<ResMut<AudioEngine>>,
 ) {
     let events = std::mem::take(&mut sim_res.0.events);
+    if events.is_empty() {
+        return;
+    }
+    // Particles route regardless of audio availability.
+    let events: Vec<SimEvent> = events
+        .into_iter()
+        .filter(|ev| match ev {
+            SimEvent::Particles { x, y, kind, color, scroll, circular } => {
+                parts.burst(*x, *y, *kind, *color, *scroll, *circular);
+                false
+            }
+            _ => true,
+        })
+        .collect();
     if events.is_empty() {
         return;
     }

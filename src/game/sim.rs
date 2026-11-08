@@ -162,6 +162,10 @@ pub struct Entity {
     pub scale: f32,
     pub scale_tgt: f32,
     pub scale_delta: f32,
+    /// State particle burst count / last-burst tick (G_EntityGroup
+    /// m_field_ec/m_field_e8 for stateParticles_* repeats).
+    pub particle_bursts: u32,
+    pub particle_last: u32,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -351,6 +355,17 @@ pub enum SimEvent {
     LevelComplete,
     /// Entity cap reached (original "Reached Entity Limit" notice).
     EntityLimit,
+    /// Spark burst request (G_Particle_NewGroup). Screen-space pos.
+    Particles {
+        x: f32,
+        y: f32,
+        kind: ResId,
+        color: u32,
+        /// Scroll with terrain (ground-class units).
+        scroll: bool,
+        /// Circular burst (unit-vector table).
+        circular: bool,
+    },
 }
 
 /// Internal spawn request.
@@ -641,6 +656,8 @@ impl Sim {
             scale: 1.0,
             scale_tgt: 1.0,
             scale_delta: 0.0,
+            particle_bursts: 0,
+            particle_last: 0,
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
@@ -1363,6 +1380,35 @@ impl Sim {
             // --- owner linkage (lock/link/orbit) ---
             self.step_owner_link(i, assets);
 
+            // --- state repeat particles (G_EntityGroup stateParticles_*) ---
+            if state.particles_id != NONE_ID {
+                let max_bursts = if state.particles_repeat {
+                    state.particles_max_bursts.max(0) as u32
+                } else {
+                    1
+                };
+                let under_cap = max_bursts == 0 || self.entities[i].particle_bursts < max_bursts;
+                let due = self.game_time
+                    >= self.entities[i].particle_last
+                        + state.particles_repeat_delay.max(0) as u32;
+                if under_cap && due {
+                    let unit_scroll = assets
+                        .units
+                        .get(&self.entities[i].unit)
+                        .map(|d| d.terrain_effect)
+                        .unwrap_or(false);
+                    self.emit_particles(
+                        i,
+                        state.particles_id,
+                        state.particles_color,
+                        unit_scroll,
+                        false,
+                    );
+                    self.entities[i].particle_bursts += 1;
+                    self.entities[i].particle_last = self.game_time;
+                }
+            }
+
             // --- spawn sets ---
             self.step_spawn_sets(i, &state);
 
@@ -1410,6 +1456,8 @@ impl Sim {
         e.frame = st.sprite_frame_min;
         e.anim_stopped = false;
         e.tracking = false;
+        e.particle_bursts = 0;
+        e.particle_last = 0;
         let has_link = st.lock_to_owner_loc || st.link_to_owner_loc || st.orbit_owner;
         let orbit = st.orbit_owner;
         self.cache_owner_link(idx, has_link, orbit);
@@ -1435,6 +1483,25 @@ impl Sim {
             e.scale_tgt = st.required_scale_percent as f32 / 100.0;
         }
         e.scale_delta = (st.scale_delta_percent as f32 / 100.0).abs();
+    }
+
+    /// Emit a spark burst at an entity's screen position. `scroll` marks
+    /// ground-class units whose particles track the terrain.
+    fn emit_particles(&mut self, idx: usize, kind: ResId, color: u32, scroll: bool, circular: bool) {
+        if kind == NONE_ID {
+            return;
+        }
+        let e = &self.entities[idx];
+        let sx = e.pos.x - self.cam_x + WORLD_TO_SCREEN_X;
+        let sy = self.scroll + SCREEN_H - e.pos.y;
+        self.events.push(SimEvent::Particles {
+            x: sx,
+            y: sy,
+            kind,
+            color,
+            scroll,
+            circular,
+        });
     }
 
     /// `G_GameObject::AdjustVisibilityAndTinting` + `DoScaling`: nudge the
@@ -1961,6 +2028,14 @@ impl Sim {
         if snd.id != NONE_ID {
             self.events.push(SimEvent::Sound(snd.id));
         }
+        // hitParticles burst on non-lethal hits (G_Entity::Hit).
+        self.emit_particles(
+            idx,
+            def.hit_particles,
+            def.hit_particles_color,
+            def.terrain_effect,
+            def.hit_particle_circular_burst,
+        );
         // Collision spawn (state+0x2e0): throttled, repeat-gated, owned
         // by the hit entity itself.
         if cur_state.collision_spawn_id != NONE_ID {
@@ -2038,8 +2113,16 @@ impl Sim {
         if def.destruct_sound.id != NONE_ID {
             self.events.push(SimEvent::Sound(def.destruct_sound.id));
         }
-        // destruct_particle / destruct_notice: particle & notice systems
-        // aren't ported yet.
+        // destructParticle burst (G_Entity::Destroy); ground-class units
+        // scroll with the terrain ("grnd" check → terrain_effect proxy).
+        self.emit_particles(
+            idx,
+            def.destruct_particle,
+            def.destruct_particle_color,
+            def.terrain_effect,
+            false,
+        );
+        // destruct_notice: floating text — TODO notice system.
 
         // Coin release: N copies of destruct_coin at the kill location.
         if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {

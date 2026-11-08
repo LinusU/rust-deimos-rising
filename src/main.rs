@@ -363,6 +363,9 @@ fn test_floats() {
         for i in 0x30usize..0x45 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
+        for i in 0x88usize..0x98 {
+            println!("flli[0x{:02x}] = {}", i, fl.get(i));
+        }
         for i in 0x98usize..0xb0 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
@@ -409,6 +412,16 @@ fn test_defs() {
         if st.collision_spawn_id != pak::NONE_ID {ncolspawn+=1;}
     }}
     println!("STATES collides={} collPlayers={} targetable={} noDeplete={} reverse={} shieldState={} useVis={} useScale={} destOwner={} visRefl={} parentDir={} colSpawn={}", ncoll,ncwp,ntarg,nnodepl,nrev,nshieldst,nusevis,nusescale,ndestowner,nvisrefl,nparentdir,ncolspawn);
+    // Particle config census.
+    let mut dp=0; let mut hp=0; let mut sp=0; let mut spr=0;
+    for u in a.units.values() {
+        if u.destruct_particle != pak::NONE_ID {dp+=1;}
+        if u.hit_particles != pak::NONE_ID {hp+=1;}
+        for st in &u.states {
+            if st.particles_id != pak::NONE_ID {sp+=1; if st.particles_repeat {spr+=1;}}
+        }
+    }
+    println!("PARTICLES destruct={} hit={} state={} stateRepeat={}", dp,hp,sp,spr);
     // pickup units: do their states set collides/collidesWithPlayers?
     let mut pu=0; let mut pcoll=0; let mut pcwp=0; let mut pnames=Vec::new();
     for (rid,u) in &a.units {
