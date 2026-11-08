@@ -918,9 +918,40 @@ impl Sim {
         } else {
             u32::MAX
         };
+        // Spawn scatter (sub_01c540): the unit def's xOffset/yOffset
+        // min/max jitter each spawned entity around the request point;
+        // equal bounds are a fixed offset, and the original's polar mode
+        // only applies when both axes carry a range.
+        let pos = if def.x_offset_min != def.x_offset_max
+            || def.y_offset_min != def.y_offset_max
+        {
+            let jx = if def.x_offset_min != def.x_offset_max {
+                let (lo, hi) = if def.x_offset_min <= def.x_offset_max {
+                    (def.x_offset_min, def.x_offset_max)
+                } else {
+                    (def.x_offset_max, def.x_offset_min)
+                };
+                rand_int(&mut self.rng, lo.round() as i64, hi.round() as i64) as f32
+            } else {
+                def.x_offset_min as f32
+            };
+            let jy = if def.y_offset_min != def.y_offset_max {
+                let (lo, hi) = if def.y_offset_min <= def.y_offset_max {
+                    (def.y_offset_min, def.y_offset_max)
+                } else {
+                    (def.y_offset_max, def.y_offset_min)
+                };
+                rand_int(&mut self.rng, lo.round() as i64, hi.round() as i64) as f32
+            } else {
+                def.y_offset_min as f32
+            };
+            req.pos + Vec2::new(jx, jy)
+        } else {
+            req.pos
+        };
         self.entities.push(Entity {
             unit: req.unit,
-            pos: req.pos,
+            pos,
             vel,
             heading,
             state: state_idx,
