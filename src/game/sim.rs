@@ -24,9 +24,11 @@ pub const SCREEN_H: f32 = 480.0;
 /// Terrain width in world pixels.
 pub const WORLD_W: f32 = 480.0;
 /// Left edge of the 416-px playfield on screen.
-pub const PLAY_LEFT: f32 = 32.0;
+pub const PLAY_LEFT: f32 = 112.0;
 /// Right edge of the playfield on screen (PLAY_LEFT + VisibleGameWidth 416).
 pub const PLAY_RIGHT: f32 = PLAY_LEFT + 416.0;
+/// World→screen x offset: 480-wide world centered in the 640 window.
+pub const WORLD_TO_SCREEN_X: f32 = 80.0;
 /// Player top game-area limit (perm float 0xb7 = Player_TopGameAreaLimit).
 pub const PLAYER_TOP_LIMIT: f32 = 13.0;
 /// Player bottom limit.
@@ -171,7 +173,7 @@ impl Entity {
     /// Screen-space position for rendering.
     pub fn screen_pos(&self, sim: &Sim) -> Vec2 {
         let p = self.pos + self.cyc_off;
-        Vec2::new(p.x - sim.cam_x, sim.scroll + SCREEN_H - p.y)
+        Vec2::new(p.x - sim.cam_x + WORLD_TO_SCREEN_X, sim.scroll + SCREEN_H - p.y)
     }
 }
 
@@ -240,7 +242,7 @@ impl Player {
     /// World position used for collisions and spawning.
     pub fn world_pos(&self, sim: &Sim) -> Vec2 {
         Vec2::new(
-            self.screen.x + sim.cam_x,
+            self.screen.x + sim.cam_x - WORLD_TO_SCREEN_X,
             sim.scroll + SCREEN_H - self.screen.y,
         )
     }
@@ -371,11 +373,13 @@ impl Sim {
     pub fn add_player(&mut self, assets: &GameAssets, slot: usize, two_player: bool) {
         let def_id = if slot == 0 { id("pl01") } else { id("pl02") };
         let def = assets.players.get(&def_id).cloned().unwrap_or_default();
-        let (sx, sy) = if two_player {
+        // Entry coords are play-area relative (0..416) → screen space.
+        let (ex, ey) = if two_player {
             (def.entry_multi_start_x as f32, def.entry_multi_start_y as f32)
         } else {
             (def.entry_solo_start_x as f32, def.entry_solo_start_y as f32)
         };
+        let (sx, sy) = (PLAY_LEFT + ex, ey);
         let max_bombs = pf(assets, pf::WEAPON_MAX_BOMBS) as i64;
         let base_bombs = pf(assets, pf::WEAPON_BASE_BOMBS) as i64;
         self.players[slot] = Some(Player {
@@ -593,6 +597,22 @@ impl Sim {
         let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
         self.cache_owner_link(idx, has_link, state.orbit_owner);
         self.init_cyclic(idx, state);
+        // Initial state entry sound.
+        if state.entry_sound.id != NONE_ID {
+            self.events.push(SimEvent::Sound(state.entry_sound.id));
+        }
+        // stateUseParentDirection: adopt the owner's facing at spawn.
+        if state.use_parent_direction {
+            if let Some(owner_idx) = self
+                .entities
+                .iter()
+                .position(|o| o.unique_num == self.entities[idx].owner && !o.dead)
+            {
+                let oh = self.entities[owner_idx].heading;
+                self.entities[idx].heading = oh;
+                self.entities[idx].dir_index = -1; // force direction re-pick
+            }
+        }
         Some(idx)
     }
 
@@ -720,10 +740,12 @@ impl Sim {
                     if p.lives > 0 {
                         // Respawn.
                         p.phase = PlayerPhase::Active;
-                        p.screen = Vec2::new(
-                            if slot == 0 && two_p { def.entry_multi_start_x as f32 } else { def.entry_solo_start_x as f32 },
-                            def.entry_solo_start_y as f32,
-                        );
+                        let (ex, ey) = if two_p {
+                            (def.entry_multi_start_x as f32, def.entry_multi_start_y as f32)
+                        } else {
+                            (def.entry_solo_start_x as f32, def.entry_solo_start_y as f32)
+                        };
+                        p.screen = Vec2::new(PLAY_LEFT + ex, ey);
                         p.vel = Vec2::ZERO;
                         p.shields = 100.0;
                         p.invuln = def.entry_invulnerability_time as u32;
@@ -1011,6 +1033,39 @@ impl Sim {
                 }
             }
 
+            // --- constrainInGameArea: bounce-clamp to the visible area ---
+            {
+                let defc = assets.units.get(&self.entities[i].unit);
+                if defc.map(|d| d.constrain_in_game_area).unwrap_or(false) {
+                    // World-space clamp: x∈[0,480] (bg width), y within the
+                    // visible scroll band — with velocity bounce.
+                    let w = self.level_width();
+                    let h = pf(assets, pf::VISIBLE_GAME_HEIGHT) as f32;
+                    let e = &mut self.entities[i];
+                    let r = entity_radius(defc.unwrap()) * 0.5;
+                    if e.pos.x < r {
+                        e.pos.x = r;
+                        e.vel.x = -e.vel.x;
+                        e.heading = vector_to_heading(e.vel);
+                    } else if e.pos.x > w - r {
+                        e.pos.x = w - r;
+                        e.vel.x = -e.vel.x;
+                        e.heading = vector_to_heading(e.vel);
+                    }
+                    let min_y = self.scroll;
+                    let max_y = self.scroll + h;
+                    if e.pos.y < min_y {
+                        e.pos.y = min_y;
+                        e.vel.y = -e.vel.y;
+                        e.heading = vector_to_heading(e.vel);
+                    } else if e.pos.y > max_y {
+                        e.pos.y = max_y;
+                        e.vel.y = -e.vel.y;
+                        e.heading = vector_to_heading(e.vel);
+                    }
+                }
+            }
+
             // --- cyclic motion (Priv_DoCyclicMotion): bounded random walk
             // of a display offset, amplitude = stateMaxSpeed ---
             if state.cyclic_motion {
@@ -1026,7 +1081,7 @@ impl Sim {
             // --- cull ---
             let e = &self.entities[i];
             let sy = self.scroll + SCREEN_H - e.pos.y;
-            let sx = e.pos.x - self.cam_x;
+            let sx = e.pos.x - self.cam_x + WORLD_TO_SCREEN_X;
             let off = e.pos.y < -80.0
                 || e.pos.y > self.level_height() + 80.0
                 || sx < -80.0 || sx > SCREEN_W + 80.0
@@ -1071,6 +1126,10 @@ impl Sim {
         let orbit = st.orbit_owner;
         self.cache_owner_link(idx, has_link, orbit);
         self.init_cyclic(idx, st);
+        // stateEntrySound plays on every state entry.
+        if st.entry_sound.id != NONE_ID {
+            self.events.push(SimEvent::Sound(st.entry_sound.id));
+        }
     }
 
     /// Seed the cyclic-motion walk for states with stateCyclicMotion.
@@ -1412,7 +1471,7 @@ impl Sim {
     /// playfield x 0..416 (world x 32..448), height above the scroll
     /// origin 0..480.
     fn is_within_game_area(&self, pos: Vec2, assets: &GameAssets) -> bool {
-        let px = pos.x - PLAY_LEFT;
+        let px = pos.x - self.cam_x + WORLD_TO_SCREEN_X - PLAY_LEFT;
         let py = pos.y - self.scroll;
         px >= 0.0 && px <= pf(assets, pf::VISIBLE_GAME_WIDTH)
             && py >= 0.0 && py <= pf(assets, pf::VISIBLE_GAME_HEIGHT)
@@ -1774,7 +1833,7 @@ impl Sim {
                 >= p.last_hit_fx as i64 + pf(assets, 0xa2) as i64
         {
             p.last_hit_fx = self.game_time;
-            let pos = Vec2::new(p.screen.x + self.cam_x, self.scroll + SCREEN_H - p.screen.y);
+            let pos = Vec2::new(p.screen.x + self.cam_x - WORLD_TO_SCREEN_X, self.scroll + SCREEN_H - p.screen.y);
             self.request_spawn(SpawnReq {
                 unit: pdef.active_spawn_on_hit,
                 pos,
@@ -1803,7 +1862,7 @@ impl Sim {
         {
             // Low-shield warning object, latched until shields recover.
             p.shield_warned = true;
-            let pos = Vec2::new(p.screen.x + self.cam_x, self.scroll + SCREEN_H - p.screen.y);
+            let pos = Vec2::new(p.screen.x + self.cam_x - WORLD_TO_SCREEN_X, self.scroll + SCREEN_H - p.screen.y);
             self.request_spawn(SpawnReq {
                 unit: pdef.active_shield_warning_object,
                 pos,
