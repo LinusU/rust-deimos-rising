@@ -15,8 +15,6 @@ use crate::assets::GameAssets;
 use crate::data::{LevelDef, PlayerDef, StateRule, UnitDef, UnitState};
 use crate::pak::{id, ResId, NONE_ID};
 use glam::Vec2;
-use rand::Rng;
-use rand::SeedableRng;
 
 pub const TICK_HZ: f32 = 60.0;
 pub const SCREEN_W: f32 = 640.0;
@@ -63,11 +61,47 @@ pub fn rid_str(rid: ResId) -> String {
     b.iter().map(|&c| c as char).collect()
 }
 
-fn rand_range(rng: &mut impl Rng, min: f64, max: f64) -> f64 {
-    if max <= min {
+/// MSL `rand()`/`srand()` from the original executable (rand.obj):
+/// `state = state*1103515245 + 12345; return (state >> 16) & 0x7fff`.
+/// `srand` stores the seed verbatim. Using the same generator lets retail
+/// film replays consume an identical random stream.
+#[derive(Clone)]
+pub struct Crand {
+    state: u32,
+}
+
+impl Crand {
+    pub fn new(seed: u32) -> Self {
+        Self { state: seed }
+    }
+    pub fn srand(&mut self, seed: u32) {
+        self.state = seed;
+    }
+    pub fn rand(&mut self) -> u32 {
+        self.state = self
+            .state
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345);
+        (self.state >> 16) & 0x7fff
+    }
+}
+
+/// `U_Utils_RandomInt(min, max)` = `min + rand() % (max - min + 1)`.
+fn rand_int(rng: &mut Crand, min: i64, max: i64) -> i64 {
+    if min == max {
         min
     } else {
-        rng.gen_range(min..=max)
+        min + (rng.rand() % (max - min + 1) as u32) as i64
+    }
+}
+
+/// `U_Utils_RandomFloat(low, high)` = `rand() * (high - low) / 32767 + min`.
+fn rand_float(rng: &mut Crand, low: f64, high: f64) -> f64 {
+    if low == high {
+        low
+    } else {
+        let min = if low > high { high } else { low };
+        rng.rand() as f64 * (high - low) / 32767.0 + min
     }
 }
 
@@ -513,7 +547,7 @@ pub struct Sim {
     next_unique: u32,
     next_group_id: u32,
     limit_message_shown: bool,
-    pub rng: rand::rngs::StdRng,
+    pub rng: Crand,
     spawn_queue: Vec<SpawnReq>,
     /// Parallel to spawn_queue: pinned screen pos for UI entities.
     spawn_locks: Vec<Option<Vec2>>,
@@ -637,7 +671,7 @@ impl Sim {
             next_unique: 1,
             next_group_id: 1,
             limit_message_shown: false,
-            rng: rand::rngs::StdRng::seed_from_u64(seed),
+            rng: Crand::new(seed as u32),
             spawn_queue: Vec::new(),
             spawn_locks: Vec::new(),
             events: Vec::new(),
@@ -798,7 +832,7 @@ impl Sim {
             lo = hi;
         }
         let mut count = if lo != hi {
-            rand_range(&mut self.rng, lo as f64, hi.max(lo) as f64) as i64
+            rand_int(&mut self.rng, lo, hi.max(lo))
         } else {
             lo
         };
@@ -808,7 +842,7 @@ impl Sim {
             for _ in 0..count {
                 let chance = def.appears_percent;
                 if chance != 100
-                    && (chance == 0 || rand_range(&mut self.rng, 0.0, 100.0) as i64 > chance)
+                    && (chance == 0 || rand_int(&mut self.rng, 0, 100) > chance)
                 {
                     culled += 1;
                 }
@@ -836,10 +870,10 @@ impl Sim {
         let mut acc = 0u32;
         for _ in 0..count {
             acc = acc.saturating_add(if def.group_delay_min != def.group_delay_max {
-                rand_range(
+                rand_int(
                     &mut self.rng,
-                    def.group_delay_min as f64,
-                    def.group_delay_max.max(def.group_delay_min) as f64,
+                    def.group_delay_min as i64,
+                    def.group_delay_max.max(def.group_delay_min) as i64,
                 ) as u32
             } else {
                 def.group_delay_min.max(0) as u32
@@ -855,10 +889,17 @@ impl Sim {
         }
         let state_idx = req.state.unwrap_or(0).min(def.states.len() - 1);
         let state = &def.states[state_idx];
-        let speed = rand_range(&mut self.rng, def.initial_speed_min, def.initial_speed_max) as f32;
+        let speed = rand_float(&mut self.rng, def.initial_speed_min as f64, def.initial_speed_max as f64) as f32;
         let heading_base = req.heading.unwrap_or(def.initial_heading as f32);
-        let tol = def.initial_heading_tolerance as f32;
-        let heading = heading_base + rand_range(&mut self.rng, -(tol as f64), tol as f64) as f32;
+        let tol = def.initial_heading_tolerance;
+        // Priv spawn: tolerance roll is U_Utils_RandomInt(-half, +half) with
+        // half = (tol + 1) >> 1, and only when tolerance != 0.
+        let heading = if tol != 0 {
+            let half = ((tol + 1) >> 1) as i64;
+            heading_base + rand_int(&mut self.rng, -half, half) as f32
+        } else {
+            heading_base
+        };
         let hr = heading.to_radians();
         let vel = if req.stationary {
             Vec2::ZERO
@@ -868,7 +909,7 @@ impl Sim {
         let shields = if def.shields_max > 0.0 { def.shields_max } else { def.shields_base };
         // Roll the on_timer target once at spawn.
         let timer_target = if state.on_timer_max > 0 || state.on_timer_min > 0 {
-            rand_range(&mut self.rng, state.on_timer_min as f64, state.on_timer_max.max(state.on_timer_min) as f64) as u32
+            rand_int(&mut self.rng, state.on_timer_min as i64, state.on_timer_max.max(state.on_timer_min) as i64) as u32
         } else { 0 };
         let idx = self.entities.len();
         // req.owner is an entity index; store the stable unique_num.
@@ -1984,8 +2025,8 @@ impl Sim {
             // play area, re-rolled every tick (panic scatter). Runs even
             // with no active players — m_field_0xc0 bypasses target AI.
             if state.flee_id != NONE_ID {
-                let tx = rand_range(&mut self.rng, 32.0, 448.0) as f32;
-                let ty = rand_range(
+                let tx = rand_float(&mut self.rng, 32.0, 448.0) as f32;
+                let ty = rand_float(
                     &mut self.rng,
                     self.scroll as f64,
                     (self.scroll + SCREEN_H) as f64,
@@ -2187,10 +2228,10 @@ impl Sim {
 
             // --- motion blur afterimages (G_MotionBlur_New trigger) ---
             if state.motion_blur_required {
-                let interval = rand_range(
+                let interval = rand_int(
                     &mut self.rng,
-                    state.motion_blur_min_time as f64,
-                    state.motion_blur_max_time.max(state.motion_blur_min_time) as f64,
+                    state.motion_blur_min_time,
+                    state.motion_blur_max_time.max(state.motion_blur_min_time),
                 ) as u32;
                 if self.game_time > self.entities[i].blur_last + interval {
                     let (unit, state_i, frame, sx, sy, scale) = {
@@ -2263,7 +2304,7 @@ impl Sim {
         e.dir_index = -1;
         let st = &def.states[e.state];
         e.state_timer_target = if st.on_timer_max > 0 || st.on_timer_min > 0 {
-            rand_range(&mut self.rng, st.on_timer_min as f64, st.on_timer_max.max(st.on_timer_min) as f64) as u32
+            rand_int(&mut self.rng, st.on_timer_min, st.on_timer_max.max(st.on_timer_min)) as u32
         } else { 0 };
         e.spawn_timers = vec![SpawnSetRt::default(); st.spawn_sets.len()];
         e.frame = st.sprite_frame_min;
@@ -2430,11 +2471,16 @@ impl Sim {
         let e = &mut self.entities[idx];
         e.cyc_off = Vec2::ZERO;
         if st.cyclic_motion {
+            // The original has no init roll here — the walk delta starts
+            // from the entity's velocity direction.
             let amp = st.max_speed.abs().max(4.0) as f32;
-            // Drift speed ~ amplitude/8, random direction.
-            let ang = rand_range(&mut self.rng, 0.0, 360.0) as f32;
-            let hr = ang.to_radians();
-            e.cyc_delta = Vec2::new(hr.sin(), hr.cos()) * (amp / 8.0).max(0.5);
+            let v = e.vel;
+            let m = (amp / 8.0).max(0.5);
+            e.cyc_delta = if v.length_squared() > 0.0001 {
+                v.normalize() * m
+            } else {
+                Vec2::new(m, 0.0)
+            };
         } else {
             e.cyc_delta = Vec2::ZERO;
         }
@@ -2482,13 +2528,13 @@ impl Sim {
         None
     }
 
-    /// `G_Entity::Priv_DoCyclicMotion`: reflected random walk bounded by a
-    /// per-tick random step in [amp/2, amp] + jitter.
+    /// `G_Entity::Priv_DoCyclicMotion`: per-tick step is
+    /// `RandomInt(amp/2, amp) + RandomInt(1, 100) / 100`; the offset clamps
+    /// to ±step and its delta flips sign (reflected random walk).
     fn step_cyclic(&mut self, idx: usize, state: &UnitState) {
-        let amp = (state.max_speed.abs() as i64).max(1);
-        let step = rand_range(&mut self.rng, (amp / 2).max(1) as f64, amp as f64)
-            + rand_range(&mut self.rng, 1.0, 100.0) / 100.0;
-        let step = step as f32;
+        let amp = (state.max_speed as i64).abs().max(2);
+        let step = rand_int(&mut self.rng, amp / 2, amp) as f32
+            + rand_int(&mut self.rng, 1, 100) as f32 / 100.0;
         let e = &mut self.entities[idx];
         for axis in 0..2 {
             let (off, delta) = if axis == 0 {
@@ -2598,7 +2644,7 @@ impl Sim {
         let dir_base = frame_min + dir as i64 * per_dir;
         let local = (e.frame - dir_base).clamp(0, per_dir - 1);
         if state.continuous_frame_randomisation {
-            let r = rand_range(&mut self.rng, 0.0, (per_dir - 1) as f64) as i64;
+            let r = rand_int(&mut self.rng, 0, per_dir - 1);
             e.frame = dir_base + r;
             return;
         }
@@ -2648,8 +2694,8 @@ impl Sim {
             }
             if !rt.started {
                 rt.started = true;
-                rt.next_volley = rand_range(&mut self.rng, ss.delay_between_min as f64, ss.delay_between_max.max(ss.delay_between_min) as f64) as u32;
-                rt.shots_left = rand_range(&mut self.rng, ss.volley_min as f64, ss.volley_max.max(ss.volley_min) as f64) as u32;
+                rt.next_volley = rand_int(&mut self.rng, ss.delay_between_min, ss.delay_between_max.max(ss.delay_between_min)) as u32;
+                rt.shots_left = rand_int(&mut self.rng, ss.volley_min, ss.volley_max.max(ss.volley_min)) as u32;
                 rt.shot_timer = 0;
                 continue;
             }
@@ -2660,7 +2706,7 @@ impl Sim {
                         rt.done = true;
                     }
                 } else if ss.repeat_spawns {
-                    rt.shots_left = rand_range(&mut self.rng, ss.volley_min as f64, ss.volley_max.max(ss.volley_min) as f64) as u32;
+                    rt.shots_left = rand_int(&mut self.rng, ss.volley_min, ss.volley_max.max(ss.volley_min)) as u32;
                     rt.shot_timer = 0;
                 }
                 continue;
@@ -2671,9 +2717,9 @@ impl Sim {
             }
             // Fire one shot.
             rt.shots_left = rt.shots_left.saturating_sub(1);
-            rt.shot_timer = rand_range(&mut self.rng, ss.rate_min as f64, ss.rate_max.max(ss.rate_min) as f64) as u32;
+            rt.shot_timer = rand_int(&mut self.rng, ss.rate_min, ss.rate_max.max(ss.rate_min)) as u32;
             if rt.shots_left == 0 {
-                rt.next_volley = rand_range(&mut self.rng, ss.delay_between_min as f64, ss.delay_between_max.max(ss.delay_between_min) as f64) as u32;
+                rt.next_volley = rand_int(&mut self.rng, ss.delay_between_min, ss.delay_between_max.max(ss.delay_between_min)) as u32;
             }
             // Position: owner-relative offset or absolute.
             let local = Vec2::new(ss.x_offset as f32, -ss.y_offset as f32);
@@ -3179,7 +3225,7 @@ impl Sim {
 
     /// Weighted random-bonus pick, mirroring `G_Entity::Destroy`'s roll.
     fn roll_random_bonus(&mut self, assets: &GameAssets) -> Option<ResId> {
-        let roll = rand_range(&mut self.rng, 0.0, 100.0) as i64;
+        let roll = rand_int(&mut self.rng, 0, 100);
         let slot = if roll < pf(assets, 0xd1) as i64 {
             // CheckForRewardThisLevel: at 100% ground accuracy a
             // pf(0xda)-weighted sub-roll swaps RandomBonus_1 for
