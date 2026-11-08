@@ -173,16 +173,25 @@ pub fn sync_entities(
 ) {
     let sim = &sim_res.0;
 
-    // Desired set: unique_num -> (sprite rid, frame, screen pos).
-    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32)> = HashMap::new();
+    // Desired set: unique_num -> (sprite rid, frame, screen pos, fx).
+    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32, f32, f32, f32, u32)> = HashMap::new();
     if flow.state == FlowState::Playing {
         for e in &sim.entities {
-        if e.dead || e.activate_in > 0 {
+        if e.dead || e.activate_in > 0 || e.vis <= 0.0 {
             continue;
         }
         let (rid, frame) = entity_sprite(&*assets, e);
         let sp = e.screen_pos(sim);
-        desired.insert(e.unique_num, (rid, frame, sp, e.hit_flash as f32));
+        let tint_color = assets
+            .units
+            .get(&e.unit)
+            .and_then(|d| d.states.get(e.state.min(d.states.len().saturating_sub(1))))
+            .map(|s| s.tint_color)
+            .unwrap_or(0);
+        desired.insert(
+            e.unique_num,
+            (rid, frame, sp, e.hit_flash as f32, e.vis, e.tint, e.scale, tint_color),
+        );
         }
     }
 
@@ -197,7 +206,7 @@ pub fn sync_entities(
     }
 
     // Spawn/update.
-    for (key, (rid, frame, sp, flash)) in &desired {
+    for (key, (rid, frame, sp, flash, vis, tint, scale, tint_color)) in &desired {
         let handle = match frame_image(&mut *assets, &mut *images, &mut *book, *rid, *frame) {
             Some(h) => h,
             None => continue,
@@ -211,19 +220,39 @@ pub fn sync_entities(
             }
         }
         let wpos = to_world(sp.x, sp.y);
+        // Visibility fade → alpha; tint% blends toward tint_color.
+        let alpha = (*vis / 100.0).clamp(0.0, 1.0);
+        let t = (*tint / 100.0).clamp(0.0, 1.0);
+        let (tr, tg, tb) = if *tint_color != 0 {
+            (
+                (((*tint_color >> 16) & 0xff) as f32) / 255.0,
+                (((*tint_color >> 8) & 0xff) as f32) / 255.0,
+                ((*tint_color & 0xff) as f32) / 255.0,
+            )
+        } else {
+            (1.0, 1.0, 1.0)
+        };
+        let mut col = Color::srgba(
+            1.0 + (tr - 1.0) * t,
+            1.0 + (tg - 1.0) * t,
+            1.0 + (tb - 1.0) * t,
+            alpha,
+        );
+        if *flash > 0.0 {
+            col = Color::srgba(2.0, 2.0, 2.0, alpha);
+        }
+        let scl = Vec3::splat(*scale);
         if let Some((_, mut sprite, mut transform)) = found {
             sprite.image = handle;
             transform.translation = wpos;
-            // Hit flash: brighten.
-            sprite.color = if *flash > 0.0 {
-                Color::srgb(2.0, 2.0, 2.0)
-            } else {
-                Color::WHITE
-            };
+            transform.scale = scl;
+            sprite.color = col;
         } else {
+            let mut sprite = Sprite::from_image(handle);
+            sprite.color = col;
             commands.spawn((
-                Sprite::from_image(handle),
-                Transform::from_translation(wpos),
+                sprite,
+                Transform::from_translation(wpos).with_scale(scl),
                 SimSprite { key: *key },
             ));
         }

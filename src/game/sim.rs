@@ -149,6 +149,19 @@ pub struct Entity {
     pub cyc_off: Vec2,
     /// Cyclic-motion per-tick delta (original m_field_0x108/0x10c).
     cyc_delta: Vec2,
+    /// Visibility fade state (G_GameObject m_some62/66/6a): current %,
+    /// required %, per-tick delta %.
+    pub vis: f32,
+    pub vis_req: f32,
+    pub vis_delta: f32,
+    /// Tint fade state (m_some54/58/5C).
+    pub tint: f32,
+    pub tint_req: f32,
+    pub tint_delta: f32,
+    /// Scale fade state (m_scale/m_targetScale/m_scaleDelta), 1.0 = native.
+    pub scale: f32,
+    pub scale_tgt: f32,
+    pub scale_delta: f32,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -619,6 +632,15 @@ impl Sim {
             orbit_radius: f32::NAN,
             cyc_off: Vec2::ZERO,
             cyc_delta: Vec2::ZERO,
+            vis: 100.0,
+            vis_req: 100.0,
+            vis_delta: 0.0,
+            tint: 0.0,
+            tint_req: 0.0,
+            tint_delta: 0.0,
+            scale: 1.0,
+            scale_tgt: 1.0,
+            scale_delta: 0.0,
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
@@ -629,6 +651,7 @@ impl Sim {
         let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
         self.cache_owner_link(idx, has_link, state.orbit_owner);
         self.init_cyclic(idx, state);
+        self.set_visual_targets(idx, state);
         // Initial state entry sound.
         if state.entry_sound.id != NONE_ID {
             self.events.push(SimEvent::Sound(state.entry_sound.id));
@@ -1227,6 +1250,17 @@ impl Sim {
                     }
                     if state.hold_position_to_target {
                         brake = true;
+                        // Priv_HoldToTarget: bounded display-offset drift
+                        // away from the target (m_prevX/Y += ±marginB,
+                        // clamped ±marginA where marginA ≈ stateMaxSpeed).
+                        let e = &mut self.entities[i];
+                        let amp = (state.max_speed.abs() as i64).max(4);
+                        let step = ((state.delta.abs() as i64).max(1)).min(amp) as f32;
+                        let away = epos0 - tp;
+                        e.cyc_off.x = (e.cyc_off.x + away.x.signum() * step)
+                            .clamp(-(amp as f32), amp as f32);
+                        e.cyc_off.y = (e.cyc_off.y + away.y.signum() * step)
+                            .clamp(-(amp as f32), amp as f32);
                     }
                 }
                 if state.flee_id != NONE_ID {
@@ -1323,6 +1357,9 @@ impl Sim {
                 self.step_cyclic(i, &state);
             }
 
+            // --- visibility/tint/scale fades (AdjustVisibilityAndTinting) ---
+            self.adjust_visuals(i);
+
             // --- owner linkage (lock/link/orbit) ---
             self.step_owner_link(i, assets);
 
@@ -1377,9 +1414,47 @@ impl Sim {
         let orbit = st.orbit_owner;
         self.cache_owner_link(idx, has_link, orbit);
         self.init_cyclic(idx, st);
+        self.set_visual_targets(idx, st);
         // stateEntrySound plays on every state entry.
         if st.entry_sound.id != NONE_ID {
             self.events.push(SimEvent::Sound(st.entry_sound.id));
+        }
+    }
+
+    /// Copy a state's visibility/tint/scale requirements onto the entity
+    /// (G_EntityGroup state-change block: m_some66/6a, m_some58/5C, scale).
+    fn set_visual_targets(&mut self, idx: usize, st: &UnitState) {
+        let e = &mut self.entities[idx];
+        e.vis_req = st.required_visibility_percent as f32;
+        e.vis_delta = st.visibility_delta_percent as f32;
+        e.tint_req = st.tint_percent as f32;
+        e.tint_delta = st.tint_delta_percent as f32;
+        // Scale percentages → factor (U_Sprite_ConvertScalePercentage = /100).
+        // A zero requirement means "no scale constraint" → hold 1.0.
+        if st.required_scale_percent > 0 {
+            e.scale_tgt = st.required_scale_percent as f32 / 100.0;
+        }
+        e.scale_delta = (st.scale_delta_percent as f32 / 100.0).abs();
+    }
+
+    /// `G_GameObject::AdjustVisibilityAndTinting` + `DoScaling`: nudge the
+    /// current values toward their per-state targets each tick.
+    fn adjust_visuals(&mut self, idx: usize) {
+        let e = &mut self.entities[idx];
+        if e.vis_req < e.vis {
+            e.vis = (e.vis - e.vis_delta).max(e.vis_req).max(0.0);
+        } else if e.vis < e.vis_req {
+            e.vis = (e.vis + e.vis_delta).min(e.vis_req);
+        }
+        if e.tint_req < e.tint {
+            e.tint = (e.tint - e.tint_delta).max(e.tint_req).max(0.0);
+        } else if e.tint < e.tint_req {
+            e.tint = (e.tint + e.tint_delta).min(e.tint_req);
+        }
+        if e.scale > e.scale_tgt {
+            e.scale = (e.scale - e.scale_delta).max(e.scale_tgt);
+        } else if e.scale < e.scale_tgt {
+            e.scale = (e.scale + e.scale_delta).min(e.scale_tgt);
         }
     }
 
@@ -1755,9 +1830,15 @@ impl Sim {
             // Tween-at-target conditions: the original compares the live
             // value against the state's required value. With no tween
             // simulation, a zero delta means already at target.
-            "this entity's visibility is at required level" => state.visibility_delta_percent == 0,
-            "this entity's tint is at required level" => state.tint_delta_percent == 0,
-            "this entity's scale is at required level" => state.scale_delta_percent == 0,
+            "this entity's visibility is at required level" => {
+                (self.entities[idx].vis - self.entities[idx].vis_req).abs() < 0.5
+            }
+            "this entity's tint is at required level" => {
+                (self.entities[idx].tint - self.entities[idx].tint_req).abs() < 0.5
+            }
+            "this entity's scale is at required level" => {
+                (self.entities[idx].scale - self.entities[idx].scale_tgt).abs() < 0.01
+            }
             "number of this type of entity active" => {
                 self.count_active_of_type(rule.unit_id) as i64 == param
             }
@@ -2143,6 +2224,10 @@ impl Sim {
                 continue;
             }
             let Some(def) = assets.units.get(&e.unit) else { continue };
+            // Fully faded entities don't interact unless hittableWhenInvisible.
+            if e.vis <= 0.0 && !def.hittable_when_invisible {
+                continue;
+            }
             // G_EG_Process player-contact gate: stateCollides &&
             // stateCollidesWithPlayers && !harmlessToPlayers.
             let st = def.states.get(e.state);
@@ -2200,6 +2285,9 @@ impl Sim {
                     continue; // same side
                 }
                 let Some(tdef) = assets.units.get(&self.entities[j].unit) else { continue };
+                if self.entities[j].vis <= 0.0 && !tdef.hittable_when_invisible {
+                    continue;
+                }
                 if !tdef.can_be_hit_by_player_projectile {
                     continue;
                 }
