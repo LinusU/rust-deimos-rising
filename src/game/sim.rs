@@ -2248,8 +2248,14 @@ impl Sim {
             let e = &self.entities[idx];
             (e.pos, e.heading)
         };
+        // spawnIfFleeing (spawnDef+0x4e): while the parent is fleeing
+        // (m_field_0xc0), only flagged spawn sets may fire.
+        let fleeing = state.flee_id != NONE_ID;
         for (si, ss) in state.spawn_sets.iter().enumerate() {
             if si >= timers.len() || ss.spawn_id == NONE_ID {
+                continue;
+            }
+            if fleeing && !ss.spawn_if_fleeing {
                 continue;
             }
             let rt = &mut timers[si];
