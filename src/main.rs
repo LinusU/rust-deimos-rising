@@ -249,6 +249,10 @@ fn main() {
         test_sprites();
         return;
     }
+    if args.iter().any(|a| a == "--rules") {
+        dump_rules();
+        return;
+    }
     if args.iter().any(|a| a == "--test-sim") {
         test_sim();
         return;
@@ -355,6 +359,13 @@ fn test_floats() {
         for i in 0x30usize..0x45 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
+        for i in 0xc8usize..0xe0 {
+            println!("flli[0x{:02x}] = {}", i, fl.get(i));
+        }
+    }
+    println!("object_ids: {} entries", a.object_ids.entries.len());
+    for (i, (n, r)) in a.object_ids.entries.iter().enumerate().take(0x28) {
+        println!("  obj[0x{:02x}] name={:?} id={:08x}", i, n, r);
     }
 }
 
@@ -424,19 +435,25 @@ fn test_sim() {
         if tick % 600 == 599 {
             let p = sim.players[0].as_ref().unwrap();
             let mut projs = 0usize;
+            let mut pickups = 0usize;
             for e in &sim.entities {
                 if let Some(d) = assets.units.get(&e.unit) {
                     if d.player_projectile {
                         projs += 1;
                     }
+                    if d.pickup_type != pak::NONE_ID {
+                        pickups += 1;
+                    }
                 }
             }
             println!(
-                "t={:>4}s scroll={:7.1} ent={:>4} proj={:>3} hit={} kill={} ph={:?} p=({:5.1},{:5.1}) sh={:5.1} score={} money={} mult={} lives={} wpn={:08x} done={}",
+                "t={:>4}s scroll={:7.1} ent={:>4} proj={:>3} pick={:>2}/{} hit={} kill={} ph={:?} p=({:5.1},{:5.1}) sh={:5.1} score={} money={} mult={} lives={} wpn={:08x} done={}",
                 tick / 60,
                 sim.scroll,
                 sim.entities.len(),
                 projs,
+                pickups,
+                sim.stat_pickups,
                 sim.stat_hits,
                 sim.stat_kills,
                 sim.phase,
@@ -465,4 +482,66 @@ fn test_sim() {
     for (u, n) in by_unit.iter().take(10) {
         println!("  {:08x}: {}", u, n);
     }
+}
+
+/// Dump every distinct rule condition/action string used by unit defs.
+fn dump_rules() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut conds = std::collections::BTreeSet::new();
+    let mut acts = std::collections::BTreeSet::new();
+    for u in a.units.values() {
+        for st in &u.states {
+            for r in &st.rules {
+                conds.insert(r.condition.clone());
+                acts.insert(r.action.clone());
+            }
+        }
+    }
+    println!("=== CONDITIONS ({}):", conds.len());
+    for c in &conds { println!("  {:?}", c); }
+    println!("=== ACTIONS ({}):", acts.len());
+    for c in &acts { println!("  {:?}", c); }
+    // Show rule tuples for the rarer conditions.
+    let rare = ["Are Fewer", "Number of This", "Animation Has Stopped", "Is Not Active", "Is Tracking"];
+    for u in a.units.values() {
+        for st in &u.states {
+            for r in &st.rules {
+                if rare.iter().any(|k| r.condition.contains(k)) {
+                    println!("RULE {:08x} '{}' st='{}' unit={:08x} range={} cond={:?} act={:?}",
+                        u.id, u.name, st.name, r.unit_id, r.range, r.condition, r.action);
+                }
+            }
+        }
+    }
+    // Do rule actions resolve to real state names?
+    let mut unresolved = std::collections::BTreeSet::new();
+    let mut resolved = 0u32;
+    for u in a.units.values() {
+        for st in &u.states {
+            for r in &st.rules {
+                let act = r.action.trim();
+                if act.is_empty() || act == "none" { continue; }
+                let lname = act.to_lowercase();
+                if lname == "delete" || lname == "destroy" || lname == "do nothing" { resolved += 1; continue; }
+                if u.states.iter().any(|s| s.name.eq_ignore_ascii_case(act)) {
+                    resolved += 1;
+                } else {
+                    unresolved.insert(act.to_string());
+                }
+            }
+        }
+    }
+    println!("=== rule actions resolving to states: {}, unresolved: {}", resolved, unresolved.len());
+    for s in &unresolved { println!("  UNRESOLVED {:?}", s); }
+    // Destruct-drop stats across all units.
+    let mut coins = 0; let mut bonus = 0; let mut groupcoin = 0; let mut pickups = 0;
+    for u in a.units.values() {
+        if u.destruct_num_coins > 0 { coins += 1; }
+        if u.destruct_release_random_bonus { bonus += 1; }
+        if u.destruct_coin_on_group_kill != pak::NONE_ID { groupcoin += 1; }
+        if u.pickup_type != pak::NONE_ID { pickups += 1; }
+    }
+    println!("=== units: coins={} bonus={} groupcoin={} pickups={}", coins, bonus, groupcoin, pickups);
 }
