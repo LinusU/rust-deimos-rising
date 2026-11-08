@@ -1,5 +1,6 @@
 mod assets;
 mod data;
+mod game;
 mod pak;
 
 use pak::{id, PakSet, Tag, NONE_ID};
@@ -227,11 +228,51 @@ fn main() {
         test_assets();
         return;
     }
+    if args.iter().any(|a| a == "--unit") {
+        let v: u32 = std::env::args().nth(2).unwrap().parse().unwrap();
+        test_unit(v);
+        return;
+    }
+    if args.iter().any(|a| a == "--test-defs") {
+        test_defs();
+        return;
+    }
+    if args.iter().any(|a| a == "--test-floats") {
+        test_floats();
+        return;
+    }
+    if args.iter().any(|a| a == "--test-all") {
+        test_all_images_sounds();
+        return;
+    }
     if args.iter().any(|a| a == "--test-sprites") {
         test_sprites();
         return;
     }
-    println!("Deimos Rising remake — run with --dump-data to verify assets.");
+    if args.iter().any(|a| a == "--test-sim") {
+        test_sim();
+        return;
+    }
+    // Default: launch the game.
+    let players = if args.iter().any(|a| a == "--2p" || a == "--players") {
+        args.iter()
+            .position(|a| a == "--players")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(2)
+    } else {
+        1
+    };
+    let dir = data_dir();
+    let mut assets = assets::GameAssets::open(&dir).expect("open retail data");
+    assets.load_all_data();
+    let level = args
+        .iter()
+        .position(|a| a == "--level")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| pak::id(s))
+        .unwrap_or_else(|| pak::id("le01"));
+    game::render::run(assets, level, players);
 }
 
 fn test_sprites() {
@@ -274,4 +315,151 @@ fn test_sprites() {
     }
     println!("sprites: {} ok {} fail, {} total frames", ok, fail, total_frames);
     println!("frame-count histogram: {:?}", hist);
+}
+
+fn test_all_images_sounds() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    // im16 TGA images
+    let mut rids: Vec<pak::ResId> = a.set.entries_of_tag(Tag::Im16).iter().map(|e| e.rid).collect();
+    rids.sort();
+    rids.dedup();
+    let (mut ok, mut fail) = (0, 0);
+    for rid in rids {
+        match a.image16(rid) {
+            Some((w, h, px)) => { ok += 1; let _ = (w, h, px.len()); }
+            None => { fail += 1; println!("  im16 FAIL {:08x}", rid); }
+        }
+    }
+    println!("im16: {} ok {} fail", ok, fail);
+    // sounds across all paks
+    let mut rids: Vec<pak::ResId> = a.set.entries_of_tag(Tag::Soun).iter().map(|e| e.rid).collect();
+    rids.sort();
+    rids.dedup();
+    let (mut ok, mut fail) = (0, 0);
+    for rid in rids {
+        match a.sound(rid) {
+            Some(s) => { ok += 1; let _ = s; }
+            None => { fail += 1; println!("  soun FAIL {:08x}", rid); }
+        }
+    }
+    println!("soun: {} ok {} fail", ok, fail);
+}
+
+fn test_floats() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    if let Some(fl) = &a.fill_list {
+        for i in 0x30usize..0x45 {
+            println!("flli[0x{:02x}] = {}", i, fl.get(i));
+        }
+    }
+}
+
+fn test_defs() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    for (rid,p) in &a.players {
+        println!("PLAYER {:08x} {:?}", rid, p);
+    }
+    for (rid,w) in &a.weapons {
+        println!("WEAPON {:08x} {:?}", rid, w);
+    }
+    // le01 objects sample
+    if let Some(l) = a.levels.get(&id("le01")) {
+        println!("LEVEL le01 bg={:?} img={:08x} music={:08x} objs={}", l.background, l.background_image, l.music, l.objects.len());
+        for o in l.objects.iter().take(15) {
+            println!("  obj unit={:08x} layer={:08x} x={} y={} hdg={} stat={} terr={}", o.unit_id,o.layer_id,o.x,o.y,o.heading_degrees,o.stationary,o.terrain_effects);
+        }
+    }
+}
+
+fn test_unit(ridv: u32) {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    if let Some(u) = a.units.get(&ridv) {
+        println!("UNIT {:08x} {}", ridv, u.name);
+        println!("  init_speed {}..{} heading {} tol {}", u.initial_speed_min, u.initial_speed_max, u.initial_heading, u.initial_heading_tolerance);
+        println!("  shields {}/{}+{} dmg {} score {} pickup={:08x} destruct_spawn={:08x}", u.shields_base,u.shields_max,u.shields_level_increment,u.damage,u.score,u.pickup_type,u.destruct_spawn);
+        for (i,st) in u.states.iter().enumerate() {
+            println!("  state[{}] '{}' spr={:08x} dirs={} fpd={} framedly={} maxspd={} delta={} rules={:?}", i, st.name, st.sprite_face, st.num_directions, st.frames_per_direction, st.frame_delay, st.max_speed, st.delta, st.rules.iter().map(|r|(r.name.clone(),r.unit_id,r.range,r.condition.clone(),r.action.clone())).collect::<Vec<_>>());
+            for ss in &st.spawn_sets { println!("     spawnset '{}' id={:08x} x={} y={} rate={}-{} volley={}-{} delay={}-{} repeat={}", ss.name, ss.spawn_id, ss.x_offset, ss.y_offset, ss.rate_min, ss.rate_max, ss.volley_min, ss.volley_max, ss.delay_between_min, ss.delay_between_max, ss.repeat_spawns); }
+        }
+    }
+}
+
+/// Headless sim smoke test: run le01 for `secs` seconds with scripted input.
+fn test_sim() {
+    use game::sim::{PlayerInput, SlotInput};
+    let dir = data_dir();
+    let mut assets = assets::GameAssets::open(&dir).expect("open");
+    assets.load_all_data();
+    let level_id = pak::id("le01");
+    let mut sim = game::render::start_level(&mut assets, level_id, 1, 1).expect("level");
+    let secs: u32 = std::env::args()
+        .position(|a| a == "--secs")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    for tick in 0..secs * 60 {
+        // Scripted input: wiggle + periodic fire.
+        let t = tick as f32;
+        let fire = (tick / 45) % 2 == 0;
+        let inp = PlayerInput {
+            p1: SlotInput {
+                up: (t * 0.05).sin() > 0.3,
+                down: (t * 0.05).sin() < -0.3,
+                left: (t * 0.03).cos() > 0.5,
+                right: (t * 0.03).cos() < -0.5,
+                fire,
+                bomb: false,
+            },
+            p2: SlotInput::default(),
+        };
+        sim.advance(&assets, &inp, 1.0 / 60.0);
+        if tick % 600 == 599 {
+            let p = sim.players[0].as_ref().unwrap();
+            let mut projs = 0usize;
+            for e in &sim.entities {
+                if let Some(d) = assets.units.get(&e.unit) {
+                    if d.player_projectile {
+                        projs += 1;
+                    }
+                }
+            }
+            println!(
+                "t={:>4}s scroll={:7.1} entities={:>4} projs={:>3} hits={} kills={} phase={:?} p=({:5.1},{:5.1}) shields={:5.1} score={} lives={} complete={}",
+                tick / 60,
+                sim.scroll,
+                sim.entities.len(),
+                projs,
+                sim.stat_hits,
+                sim.stat_kills,
+                sim.phase,
+                p.screen.x,
+                p.screen.y,
+                p.shields,
+                p.score,
+                p.lives,
+                sim.level_complete,
+            );
+        }
+        if sim.level_complete {
+            println!("LEVEL COMPLETE at t={}s", tick / 60);
+            break;
+        }
+    }
+    // Final entity census.
+    let mut by_unit: std::collections::HashMap<u32, usize> = Default::default();
+    for e in &sim.entities {
+        *by_unit.entry(e.unit).or_default() += 1;
+    }
+    println!("final: {} entities, {} distinct units", sim.entities.len(), by_unit.len());
+    for (u, n) in by_unit.iter().take(10) {
+        println!("  {:08x}: {}", u, n);
+    }
 }

@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 bevy = "0.20.1"
 gif = "0.14.2"
+glam = "0.33"
+rand = "0.8"
 image = { version = "0.25", default-features = false, features = ["tga"] }
 # bevy = "0.20"
 

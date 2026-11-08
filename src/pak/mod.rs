@@ -227,7 +227,7 @@ impl Pak {
                 break;
             }
             let method = u16::from_le_bytes([cd[pos + 10], cd[pos + 11]]);
-            let csize = u32::from_le_bytes([cd[pos + 20], cd[pos + 21], cd[pos + 22], cd[pos + 23]]) as u64;
+            let _csize = u32::from_le_bytes([cd[pos + 20], cd[pos + 21], cd[pos + 22], cd[pos + 23]]) as u64;
             let usize_ = u32::from_le_bytes([cd[pos + 24], cd[pos + 25], cd[pos + 26], cd[pos + 27]]) as u64;
             let name_len = u16::from_le_bytes([cd[pos + 28], cd[pos + 29]]) as usize;
             let extra_len = u16::from_le_bytes([cd[pos + 30], cd[pos + 31]]) as usize;

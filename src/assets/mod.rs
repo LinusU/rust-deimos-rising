@@ -42,6 +42,7 @@ impl Sound {
 }
 
 /// All game data, loaded once from the retail paks and cached.
+#[derive(bevy::prelude::Resource)]
 pub struct GameAssets {
     pub set: PakSet,
     sprites: HashMap<(u32, ResId), Sprite>,

@@ -59,11 +59,16 @@ impl<'a> Cursor<'a> {
             .unwrap_or(false)
     }
 
-    /// 4-character ID inside `<...>`.
+    /// 4-character ID inside `<...>`. IDs are exactly 4 bytes and may
+    /// legitimately contain spaces (e.g. `icb `), so don't trim first.
     pub fn get_id(&mut self, key: &str) -> ResId {
         match self.get_raw(key) {
-            Some(v) if v.trim().len() == 4 => id(v.trim()),
-            _ => NONE_ID,
+            Some(v) if v.len() == 4 => id(&v),
+            Some(v) => {
+                let t = v.trim();
+                if t.len() == 4 { id(t) } else { NONE_ID }
+            }
+            None => NONE_ID,
         }
     }
 
@@ -255,8 +260,13 @@ impl IdList {
             entries: named_values(text)
                 .into_iter()
                 .map(|(name, v)| {
-                    let v = v.trim();
-                    let rid = if v.len() == 4 { id(v) } else { NONE_ID };
+                    // IDs are exactly 4 bytes and may contain spaces.
+                    let rid = if v.len() == 4 {
+                        id(&v)
+                    } else {
+                        let t = v.trim();
+                        if t.len() == 4 { id(t) } else { NONE_ID }
+                    };
                     (name, rid)
                 })
                 .collect(),
@@ -287,6 +297,7 @@ pub struct LevelObject {
     pub terrain_effects: bool,
 }
 
+#[derive(Clone)]
 pub struct LevelDef {
     pub name: String,
     pub identifier: String,
