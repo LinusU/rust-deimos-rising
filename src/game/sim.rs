@@ -452,6 +452,9 @@ pub struct Player {
     pub bomb_last: u32,
     /// Previous-tick bomb input for edge detection (pad1a).
     pub prev_bomb: bool,
+    /// Previous-tick air-fire input for the autoRepeat semi-auto gate
+    /// (m_field_0xa).
+    pub prev_fire: bool,
     /// Shield recharge delay after a hit.
     pub shield_recharge: u32,
     /// Score multiplier.
@@ -766,6 +769,7 @@ impl Sim {
             bomb_burst: 0,
             bomb_last: 0,
             prev_bomb: false,
+            prev_fire: false,
             shield_recharge: 0,
             multiplier: 1,
             next_life_score: def.life_initial_required_score,
@@ -1893,6 +1897,8 @@ impl Sim {
                         p.gnd_power = PowerupRt::default();
                         p.power = 0.0;
                         p.gpower = 0.0;
+                        p.prev_fire = false;
+                        p.prev_bomb = false;
                         if def.entry_spawn != NONE_ID {
                             let w = Vec2::new(
                                 p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
@@ -2004,7 +2010,19 @@ impl Sim {
             }
             p.prev_bomb = inp.bomb;
         }
-        let fire_air = inp.fire && p.fire_timer == 0;
+        // Priv_CheckSpawning_Air: normal fire only while the air
+        // power-up machine is idle (m_field_0x11 == 0), and non
+        // autoRepeat weapons need a fresh press each shot (m_field_0xa).
+        let auto_repeat = assets
+            .weapons
+            .get(&p.air_weapon)
+            .map(|w| w.auto_repeat)
+            .unwrap_or(true);
+        let fire_air = inp.fire
+            && p.fire_timer == 0
+            && p.air_power.state == 0
+            && (auto_repeat || !p.prev_fire);
+        p.prev_fire = inp.fire;
         // Firing.
         if fire_gnd {
             self.fire_ground_weapon(assets, slot);
