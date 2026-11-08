@@ -173,6 +173,11 @@ pub struct Entity {
     pub state_sound_played: Vec<bool>,
     /// Last motion-blur spawn tick (m_field_e4).
     pub blur_last: u32,
+    /// Position where this entity was requested to spawn — the debris
+    /// collision teleport target (g_entityGroupDefaultLocX/Y).
+    pub entry_pos: Vec2,
+    /// Set once the entity has collided with a debris zone (m_field134).
+    pub debris_hit: bool,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -350,6 +355,10 @@ pub struct Sim {
     spawn_queue: Vec<SpawnReq>,
     /// Deferred one-shot actions (e.g. spawn at pos next tick).
     pub events: Vec<SimEvent>,
+    /// Debris zones (G_Debris): world-space rects [min_x, min_y, max_x,
+    /// max_y] left by destroyed `destructCreateObstacle` units. Fixed in
+    /// world space = scroll-locked like the original's screen rects.
+    pub debris: Vec<[f32; 4]>,
 }
 
 #[derive(Clone, Debug)]
@@ -430,6 +439,7 @@ impl Sim {
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             spawn_queue: Vec::new(),
             events: Vec::new(),
+            debris: Vec::new(),
         }
     }
 
@@ -682,6 +692,8 @@ impl Sim {
             sound_last_play: 0,
             state_sound_played: vec![false; def.states.len()],
             blur_last: 0,
+            entry_pos: req.pos,
+            debris_hit: false,
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
@@ -1507,6 +1519,9 @@ impl Sim {
                 }
             }
 
+            // --- debris / ground-obstacle collision ---
+            self.step_debris(i, assets);
+
             // --- spawn sets ---
             self.step_spawn_sets(i, &state);
 
@@ -1612,6 +1627,79 @@ impl Sim {
             scroll,
             circular,
         });
+    }
+
+    /// Leave a debris zone at an entity's bounds (G_Debris_New).
+    fn add_debris(&mut self, idx: usize, assets: &GameAssets) {
+        let e = &self.entities[idx];
+        let r = assets
+            .units
+            .get(&e.unit)
+            .map(entity_radius)
+            .unwrap_or(8.0);
+        self.debris.push([
+            e.pos.x - r,
+            e.pos.y - r,
+            e.pos.x + r,
+            e.pos.y + r,
+        ]);
+        if self.debris.len() > 512 {
+            self.debris.remove(0);
+        }
+    }
+
+    /// `G_Entity::Destroy`-adjacent debris: units flagged
+    /// destructCreateObstacle leave a collision zone where they die.
+    fn maybe_debris_on_destroy(&mut self, idx: usize, assets: &GameAssets) {
+        let flagged = assets
+            .units
+            .get(&self.entities[idx].unit)
+            .map(|d| d.destruct_create_obstacle)
+            .unwrap_or(false);
+        if flagged {
+            self.add_debris(idx, assets);
+        }
+    }
+
+    /// Debris collision (G_EntityGroup tick block): entities flagged
+    /// collidesWithGroundObstacles that touch a debris zone are reset to
+    /// their entry position once (m_field134), and if they also create
+    /// obstacles their bounds become new debris.
+    fn step_debris(&mut self, idx: usize, assets: &GameAssets) {
+        let (collides, creates, hit, entry) = {
+            let e = &self.entities[idx];
+            let def = match assets.units.get(&e.unit) {
+                Some(d) => d,
+                None => return,
+            };
+            (
+                def.collides_with_ground_obstacles,
+                def.destruct_create_obstacle,
+                e.debris_hit,
+                e.entry_pos,
+            )
+        };
+        if !collides || hit || self.debris.is_empty() {
+            return;
+        }
+        let e = &self.entities[idx];
+        let r = assets
+            .units
+            .get(&e.unit)
+            .map(entity_radius)
+            .unwrap_or(8.0);
+        let (x0, y0, x1, y1) = (e.pos.x - r, e.pos.y - r, e.pos.x + r, e.pos.y + r);
+        let hit_debris = self.debris.iter().any(|d| {
+            x1 >= d[0] && x0 <= d[2] && y1 >= d[1] && y0 <= d[3]
+        });
+        if hit_debris {
+            let e = &mut self.entities[idx];
+            e.pos = entry;
+            e.debris_hit = true;
+            if creates {
+                self.add_debris(idx, assets);
+            }
+        }
     }
 
     /// `G_GameObject::AdjustVisibilityAndTinting` + `DoScaling`: nudge the
@@ -2232,7 +2320,9 @@ impl Sim {
             def.terrain_effect,
             false,
         );
-        // destruct_notice: floating text — TODO notice system.
+        // destruct_notice: floating text — TODO notice system (unused in
+        // retail data).
+        self.maybe_debris_on_destroy(idx, assets);
 
         // Coin release: N copies of destruct_coin at the kill location.
         if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {

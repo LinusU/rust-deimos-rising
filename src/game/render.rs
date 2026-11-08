@@ -242,7 +242,7 @@ fn particle_tick(p: &mut Particles, scroll_delta: f32) {
             }
             pt.vel *= 0.96; // pf(0x90)
             pt.pos += pt.vel;
-            if (pt.pos.x < -32.0 || pt.pos.x + 7.0 > BX1 || pt.pos.y < BY0 || pt.pos.y + 7.0 > BY1) {
+            if pt.pos.x < -32.0 || pt.pos.x + 7.0 > BX1 || pt.pos.y < BY0 || pt.pos.y + 7.0 > BY1 {
                 pt.active = false;
                 continue;
             }
