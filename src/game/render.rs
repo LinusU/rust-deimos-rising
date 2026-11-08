@@ -1190,6 +1190,17 @@ pub fn flow_system(
             }
         }
         FlowState::Playing => {
+            // Esc exits to title (original quits the app; we keep the run's
+            // demo recording instead of losing it).
+            if esc && demo.playback.is_none() {
+                if !demo.rec.p1.is_empty() {
+                    demo.rec.save();
+                }
+                demo.rec = DemoRec::default();
+                flow.state = FlowState::Title;
+                flow.ticks = 0;
+                return;
+            }
             // Attract playback finished its recorded frames.
             if let Some(pb) = &demo.playback {
                 if demo.frame >= pb.frames() {
