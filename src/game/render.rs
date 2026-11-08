@@ -76,6 +76,11 @@ pub struct Flow {
     /// Name-entry cursor state while in FlowState::NameEntry.
     pub name_buf: [char; 3],
     pub name_idx: usize,
+    /// Run started above sector 1: 1 life, no hi-score, no progress credit
+    /// (original level-select restriction).
+    pub restricted: bool,
+    /// Sequentially completed level count; sectors 0..=progress are selectable.
+    pub progress: u32,
 }
 
 /// A run result waiting for a player name.
@@ -94,7 +99,22 @@ pub struct ScoreEntry {
 }
 
 const SCORES_PATH: &str = "deimos-hi-scores.txt";
+const PROGRESS_PATH: &str = "deimos-progress.txt";
 const MAX_SCORES: usize = 15;
+
+/// Number of sequentially completed levels (sector-select unlock count).
+/// The original stores this in the prefs blob; the remake uses a plain
+/// runtime file (never committed).
+fn load_progress() -> u32 {
+    std::fs::read_to_string(PROGRESS_PATH)
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+fn save_progress(progress: u32) {
+    let _ = std::fs::write(PROGRESS_PATH, format!("{}\n", progress));
+}
 
 /// Local hi-score table. The original persists an encrypted prefs blob;
 /// the remake keeps a plain runtime file (never committed).
@@ -1252,7 +1272,9 @@ pub fn flow_system(
             }
         }
         FlowState::Sectors => {
-            let n = flow.level_ids.len();
+            // Only sectors 0..=progress are unlocked (sequential campaign).
+            let n = ((flow.progress as usize) + 1).min(flow.level_ids.len());
+            flow.sector = flow.sector.min(n.saturating_sub(1));
             if n > 0 {
                 if up {
                     flow.sector = (flow.sector + n - 1) % n;
@@ -1291,6 +1313,14 @@ pub fn flow_system(
                         };
                         demo.playback = None;
                         demo.frame = 0;
+                        // Starting above sector 1 restricts the run: one
+                        // life, no hi-score, no campaign progress credit.
+                        flow.restricted = flow.sector > 0;
+                        if flow.restricted {
+                            for p in sim.0.players.iter_mut().flatten() {
+                                p.lives = 1;
+                            }
+                        }
                         flow.state = FlowState::Playing;
                         flow.ticks = 0;
                         flow.paused = false;
@@ -1320,6 +1350,15 @@ pub fn flow_system(
                 }
             }
             if sim.0.phase == crate::game::sim::Phase::LevelEnd {
+                // Campaign progress only counts for unrestricted runs that
+                // completed levels sequentially from sector 1.
+                if !flow.restricted
+                    && demo.playback.is_none()
+                    && flow.sector as u32 == flow.progress
+                {
+                    flow.progress += 1;
+                    save_progress(flow.progress);
+                }
                 flow.state = FlowState::Cleared;
                 flow.ticks = 0;
             } else {
@@ -1350,8 +1389,12 @@ pub fn flow_system(
         FlowState::GameOver => {
             if enter {
                 // Queue hi-score entries for qualifying players, best first.
+                // Restricted runs (started above sector 1) never count.
                 flow.pending_scores.clear();
-                let mut results: Vec<PendingScore> = sim
+                let mut results: Vec<PendingScore> = if flow.restricted {
+                    Vec::new()
+                } else {
+                sim
                     .0
                     .players
                     .iter()
@@ -1366,7 +1409,8 @@ pub fn flow_system(
                             None
                         }
                     })
-                    .collect();
+                    .collect()
+                };
                 results.sort_by(|a, b| b.score.cmp(&a.score));
                 flow.pending_scores = results
                     .into_iter()
@@ -1450,6 +1494,10 @@ fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets, scores: &HighScores) -
         FlowState::Sectors => {
             let mut s = String::from("CHOOSE A STARTING SECTOR\n\n");
             for (i, _) in flow.level_ids.iter().enumerate() {
+                if i > flow.progress as usize {
+                    s.push_str(&format!("   SECTOR {:>2}  (LOCKED)\n", i + 1));
+                    continue;
+                }
                 let cur = if i == flow.sector { "> " } else { "  " };
                 s.push_str(&format!("{}{}\n", cur, name_of(i)));
             }
@@ -1663,6 +1711,8 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             pending_scores: Vec::new(),
             name_buf: ['A', 'A', 'A'],
             name_idx: 0,
+            restricted: false,
+            progress: load_progress(),
         })
         .insert_resource(HighScores::load())
         .insert_resource(Demo::default())
