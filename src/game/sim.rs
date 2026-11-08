@@ -2713,7 +2713,7 @@ fn vector_to_heading(v: Vec2) -> f32 {
 
 /// `G_WepDef_MasterList_GetNextRefPtrByType`: weapons of `wtype` available
 /// at `level`, in master-list order.
-fn weapon_chain(assets: &GameAssets, wtype: ResId, level: i64) -> Vec<ResId> {
+pub fn weapon_chain(assets: &GameAssets, wtype: ResId, level: i64) -> Vec<ResId> {
     assets
         .weapon_order
         .iter()

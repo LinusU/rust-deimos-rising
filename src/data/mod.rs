@@ -179,8 +179,8 @@ impl FillList {
 // .reli / .coli / .edli — `#Name<tabs><value>` lists
 // ---------------------------------------------------------------------------
 
-/// `.reli` file: named rect list. The original stores `U_Rect{top,left,
-/// bottom,right}` but the file order is `<left, top, bottom, right>`.
+/// `.reli` file: named rect list. File order is `left, top, right, bottom`
+/// (see `U_Token_GetRect`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Rect {
     pub left: i64,
@@ -204,8 +204,8 @@ impl RectList {
                 let rect = Rect {
                     left: it.next().unwrap_or(0),
                     top: it.next().unwrap_or(0),
-                    bottom: it.next().unwrap_or(0),
                     right: it.next().unwrap_or(0),
+                    bottom: it.next().unwrap_or(0),
                 };
                 (name, rect)
             })

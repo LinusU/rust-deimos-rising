@@ -147,6 +147,21 @@ fn dump_data() {
     let _ = NONE_ID;
 }
 
+/// List the permanent list resources (flli/reli/coli/edli/stli) with names.
+fn perm_probe() {
+    let dir = data_dir();
+    let set = PakSet::open_dir(&dir).expect("open paks");
+    for tag in [
+        Tag::Flli, Tag::Reli, Tag::Coli, Tag::Edli, Tag::Stli, Tag::Tefo, Tag::Film, Tag::Pref,
+        Tag::Plde, Tag::Leve, Tag::Wede,
+    ] {
+        println!("== {:?}", tag);
+        for e in set.entries_of_tag(tag) {
+            println!("  {:08x} {}", e.rid, e.display);
+        }
+    }
+}
+
 fn test_assets() {
     let dir = data_dir();
     let mut a = assets::GameAssets::open(&dir).expect("open");
@@ -226,6 +241,15 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test-assets") {
         test_assets();
+        return;
+    }
+    if args.iter().any(|a| a == "--perm") {
+        perm_probe();
+        return;
+    }
+    if args.iter().any(|a| a == "--sprite") {
+        let s = std::env::args().nth(2).unwrap();
+        sprite_probe(&s);
         return;
     }
     if args.iter().any(|a| a == "--unit") {
@@ -510,6 +534,26 @@ fn test_strings() {
                 }
             }
         }
+    }
+}
+
+fn sprite_probe(name: &str) {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    let rid = pak::id(name);
+    if let Some(s) = a.sprite(rid) {
+        println!(
+            "sprite {:08x}: {} frames, {}x{}",
+            rid,
+            s.frames.len(),
+            s.width,
+            s.height
+        );
+        for (i, f) in s.frames.iter().enumerate() {
+            println!("  f{} {}x{}", i, f.width, f.height);
+        }
+    } else {
+        println!("sprite {:08x} not found", rid);
     }
 }
 

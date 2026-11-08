@@ -1535,6 +1535,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
         })
         .insert_resource(HighScores::load())
         .insert_resource(Demo::default())
+        .insert_resource(ScoreBars::default())
         .insert_resource(Particles::default())
         .insert_resource(Blurs::default());
     if let Some(engine) = crate::game::audio::AudioEngine::new() {
@@ -1556,6 +1557,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sync_crosshair,
                 sync_entities,
                 sync_players,
+                sync_scorebar,
                 hud_system,
             )
                 .chain(),
@@ -1567,36 +1569,65 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
 // HUD
 // ---------------------------------------------------------------------------
 
-/// One score-bar text line per player slot.
+/// One score-bar text element per player slot.
 #[derive(Component)]
 pub struct HudText {
     pub slot: usize,
+    pub kind: HudKind,
 }
 
-/// Spawn the two HUD text lines (top corners).
-pub fn setup_hud(mut commands: Commands) {
+#[derive(Clone, Copy, PartialEq)]
+pub enum HudKind {
+    /// Score digits in the "Score" rect.
+    Score,
+    /// Lives count in the "Life Count" rect.
+    Lives,
+}
+
+/// Spawn HUD text inside the score-bar strip (perm `reli` rects).
+pub fn setup_hud(mut commands: Commands, assets: Res<GameAssets>) {
     for slot in 0..2 {
-        let (left, right) = if slot == 0 {
-            (Val::Px(6.0), Val::Auto)
-        } else {
-            (Val::Auto, Val::Px(6.0))
-        };
-        commands.spawn((
-            Text::new(""),
-            TextFont {
-                font_size: bevy::text::FontSize::Px(15.0),
-                ..default()
-            },
-            TextColor(Color::srgb(0.9, 0.95, 1.0)),
-            Node {
-                position_type: PositionType::Absolute,
-                top: Val::Px(4.0 + slot as f32 * 16.0),
-                left,
-                right,
-                ..default()
-            },
-            HudText { slot },
-        ));
+        for (kind, rect_name, size, anchor_right) in [
+            (HudKind::Score, "Score", 13.0, true),
+            (HudKind::Lives, "Life Count", 15.0, false),
+        ] {
+            let full = format!("Scorebar Player {} {}", slot + 1, rect_name);
+            let Some(r) = assets
+                .rect_list
+                .as_ref()
+                .and_then(|l| l.get(&full))
+            else {
+                continue;
+            };
+            let (x, y, w) = (
+                SCOREBAR_X + r.left as f32,
+                r.top as f32,
+                (r.right - r.left) as f32,
+            );
+            commands.spawn((
+                Text::new(""),
+                TextFont {
+                    font_size: bevy::text::FontSize::Px(size),
+                    ..default()
+                },
+                TextColor(Color::srgb(0.9, 0.95, 1.0)),
+                Node {
+                    position_type: PositionType::Absolute,
+                    top: Val::Px(y),
+                    left: Val::Px(x),
+                    width: Val::Px(w),
+                    height: Val::Px((r.bottom - r.top) as f32),
+                    justify_content: if anchor_right {
+                        JustifyContent::FlexEnd
+                    } else {
+                        JustifyContent::FlexStart
+                    },
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                HudText { slot, kind },
+            ));
+        }
     }
 }
 
@@ -1630,11 +1661,224 @@ pub fn setup_menu(mut commands: Commands) {
         ));
 }
 
+// ---------------------------------------------------------------------------
+// Score bar (G_ScoreBar port): right-edge 160x480 strip. Perm rects from the
+// `reli` Rects file name each element; screen x = 480 + front-space x.
+// ---------------------------------------------------------------------------
+
+/// Right-edge strip origin on the 640x480 screen (ScoreBarWidth=160).
+const SCOREBAR_X: f32 = 480.0;
+
+/// Animated meter percentages, eased toward the live values like
+/// `G_ScoreBar_Process` (perm floats Shield/Power Meter Increase/DecreaseRate).
+#[derive(Resource, Default)]
+pub struct ScoreBars {
+    pub shield: [f32; 2],
+    pub power: [f32; 2],
+}
+
+/// Which score-bar element a sprite entity represents.
+#[derive(Component, Clone, Copy, PartialEq, Eq, Hash)]
+enum BarElem {
+    LifeIcon,
+    ShieldTrack,
+    ShieldFill,
+    PowerTrack,
+    PowerFill,
+    Weapon(usize),
+}
+
+#[derive(Component)]
+struct ScoreBarSprite {
+    player: usize,
+    elem: BarElem,
+}
+
+fn bar_rect(assets: &GameAssets, player: usize, name: &str) -> Option<crate::data::Rect> {
+    let full = format!("Scorebar Player {} {}", player + 1, name);
+    assets.rect_list.as_ref()?.get(&full)
+}
+
+/// Screen-space center + size for a score-bar element rect.
+fn bar_pos(r: crate::data::Rect) -> (Vec3, Vec2) {
+    let cx = SCOREBAR_X + (r.left + r.right) as f32 * 0.5;
+    let cy = (r.top + r.bottom) as f32 * 0.5;
+    (
+        to_world(cx, cy),
+        Vec2::new((r.right - r.left) as f32, (r.bottom - r.top) as f32),
+    )
+}
+
+/// Pixel-space clip rect keeping the left `frac` of an image (Sprite.rect
+/// is in image pixels).
+fn clip_left(images: &Assets<Image>, handle: &Handle<Image>, frac: f32) -> bevy::math::Rect {
+    let (w, h) = images
+        .get(handle)
+        .map(|i| (i.width() as f32, i.height() as f32))
+        .unwrap_or((96.0, 13.0));
+    bevy::math::Rect::new(0.0, 0.0, (w * frac).max(0.0), h)
+}
+
+/// Sync score-bar sprites to sim state (Playing only).
+#[allow(clippy::too_many_arguments)]
+fn sync_scorebar(
+    mut commands: Commands,
+    sim_res: Res<GameSim>,
+    flow: Res<Flow>,
+    mut assets: ResMut<GameAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut book: ResMut<TextureBook>,
+    mut bars: ResMut<ScoreBars>,
+    time: Res<Time>,
+    mut q: Query<(Entity, &ScoreBarSprite, &mut Sprite, &mut Transform)>,
+) {
+    let dt = time.delta_secs() * 60.0; // meter rates are per-frame at 60fps
+    let active = flow.state == FlowState::Playing;
+
+    // Desired elements: (player, elem) -> sprite/frame/rect/clip/dim/scale.
+    struct Want {
+        player: usize,
+        elem: BarElem,
+        rid: ResId,
+        frame: i64,
+        rect: String,
+        clip: Option<f32>,
+        dim: bool,
+        scale: f32,
+    }
+    let mut wants: Vec<Want> = Vec::new();
+
+    if active {
+        let sim = &sim_res.0;
+        let pdef_rid = [crate::pak::id("pl01"), crate::pak::id("pl02")];
+        for slot in 0..2 {
+            let Some(p) = sim.players[slot].as_ref() else { continue };
+            if p.phase == crate::game::sim::PlayerPhase::Dead {
+                continue;
+            }
+            // Ease meter fill toward the live 0..100 values.
+            ease(&mut bars.shield[slot], p.shields as f32, dt, 2.0, 3.0);
+            ease(&mut bars.power[slot], p.power as f32, dt, 2.0, 4.0);
+            let shield_pct = bars.shield[slot] / 100.0;
+            let power_pct = bars.power[slot] / 100.0;
+
+            let Some(def) = assets.players.get(&pdef_rid[slot]) else { continue };
+
+            if def.sprite_score_bar != crate::pak::NONE_ID {
+                wants.push(Want { player: slot, elem: BarElem::LifeIcon, rid: def.sprite_score_bar, frame: def.sprite_score_bar_frame, rect: "Life Symbol".into(), clip: None, dim: false, scale: 1.0 });
+            }
+            if def.sprite_score_bar_shield != crate::pak::NONE_ID {
+                wants.push(Want { player: slot, elem: BarElem::ShieldTrack, rid: def.sprite_score_bar_shield, frame: def.sprite_score_bar_shield_frame, rect: "Shields".into(), clip: None, dim: true, scale: 1.0 });
+                wants.push(Want { player: slot, elem: BarElem::ShieldFill, rid: def.sprite_score_bar_shield, frame: def.sprite_score_bar_shield_frame, rect: "Shields".into(), clip: Some(shield_pct), dim: false, scale: 1.0 });
+            }
+            if def.sprite_score_bar_power != crate::pak::NONE_ID {
+                wants.push(Want { player: slot, elem: BarElem::PowerTrack, rid: def.sprite_score_bar_power, frame: def.sprite_score_bar_power_frame, rect: "Power".into(), clip: None, dim: true, scale: 1.0 });
+                wants.push(Want { player: slot, elem: BarElem::PowerFill, rid: def.sprite_score_bar_power, frame: def.sprite_score_bar_power_frame, rect: "Power".into(), clip: Some(power_pct), dim: false, scale: 1.0 });
+            }
+
+            // Weapon preview chain: current + next two PEAA weapons
+            // (AirWeapon_GetScoreBarInfo). Slots whose preview duplicates an
+            // earlier slot are blanked, like the original.
+            let chain = crate::game::sim::weapon_chain(&assets, crate::pak::id("PEAA"), sim.level_number);
+            let mut previews: [Option<ResId>; 3] = [None; 3];
+            if let Some(c) = chain.iter().position(|&w| w == p.air_weapon) {
+                let mut seen: Vec<(ResId, i64)> = Vec::new();
+                for i in 0..3 {
+                    let w = chain[(c + i) % chain.len()];
+                    let Some(wd) = assets.weapons.get(&w) else { continue };
+                    let key = (wd.score_bar_preview_face, wd.score_bar_preview_frame);
+                    if wd.score_bar_preview_face == crate::pak::NONE_ID || seen.contains(&key) {
+                        continue;
+                    }
+                    seen.push(key);
+                    previews[i] = Some(w);
+                }
+            } else {
+                previews[0] = Some(p.air_weapon);
+            }
+            for (i, w) in previews.iter().enumerate() {
+                let Some(w) = w else { continue };
+                let Some(wd) = assets.weapons.get(w) else { continue };
+                if wd.score_bar_preview_face == crate::pak::NONE_ID {
+                    continue;
+                }
+                let selected = i == 0;
+                wants.push(Want {
+                    player: slot,
+                    elem: BarElem::Weapon(i),
+                    rid: wd.score_bar_preview_face,
+                    frame: wd.score_bar_preview_frame,
+                    rect: format!("Weapon {}", i + 1),
+                    clip: None,
+                    dim: !selected,
+                    scale: if selected { 1.0 } else { 0.7 },
+                });
+            }
+        }
+    }
+
+    // Reconcile entities keyed by (player, elem).
+    let mut existing: std::collections::HashMap<(usize, BarElem), Entity> =
+        q.iter().map(|(e, s, _, _)| ((s.player, s.elem), e)).collect();
+
+    for w in &wants {
+        let key = (w.player, w.elem);
+        let Some(r) = bar_rect(&assets, w.player, &w.rect) else { continue };
+        let (pos, size) = bar_pos(r);
+        let Some(handle) = frame_image(&mut assets, &mut images, &mut book, w.rid, w.frame)
+        else {
+            continue;
+        };
+        let color = if w.dim {
+            Color::srgba(1.0, 1.0, 1.0, 0.45)
+        } else {
+            Color::WHITE
+        };
+        let rect = w.clip.map(|f| clip_left(&images, &handle, f));
+        match existing.remove(&key) {
+            Some(e) => {
+                if let Ok((_, _, mut sprite, mut tf)) = q.get_mut(e) {
+                    sprite.image = handle;
+                    sprite.custom_size = Some(size * w.scale);
+                    sprite.color = color;
+                    sprite.rect = rect;
+                    tf.translation = pos;
+                }
+            }
+            None => {
+                commands.spawn((
+                    Sprite {
+                        image: handle,
+                        custom_size: Some(size * w.scale),
+                        color,
+                        rect,
+                        ..default()
+                    },
+                    Transform::from_translation(pos),
+                    Visibility::default(),
+                    ScoreBarSprite { player: w.player, elem: w.elem },
+                ));
+            }
+        }
+    }
+    // Despawn leftovers (everything when !active).
+    for (_, e) in existing {
+        commands.entity(e).despawn();
+    }
+}
+
+fn ease(cur: &mut f32, target: f32, dt: f32, inc: f32, dec: f32) {
+    if *cur > target {
+        *cur = (*cur - dec * dt).max(target);
+    } else if *cur < target {
+        *cur = (*cur + inc * dt).min(target);
+    }
+}
+
 /// Refresh HUD text from sim state each frame.
 pub fn hud_system(
     sim_res: Res<GameSim>,
     flow: Res<Flow>,
-    assets: Res<GameAssets>,
     mut q: Query<(&HudText, &mut Text)>,
 ) {
     let sim = &sim_res.0;
@@ -1644,7 +1888,7 @@ pub fn hud_system(
             continue;
         }
         let slot = hud.slot;
-        if flow.paused && slot == 0 {
+        if flow.paused && slot == 0 && hud.kind == HudKind::Score {
             text.0 = "PAUSED".to_string();
             continue;
         }
@@ -1652,20 +1896,9 @@ pub fn hud_system(
             text.0 = String::new();
             continue;
         };
-        let wname = assets
-            .weapons
-            .get(&p.air_weapon)
-            .map(|w| w.name.trim_start_matches("Air - ").to_string())
-            .unwrap_or_else(|| "---".into());
-        text.0 = format!(
-            "{:>7}  {:>4}  x{:<2}  L{:<2}  SH{:>3}  P{:>3}  {}",
-            p.score,
-            p.money,
-            p.multiplier,
-            p.lives,
-            p.shields as i64,
-            p.power as i64,
-            wname,
-        );
+        text.0 = match hud.kind {
+            HudKind::Score => format!("{:>7}", p.score),
+            HudKind::Lives => format!("{}", p.lives.max(0)),
+        };
     }
 }
