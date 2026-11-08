@@ -136,6 +136,8 @@ pub struct Entity {
     /// Non-looping animation reached its last frame (rule condition
     /// "This Entity's Animation Has Stopped" — the original's `m_field_0xb6`).
     pub anim_stopped: bool,
+    /// Pinned screen position (notice banners); set at spawn.
+    pub screen_lock: Option<Vec2>,
     /// Ticks until this entity activates (original `m_fielda4`, fed by
     /// cumulative groupDelay rolls). While >0 it skips all processing.
     pub activate_in: u32,
@@ -204,8 +206,12 @@ pub struct SpawnSetRt {
 }
 
 impl Entity {
-    /// Screen-space position for rendering.
+    /// Screen-space position for rendering. Screen-locked entities
+    /// (notice banners) keep the position captured at spawn.
     pub fn screen_pos(&self, sim: &Sim) -> Vec2 {
+        if let Some(sp) = self.screen_lock {
+            return sp;
+        }
         let p = self.pos + self.cyc_off;
         Vec2::new(p.x - sim.cam_x + WORLD_TO_SCREEN_X, sim.scroll + SCREEN_H - p.y)
     }
@@ -509,6 +515,8 @@ pub struct Sim {
     limit_message_shown: bool,
     pub rng: rand::rngs::StdRng,
     spawn_queue: Vec<SpawnReq>,
+    /// Parallel to spawn_queue: pinned screen pos for UI entities.
+    spawn_locks: Vec<Option<Vec2>>,
     /// Deferred one-shot actions (e.g. spawn at pos next tick).
     pub events: Vec<SimEvent>,
     /// Debris zones (G_Debris): world-space rects [min_x, min_y, max_x,
@@ -631,6 +639,7 @@ impl Sim {
             limit_message_shown: false,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             spawn_queue: Vec::new(),
+            spawn_locks: Vec::new(),
             events: Vec::new(),
             debris: Vec::new(),
             accuracy_targets: 0,
@@ -734,6 +743,16 @@ impl Sim {
             return;
         }
         self.spawn_queue.push(req);
+        self.spawn_locks.push(None);
+    }
+
+    /// Queue a spawn pinned to a fixed screen position (notice banners).
+    pub fn request_spawn_screen(&mut self, req: SpawnReq, screen: Vec2) {
+        if self.entities.len() + self.spawn_queue.len() >= MAX_ENTITIES {
+            return;
+        }
+        self.spawn_queue.push(req);
+        self.spawn_locks.push(Some(screen));
     }
 
     /// `G_EG_RequestSpawn` group path (`sub_41b650` + spawn loop): rolls
@@ -885,6 +904,7 @@ impl Sim {
             rot_dir: -1,
             rot_last: 0,
             anim_stopped: false,
+            screen_lock: None,
             activate_in,
             group_id,
             owner_off: Vec2::ZERO,
@@ -1334,7 +1354,7 @@ impl Sim {
                 if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
                     if rid != NONE_ID {
                         let pos = Vec2::new(self.cam_x + 240.0, self.scroll + 240.0);
-                        self.request_spawn(SpawnReq {
+                        self.request_spawn_screen(SpawnReq {
                             unit: rid,
                             pos,
                             heading: None,
@@ -1342,7 +1362,7 @@ impl Sim {
                             spawner_player: -1,
                             stationary: true,
                             state: None,
-                        });
+                        }, Vec2::new(320.0, 56.0));
                     }
                 }
             }
@@ -1386,8 +1406,15 @@ impl Sim {
 
         // --- process queued spawns ---
         let queue = std::mem::take(&mut self.spawn_queue);
-        for req in &queue {
+        let locks = std::mem::take(&mut self.spawn_locks);
+        for (i, req) in queue.iter().enumerate() {
+            let before = self.entities.len();
             self.spawn_group(assets, req);
+            if let Some(sp) = locks.get(i).copied().flatten() {
+                for e in &mut self.entities[before..] {
+                    e.screen_lock = Some(sp);
+                }
+            }
         }
 
         // --- players ---

@@ -1413,7 +1413,7 @@ pub fn flow_system(
                     if let Some(rid) = assets.object_ids.entries.get(0x18).map(|e| e.1) {
                         if rid != crate::pak::NONE_ID {
                             let pos = Vec2::new(sim.0.cam_x + 240.0, sim.0.scroll + 240.0);
-                            sim.0.request_spawn(SpawnReq {
+                            sim.0.request_spawn_screen(SpawnReq {
                                 unit: rid,
                                 pos,
                                 heading: None,
@@ -1421,7 +1421,7 @@ pub fn flow_system(
                                 spawner_player: -1,
                                 stationary: true,
                                 state: None,
-                            });
+                            }, Vec2::new(320.0, 56.0));
                         }
                     }
                 }
@@ -1732,7 +1732,7 @@ pub fn start_level(
     if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
         if rid != crate::pak::NONE_ID {
             let pos = Vec2::new(sim.cam_x + 240.0, sim.scroll + 240.0);
-            sim.request_spawn(SpawnReq {
+            sim.request_spawn_screen(SpawnReq {
                 unit: rid,
                 pos,
                 heading: None,
@@ -1740,7 +1740,7 @@ pub fn start_level(
                 spawner_player: -1,
                 stationary: true,
                 state: None,
-            });
+            }, Vec2::new(320.0, 56.0));
         }
     }
     Some(sim)
