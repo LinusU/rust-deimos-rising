@@ -506,6 +506,16 @@ pub struct PowerupRt {
     pub next_release: u32,
     /// Unit id of the activation spawn (stands in for the tracked uid).
     pub act_unit: ResId,
+    /// Overload warning phase (m_overloadB): true while waiting to refill.
+    pub ovl_phase: bool,
+    /// Ticks between overload warnings (m_overloadE), shrunk each warning.
+    pub ovl_interval: i64,
+    /// Completed overload warnings (m_overloadF).
+    pub ovl_count: i64,
+    /// Tick the last warning fired (m_overloadD).
+    pub ovl_last: u32,
+    /// Overload meter, 0..100 (m_some54) — drives the power-bar display.
+    pub ovl_meter: f64,
 }
 
 impl Player {
@@ -1219,6 +1229,15 @@ impl Sim {
                     rt.state_start = now;
                     let def_id = self.players[slot].as_ref().map(|p| p.def_id).unwrap_or(NONE_ID);
                     if let Some(pd) = assets.players.get(&def_id) {
+                        rt.ovl_phase = true;
+                        rt.ovl_interval = pd.powerup_overload_initial_time_between_warnings;
+                        rt.ovl_count = 0;
+                        rt.ovl_last = now;
+                        rt.ovl_meter = if ground {
+                            self.players[slot].as_ref().map(|p| p.gpower).unwrap_or(0.0)
+                        } else {
+                            self.players[slot].as_ref().map(|p| p.power).unwrap_or(0.0)
+                        };
                         if pd.powerup_overload_sound.id != NONE_ID {
                             self.events.push(SimEvent::Sound(pd.powerup_overload_sound.id));
                         }
@@ -1247,7 +1266,56 @@ impl Sim {
                     }
                 }
             }
-            2 => {}
+            2 => {
+                // PowerupOverload_Process: meter drains by
+                // warning_fade_percent per tick; every ovl_interval ticks it
+                // refills and counts a warning (the interval shrinks toward
+                // the minimum each cycle); at num_warnings the ship is
+                // destroyed. Releasing fire exits via the state-3 path above.
+                let pd = self.players[slot]
+                    .as_ref()
+                    .and_then(|p| assets.players.get(&p.def_id))
+                    .cloned();
+                if let Some(pd) = pd {
+                    if rt.ovl_phase {
+                        if now as i64 > rt.ovl_last as i64 + rt.ovl_interval {
+                            rt.ovl_last = now;
+                            rt.ovl_meter += 100.0;
+                            if rt.ovl_meter >= 100.0 {
+                                rt.ovl_meter = 100.0;
+                                rt.ovl_phase = false;
+                                rt.ovl_interval -= 1;
+                                if rt.ovl_interval
+                                    < pd.powerup_overload_min_time_between_warnings
+                                {
+                                    rt.ovl_interval =
+                                        pd.powerup_overload_min_time_between_warnings;
+                                }
+                                rt.ovl_count += 1;
+                                if rt.ovl_count >= pd.powerup_overload_num_warnings {
+                                    self.destroy_player(assets, slot);
+                                } else if pd.powerup_overload_sound.id != NONE_ID {
+                                    self.events
+                                        .push(SimEvent::Sound(pd.powerup_overload_sound.id));
+                                }
+                            }
+                        }
+                    } else {
+                        rt.ovl_meter -= pd.powerup_overload_warning_fade_percent;
+                        if rt.ovl_meter <= 0.0 {
+                            rt.ovl_meter = 0.0;
+                            rt.ovl_phase = true;
+                        }
+                    }
+                    if let Some(p) = self.players[slot].as_mut() {
+                        if ground {
+                            p.gpower = rt.ovl_meter;
+                        } else {
+                            p.power = rt.ovl_meter;
+                        }
+                    }
+                }
+            }
             3 => {
                 if rt.level > 0 && now as i64 > rt.next_release as i64 + tbr {
                     let pos = self.players[slot].as_ref().unwrap().world_pos(self);
@@ -3584,6 +3652,19 @@ impl Sim {
             .get(slot)
             .map(|(_, r)| *r)
             .filter(|r| *r != NONE_ID)
+    }
+
+    /// `G_Player::Destroy` — the wreck path shared by fatal hits and weapon
+    /// overload. Runs the same death sequence as a lethal damage_player call
+    /// without hit FX, hit sound, or the damage latch.
+    pub fn destroy_player(&mut self, assets: &GameAssets, slot: usize) {
+        let Some(p) = self.players[slot].as_mut() else { return };
+        if p.phase != PlayerPhase::Active {
+            return;
+        }
+        p.shields = -1.0;
+        p.last_hit_time = 0;
+        self.damage_player(assets, slot, 0.0);
     }
 
     /// `G_Player::Hit` — shield damage = shieldBaseHitPercentage × incoming,
