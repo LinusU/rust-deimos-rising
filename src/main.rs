@@ -247,6 +247,10 @@ fn main() {
         perm_probe();
         return;
     }
+    if args.iter().any(|a| a == "--pickups") {
+        pickups_probe();
+        return;
+    }
     if args.iter().any(|a| a == "--sprite") {
         let s = std::env::args().nth(2).unwrap();
         sprite_probe(&s);
@@ -534,6 +538,22 @@ fn test_strings() {
                 }
             }
         }
+    }
+}
+
+fn pickups_probe() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut v: Vec<_> = a
+        .units
+        .iter()
+        .filter(|(_, u)| u.pickup_type != pak::NONE_ID)
+        .map(|(&rid, u)| (rid, u.name.clone(), u.pickup_type, u.pickup_value))
+        .collect();
+    v.sort();
+    for (rid, name, pt, pv) in v {
+        println!("{:08x} {:30} pickup={:08x} val={}", rid, name, pt, pv);
     }
 }
 

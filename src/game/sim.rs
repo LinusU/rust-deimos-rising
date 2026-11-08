@@ -255,6 +255,10 @@ pub struct Player {
     pub shield_recharge: u32,
     /// Score multiplier.
     pub multiplier: i64,
+    /// Next score threshold granting an extra life (m_pad3a).
+    pub next_life_score: i64,
+    /// Accumulated extra-life bonus offset (m_pad3b).
+    pub life_bonus_acc: i64,
     /// Game time of last accepted hit (m_shieldReset1 hit-delay gate).
     pub last_hit_time: u32,
     /// Game time of last hit-effect spawn (m_shieldReset2 throttle).
@@ -488,6 +492,8 @@ impl Sim {
             bombs: base_bombs.max(1).min(max_bombs.max(1)),
             shield_recharge: 0,
             multiplier: 1,
+            next_life_score: def.life_initial_required_score,
+            life_bonus_acc: 0,
             last_hit_time: 0,
             last_hit_fx: 0,
             shield_warned: false,
@@ -982,6 +988,56 @@ impl Sim {
                 self.scroll_paused = true;
                 self.phase = Phase::LevelEnd;
                 self.events.push(SimEvent::LevelComplete);
+                // Level-cleared bonuses (G_Game/G_Player level-end path):
+                // defence bonus = levelNumber * DefenceBonusBaseAmount plus
+                // the defence-bonus object spawn, then the money counter
+                // tally converts each purse to score (BonusFactorPerCoinHeld
+                // * multiplier via Score_Adjust) and zeroes it.
+                for slot in 0..2 {
+                    let info = self.players[slot].as_ref().and_then(|p| {
+                        if p.phase == PlayerPhase::Dead {
+                            return None;
+                        }
+                        let def = assets.players.get(&p.def_id)?;
+                        let wx = p.screen.x + self.cam_x - WORLD_TO_SCREEN_X;
+                        let wy = self.scroll + SCREEN_H - p.screen.y;
+                        Some((
+                            def.active_defence_bonus_object,
+                            p.money,
+                            Vec2::new(wx, wy),
+                            slot as i32,
+                        ))
+                    });
+                    let Some((def_obj, money, wpos, spawner)) = info else { continue };
+                    if def_obj != NONE_ID {
+                        self.request_spawn(SpawnReq {
+                            unit: def_obj,
+                            pos: wpos,
+                            heading: None,
+                            owner: usize::MAX,
+                            spawner_player: spawner,
+                            stationary: true,
+                            state: None,
+                        });
+                    }
+                    self.add_score(
+                        slot,
+                        self.level_number * pf(assets, 0xb8) as i64,
+                        false,
+                        assets,
+                    );
+                    if money > 0 {
+                        self.add_score(
+                            slot,
+                            money * pf(assets, 0xab) as i64,
+                            false,
+                            assets,
+                        );
+                        if let Some(p) = self.players[slot].as_mut() {
+                            p.money = 0;
+                        }
+                    }
+                }
             }
         }
 
@@ -2220,11 +2276,10 @@ impl Sim {
             self.apply_state_change(idx, &cur_state.on_hit_change_to, assets);
         }
         if self.entities[idx].shields <= 0.0 {
-            // Score is awarded only on shield depletion.
+            // Score is awarded only on shield depletion (Score_Adjust,
+            // non-raw → multiplied).
             if from_player >= 0 {
-                if let Some(p) = self.players[from_player as usize].as_mut() {
-                    p.score += def.score as i64 * p.multiplier;
-                }
+                self.add_score(from_player as usize, def.score as i64, false, assets);
             }
             self.destroy_entity(assets, idx, from_player);
             return;
@@ -2273,6 +2328,40 @@ impl Sim {
                     state: None,
                 });
             }
+        }
+    }
+
+    /// `G_Player::Score_Adjust`: score += points (*multiplier unless raw),
+    /// then the extra-life threshold check (m_pad3a/m_pad3b port).
+    fn add_score(&mut self, slot: usize, points: i64, raw: bool, assets: &GameAssets) {
+        let Some(p) = self.players[slot].as_mut() else { return };
+        if p.phase == PlayerPhase::Dead {
+            return;
+        }
+        let mult = if raw { 1 } else { p.multiplier.max(1) };
+        p.score += points * mult;
+        if points <= 0 {
+            return;
+        }
+        if raw {
+            // Raw adds set m_pad3b = score + ExtraLifeScoreAdjustment.
+            p.life_bonus_acc = p.score + pf(assets, 0xb6) as i64;
+            return;
+        }
+        if p.score > p.next_life_score {
+            let (max_lives, step) = assets
+                .players
+                .get(&p.def_id)
+                .map(|d| (d.life_max_num, d.life_additional_required_score))
+                .unwrap_or((i64::MAX, 30000));
+            if p.lives < max_lives {
+                p.lives += 1;
+                self.events.push(SimEvent::PlayerEvent(slot, "extra_life"));
+            }
+            // m_pad3a += lifeAdditionalRequiredScore + m_pad3b;
+            // m_pad3b += ExtraLifeScoreAdjustment.
+            p.next_life_score += step + p.life_bonus_acc;
+            p.life_bonus_acc += pf(assets, 0xb6) as i64;
         }
     }
 
@@ -2471,18 +2560,28 @@ impl Sim {
                 state: None,
             });
         }
+        // Money burst on ship destruction (G_Player::Destroy): remaining
+        // money converts to coin pickups scattered at the wreck, then the
+        // purse resets. Collected after the `p` borrow ends.
+        let mut money_burst: Option<(i64, Vec2)> = None;
         let p = self.players[slot].as_mut().unwrap();
         if p.shields < 0.0 {
             p.shields = 0.0;
             p.lives -= 1;
+            if p.money > 0 {
+                let wx = p.screen.x + self.cam_x - WORLD_TO_SCREEN_X;
+                let wy = self.scroll + SCREEN_H - p.screen.y;
+                money_burst = Some((p.money, Vec2::new(wx, wy)));
+                p.money = 0;
+            }
             self.events.push(SimEvent::PlayerEvent(slot, "shield_break"));
             if p.lives <= 0 {
                 p.phase = PlayerPhase::Dead;
                 self.events.push(SimEvent::PlayerEvent(slot, "dead"));
-                return;
+            } else {
+                p.phase = PlayerPhase::Dying;
+                p.phase_time = 0;
             }
-            p.phase = PlayerPhase::Dying;
-            p.phase_time = 0;
         } else if amount > 0.0 && !p.shield_warned
             && (p.shields as i64) <= pdef.shield_warning_percentage
             && pdef.active_shield_warning_object != NONE_ID
@@ -2499,6 +2598,35 @@ impl Sim {
                 stationary: true,
                 state: None,
             });
+        }
+        // Burst the purse into coin pickups (50/10/5/1 denominations).
+        if let Some((mut money, pos)) = money_burst {
+            const COINS: [(i64, ResId); 4] = [
+                (50, id("clac")),
+                (10, id("slac")),
+                (5, id("gsac")),
+                (1, id("ssac")),
+            ];
+            // Slight scatter so the pile doesn't stack pixel-perfect.
+            let mut n = 0i64;
+            while money > 0 {
+                let (v, u) = COINS.iter().find(|(v, _)| *v <= money).copied().unwrap();
+                money -= v;
+                n += 1;
+                let off = Vec2::new(
+                    ((n * 37) % 24) as f32 - 12.0,
+                    ((n * 53) % 24) as f32 - 12.0,
+                );
+                self.request_spawn(SpawnReq {
+                    unit: u,
+                    pos: pos + off,
+                    heading: None,
+                    owner: usize::MAX,
+                    spawner_player: slot as i32,
+                    stationary: false,
+                    state: None,
+                });
+            }
         }
     }
 
