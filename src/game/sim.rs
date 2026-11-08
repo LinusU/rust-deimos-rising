@@ -1594,8 +1594,20 @@ impl Sim {
             let target = self.nearest_player(epos0);
             let mut pending_change: Option<String> = None;
             let mut brake = false;
-            let mut flee_from: Option<Vec2> = None;
+            let mut flee_to: Option<Vec2> = None;
             let mut hunt_to: Option<Vec2> = None;
+            // Priv_Flee: flee_id picks a random point inside the visible
+            // play area, re-rolled every tick (panic scatter). Runs even
+            // with no active players — m_field_0xc0 bypasses target AI.
+            if state.flee_id != NONE_ID {
+                let tx = rand_range(&mut self.rng, 32.0, 448.0) as f32;
+                let ty = rand_range(
+                    &mut self.rng,
+                    self.scroll as f64,
+                    (self.scroll + SCREEN_H) as f64,
+                ) as f32;
+                flee_to = Some(Vec2::new(tx, ty));
+            }
             if let Some((tp, td)) = target {
                 let in_range = state.on_range != 0.0 && td < state.on_range as f32;
                 if in_range {
@@ -1618,10 +1630,10 @@ impl Sim {
                             .clamp(-(amp as f32), amp as f32);
                     }
                 }
-                if state.flee_id != NONE_ID {
-                    flee_from = Some(tp);
-                } else if state.hunts && !brake {
-                    hunt_to = Some(tp);
+                if state.flee_id == NONE_ID {
+                    if state.hunts && !brake {
+                        hunt_to = Some(tp);
+                    }
                 }
             } else {
                 // No active players: unit-level flee flags pick a heading.
@@ -1644,20 +1656,21 @@ impl Sim {
                 let cur_speed = e.vel.length();
                 if brake {
                     e.vel *= 0.85;
-                } else if let Some(tp) = flee_from.or(hunt_to) {
-                    // Steer toward (hunt) or away from (flee) the target.
-                    let dir = if flee_from.is_some() {
-                        (epos0 - tp).normalize_or_zero()
-                    } else {
-                        (tp - epos0).normalize_or_zero()
-                    };
+                } else if let Some(tp) = flee_to.or(hunt_to) {
+                    // Steer toward the flee point or hunt target.
+                    let dir = (tp - epos0).normalize_or_zero();
                     if dir.length_squared() > 0.0001 {
-                        let speed = if flee_from.is_some() {
+                        let fleeing = flee_to.is_some();
+                        let speed = if fleeing {
                             state.flee_speed.max(state.max_speed) as f32
                         } else {
                             target_speed
                         };
-                        let delta = state.delta.max(state.flee_delta) as f32;
+                        let delta = if fleeing {
+                            state.flee_delta.max(state.delta) as f32
+                        } else {
+                            state.delta as f32
+                        };
                         let new_speed = (cur_speed + delta).min(speed.max(1.0));
                         e.vel = dir * new_speed;
                         e.heading = vector_to_heading(e.vel);

@@ -898,14 +898,14 @@ pub fn sync_entities(
             udef.map(|d| d.states.len().saturating_sub(1))
                 .unwrap_or(0),
         );
-        let tint_color = udef
-            .and_then(|d| d.states.get(state_idx))
-            .map(|s| s.tint_color)
-            .unwrap_or(0);
-        let terrain = udef
-            .and_then(|d| d.states.get(state_idx))
-            .map(|s| s.draw_to_terrain)
-            .unwrap_or(false);
+        let state_def = udef.and_then(|d| d.states.get(state_idx));
+        let tint_color = state_def.map(|s| s.tint_color).unwrap_or(0);
+        let terrain = state_def.map(|s| s.draw_to_terrain).unwrap_or(false);
+        // stateDoColorise: the base sprite is never drawn — the entity is
+        // only visible through its glow/hit-flash overlay.
+        if state_def.map(|s| s.do_colorise).unwrap_or(false) && !e.glow.active {
+            continue;
+        }
         desired.insert(
             e.unique_num,
             (
