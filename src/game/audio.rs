@@ -7,7 +7,7 @@
 //! so every `sfx.add(source)` overlaps freely.
 
 use crate::assets::{GameAssets, Sound};
-use crate::game::render::{GameSim, Particles};
+use crate::game::render::{BlurFx, Blurs, GameSim, Particles};
 use crate::game::sim::SimEvent;
 use crate::pak::ResId;
 use bevy::prelude::*;
@@ -111,6 +111,7 @@ pub fn drain_events(
     mut sim_res: ResMut<GameSim>,
     mut assets: ResMut<GameAssets>,
     mut parts: ResMut<Particles>,
+    mut blurs: ResMut<Blurs>,
     audio: Option<ResMut<AudioEngine>>,
 ) {
     let events = std::mem::take(&mut sim_res.0.events);
@@ -123,6 +124,35 @@ pub fn drain_events(
         .filter(|ev| match ev {
             SimEvent::Particles { x, y, kind, color, scroll, circular } => {
                 parts.burst(*x, *y, *kind, *color, *scroll, *circular);
+                false
+            }
+            SimEvent::MotionBlur { unit, state, frame, x, y, scale, vis0, vis_d } => {
+                // Resolve the sprite rid the same way sync_entities does.
+                let rid = assets
+                    .units
+                    .get(unit)
+                    .map(|def| {
+                        def.states
+                            .get((*state).min(def.states.len().saturating_sub(1)))
+                            .filter(|st| st.sprite_face != crate::pak::NONE_ID)
+                            .map(|st| st.sprite_face)
+                            .unwrap_or_else(|| {
+                                if def.editor_preview_sprite_face != crate::pak::NONE_ID {
+                                    def.editor_preview_sprite_face
+                                } else {
+                                    *unit
+                                }
+                            })
+                    })
+                    .unwrap_or(*unit);
+                blurs.list.push(BlurFx {
+                    rid,
+                    frame: *frame,
+                    pos: bevy::math::Vec2::new(*x, *y),
+                    scale: *scale,
+                    vis: (*vis0 / 100.0).clamp(0.0, 1.0),
+                    vis_d: *vis_d,
+                });
                 false
             }
             _ => true,

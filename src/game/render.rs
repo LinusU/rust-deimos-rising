@@ -335,6 +335,102 @@ pub struct ParticleSprite {
     key: u32,
 }
 
+// ---------------------------------------------------------------------------
+// Motion blur (G_MotionBlur port): frozen sprite afterimages that fade out
+// ---------------------------------------------------------------------------
+
+/// One fading afterimage (G_MotionBlurObject snapshot).
+pub struct BlurFx {
+    /// Sprite rid resolved from unit+state (entity_sprite rules).
+    pub rid: ResId,
+    pub frame: i64,
+    pub pos: Vec2, // screen space
+    pub scale: f32,
+    /// Current visibility 0..1; fades by vis_d per tick.
+    pub vis: f32,
+    pub vis_d: f32,
+}
+
+#[derive(Resource, Default)]
+pub struct Blurs {
+    pub list: Vec<BlurFx>,
+}
+
+/// Advance blurs one tick and sync their sprites.
+pub fn sync_blurs(
+    mut commands: Commands,
+    mut blurs: ResMut<Blurs>,
+    flow: Res<Flow>,
+    time: Res<Time>,
+    mut assets: ResMut<GameAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut book: ResMut<TextureBook>,
+    mut q: Query<(Entity, &BlurSprite, &mut Sprite, &mut Transform)>,
+) {
+    if flow.state != FlowState::Playing {
+        for (e, _, _, _) in q.iter() {
+            commands.entity(e).despawn();
+        }
+        blurs.list.clear();
+        return;
+    }
+    // Fade at ~60 Hz like the original's per-tick process.
+    let ticks = (time.delta_secs() * 60.0) as u32;
+    for _ in 0..ticks.min(4) {
+        blurs.list.retain_mut(|b| {
+            b.vis -= b.vis_d / 100.0;
+            b.vis > 0.0
+        });
+    }
+    // Cap the list like the original's motion-blur limit.
+    if blurs.list.len() > 256 {
+        let excess = blurs.list.len() - 256;
+        blurs.list.drain(0..excess);
+    }
+
+    let mut desired: Vec<(u32, Vec2, ResId, i64, f32, f32)> = Vec::new();
+    for (i, b) in blurs.list.iter().enumerate() {
+        desired.push((i as u32, b.pos, b.rid, b.frame, b.vis, b.scale));
+    }
+    for (bevy_e, bs, _, _) in q.iter() {
+        if !desired.iter().any(|d| d.0 == bs.key) {
+            commands.entity(bevy_e).despawn();
+        }
+    }
+    for (key, pos, rid, frame, vis, scale) in desired {
+        let handle = match frame_image(&mut *assets, &mut *images, &mut *book, rid, frame) {
+            Some(h) => h,
+            None => continue,
+        };
+        let wpos = to_world(pos.x, pos.y);
+        let mut found = None;
+        for (_be, bs, sprite, transform) in q.iter_mut() {
+            if bs.key == key {
+                found = Some((sprite, transform));
+                break;
+            }
+        }
+        if let Some((mut sprite, mut transform)) = found {
+            transform.translation = wpos;
+            transform.scale = Vec3::splat(scale.max(0.01));
+            sprite.color.set_alpha(vis.clamp(0.0, 1.0));
+        } else {
+            let mut sprite = Sprite::from_image(handle);
+            sprite.color.set_alpha(vis.clamp(0.0, 1.0));
+            commands.spawn((
+                sprite,
+                Transform::from_translation(wpos).with_scale(Vec3::splat(scale.max(0.01))),
+                BlurSprite { key },
+            ));
+        }
+    }
+}
+
+#[derive(Component)]
+pub struct BlurSprite {
+    key: u32,
+}
+
 /// Input state gathered from Bevy keys.
 #[derive(Resource, Default)]
 pub struct FrameInput {
@@ -991,7 +1087,8 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             ticks: 0,
             level_ids,
         })
-        .insert_resource(Particles::default());
+        .insert_resource(Particles::default())
+        .insert_resource(Blurs::default());
     if let Some(engine) = crate::game::audio::AudioEngine::new() {
         app.insert_resource(engine);
     }
@@ -1007,6 +1104,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sync_menu,
                 sync_terrain,
                 sync_particles,
+                sync_blurs,
                 sync_entities,
                 sync_players,
                 hud_system,

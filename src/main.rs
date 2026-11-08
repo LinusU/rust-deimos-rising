@@ -442,6 +442,11 @@ fn test_defs() {
         if st.sound_repeat_on_state_change {sr+=1;} if st.sound_allow_only_one_instance {so+=1;}
     }}
     println!("STATE-SND entry={} loop={} maxNum={} repeatChg={} oneInst={}", snd,sl,slm,sr,so);
+    let mut mb=0; let mut mba=0;
+    for u in a.units.values() { for st in &u.states {
+        if st.motion_blur_required {mb+=1; if st.motion_blur_allow_glow {mba+=1;}}
+    }}
+    println!("MOTIONBLUR required={} glow={}", mb,mba);
     // pickup units: do their states set collides/collidesWithPlayers?
     let mut pu=0; let mut pcoll=0; let mut pcwp=0; let mut pnames=Vec::new();
     for (rid,u) in &a.units {

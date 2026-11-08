@@ -171,6 +171,8 @@ pub struct Entity {
     pub sound_play_count: u32,
     pub sound_last_play: u32,
     pub state_sound_played: Vec<bool>,
+    /// Last motion-blur spawn tick (m_field_e4).
+    pub blur_last: u32,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -370,6 +372,19 @@ pub enum SimEvent {
         scroll: bool,
         /// Circular burst (unit-vector table).
         circular: bool,
+    },
+    /// Frozen-sprite afterimage request (G_MotionBlur_New). Carries the
+    /// visual snapshot; screen-space pos.
+    MotionBlur {
+        unit: ResId,
+        state: usize,
+        frame: i64,
+        x: f32,
+        y: f32,
+        scale: f32,
+        /// Initial visibility percent and per-tick delta percent.
+        vis0: f32,
+        vis_d: f32,
     },
 }
 
@@ -666,6 +681,7 @@ impl Sim {
             sound_play_count: 0,
             sound_last_play: 0,
             state_sound_played: vec![false; def.states.len()],
+            blur_last: 0,
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
@@ -1455,6 +1471,39 @@ impl Sim {
                     let e = &mut self.entities[i];
                     e.sound_play_count += 1;
                     e.sound_last_play = self.game_time;
+                }
+            }
+
+            // --- motion blur afterimages (G_MotionBlur_New trigger) ---
+            if state.motion_blur_required {
+                let interval = rand_range(
+                    &mut self.rng,
+                    state.motion_blur_min_time as f64,
+                    state.motion_blur_max_time.max(state.motion_blur_min_time) as f64,
+                ) as u32;
+                if self.game_time > self.entities[i].blur_last + interval {
+                    let (unit, state_i, frame, sx, sy, scale) = {
+                        let e = &self.entities[i];
+                        (
+                            e.unit,
+                            e.state,
+                            e.frame,
+                            e.pos.x - self.cam_x + WORLD_TO_SCREEN_X,
+                            self.scroll + SCREEN_H - e.pos.y,
+                            e.scale,
+                        )
+                    };
+                    self.events.push(SimEvent::MotionBlur {
+                        unit,
+                        state: state_i,
+                        frame,
+                        x: sx,
+                        y: sy,
+                        scale,
+                        vis0: state.motion_blur_initial_visibility as f32,
+                        vis_d: state.motion_blur_visibility_delta as f32,
+                    });
+                    self.entities[i].blur_last = self.game_time;
                 }
             }
 
