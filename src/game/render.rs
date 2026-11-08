@@ -811,7 +811,16 @@ pub fn sync_entities(
             .unwrap_or(0);
         desired.insert(
             e.unique_num,
-            (rid, frame, sp, e.hit_flash as f32, e.vis, e.tint, e.scale, tint_color),
+            (
+                rid,
+                frame,
+                sp,
+                if e.glow.active { e.glow.timer as f32 / 32.0 } else { 0.0 },
+                e.vis,
+                e.tint,
+                e.scale,
+                tint_color,
+            ),
         );
         }
     }
@@ -860,7 +869,9 @@ pub fn sync_entities(
             alpha,
         );
         if *flash > 0.0 {
-            col = Color::srgba(2.0, 2.0, 2.0, alpha);
+            // Glow pulse: brightness 1.125..2.0 following the sawtooth.
+            let b = 1.0 + flash;
+            col = Color::srgba(b, b, b, alpha);
         }
         let scl = Vec3::splat(*scale);
         if let Some((_, mut sprite, mut transform)) = found {

@@ -112,8 +112,8 @@ pub struct Entity {
     pub spawn_timers: Vec<SpawnSetRt>,
     /// Ticks remaining before this entity may be hit again.
     pub hit_cooldown: u32,
-    /// Ticks of post-hit glow remaining.
-    pub hit_flash: u32,
+    /// Hit-glow state (G_GameObject m_glow*): blink timer 4..32 ±6/tick.
+    pub glow: GlowRt,
     /// game_time of the last on-hit state change (rate limit).
     pub hit_change_time: u32,
     /// Last collision-spawn time (original m_field_0xc2).
@@ -220,6 +220,49 @@ pub enum PlayerPhase {
     Dying,
     /// Out of lives.
     Dead,
+}
+
+/// Entity hit-glow (`G_GameObject::Glow_Start/Process`): timer starts at
+/// 32 and oscillates 4..32 by ±step; glow ends after the up-swing.
+#[derive(Clone, Copy, Default)]
+pub struct GlowRt {
+    pub active: bool,
+    /// m_glowTimer (4..=32 while active).
+    pub timer: i32,
+    /// m_glowFlag — true while counting down.
+    pub flag: bool,
+}
+
+impl GlowRt {
+    /// Glow_Start(color ignored — original passes 0x7fff,6,0 for hits).
+    pub fn start(&mut self) {
+        if !self.active {
+            self.active = true;
+            self.timer = 32;
+            self.flag = true;
+        }
+    }
+
+    /// Glow_Process — one tick of the sawtooth.
+    pub fn process(&mut self) {
+        if !self.active {
+            return;
+        }
+        if self.flag {
+            self.timer -= 6;
+            if self.timer < 4 {
+                self.timer = 4;
+                self.flag = false;
+            }
+        } else {
+            self.timer += 6;
+            if self.timer > 32 {
+                self.timer = 32;
+                self.flag = true;
+                self.active = false;
+            }
+        }
+    }
 }
 
 /// Level-end money tally state — `G_Player::MoneyCounter` phases 1..8.
@@ -691,7 +734,7 @@ impl Sim {
             spawner_player: req.spawner_player,
             spawn_timers: vec![SpawnSetRt::default(); state.spawn_sets.len()],
             hit_cooldown: 0,
-            hit_flash: 0,
+            glow: GlowRt::default(),
             hit_change_time: 0,
             hit_fx_time: 0,
             hit_count: 0,
@@ -1377,7 +1420,7 @@ impl Sim {
                 e.age += 1;
                 e.state_time += 1;
                 if e.hit_cooldown > 0 { e.hit_cooldown -= 1; }
-                if e.hit_flash > 0 { e.hit_flash -= 1; }
+                e.glow.process();
             }
 
             // --- state transitions ---
@@ -2045,13 +2088,13 @@ impl Sim {
         if reflect {
             let owner_uid = self.entities[idx].owner;
             if owner_uid != u32::MAX {
-                let flash = self
+                let glow = self
                     .entities
                     .iter()
                     .find(|o| o.unique_num == owner_uid && !o.dead)
-                    .map(|o| o.hit_flash);
-                if let Some(flash) = flash {
-                    self.entities[idx].hit_flash = flash;
+                    .map(|o| o.glow);
+                if let Some(glow) = glow {
+                    self.entities[idx].glow = glow;
                 }
             }
         }
@@ -2400,7 +2443,6 @@ impl Sim {
             let e = &mut self.entities[idx];
             e.shields = (e.shields - amount).max(0.0);
             e.hit_cooldown = 2;
-            e.hit_flash = 4;
             e.hit_count += 1;
         }
         // stateCollides... 0x344: shields do not deplete on collision —
@@ -2427,6 +2469,11 @@ impl Sim {
             }
             self.destroy_entity(assets, idx, from_player);
             return;
+        }
+        // Survived: Glow_Start(0x7fff,6,0) unless the state opts out
+        // (stateDoNotGlowOnCollision, st+0x350).
+        if !cur_state.do_not_glow_on_collision {
+            self.entities[idx].glow.start();
         }
         // Survived: shield vs unshielded sound — 0x344 picks unshielded.
         let snd = if cur_state.shields_do_not_deplete_on_collision {
