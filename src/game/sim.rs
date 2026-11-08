@@ -2975,6 +2975,7 @@ impl Sim {
     /// `G_Player::Score_Adjust`: score += points (*multiplier unless raw),
     /// then the extra-life threshold check (m_pad3a/m_pad3b port).
     fn add_score(&mut self, slot: usize, points: i64, raw: bool, assets: &GameAssets) {
+        let mut life_spawn_req = None;
         let Some(p) = self.players[slot].as_mut() else { return };
         if p.phase == PlayerPhase::Dead {
             return;
@@ -2990,19 +2991,39 @@ impl Sim {
             return;
         }
         if p.score > p.next_life_score {
-            let (max_lives, step) = assets
+            let (max_lives, step, life_spawn) = assets
                 .players
                 .get(&p.def_id)
-                .map(|d| (d.life_max_num, d.life_additional_required_score))
-                .unwrap_or((i64::MAX, 30000));
+                .map(|d| (d.life_max_num, d.life_additional_required_score, d.life_spawn))
+                .unwrap_or((i64::MAX, 30000, NONE_ID));
             if p.lives < max_lives {
                 p.lives += 1;
                 self.events.push(SimEvent::PlayerEvent(slot, "extra_life"));
+                if life_spawn != NONE_ID {
+                    // Lives_Add spawns the player's life_Spawn object
+                    // (Notice - Extra Life) at the ship.
+                    let pos = Vec2::new(
+                        p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
+                        self.scroll + SCREEN_H - p.screen.y,
+                    );
+                    life_spawn_req = Some(SpawnReq {
+                        unit: life_spawn,
+                        pos,
+                        heading: None,
+                        owner: usize::MAX,
+                        spawner_player: slot as i32,
+                        stationary: false,
+                        state: None,
+                    });
+                }
             }
             // m_pad3a += lifeAdditionalRequiredScore + m_pad3b;
             // m_pad3b += ExtraLifeScoreAdjustment.
             p.next_life_score += step + p.life_bonus_acc;
             p.life_bonus_acc += pf(assets, 0xb6) as i64;
+        }
+        if let Some(req) = life_spawn_req {
+            self.request_spawn(req);
         }
     }
 
