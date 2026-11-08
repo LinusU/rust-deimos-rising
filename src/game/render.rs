@@ -1512,7 +1512,21 @@ fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets, scores: &HighScores) -
             )
         }
         FlowState::Cleared => {
-            "ALL MISSION TARGETS DESTROYED!!!\n\nPRESS ANY KEY".to_string()
+            {
+                // Level-end banner + ground-accuracy readout
+                // (G_GameInterface level-clear display).
+                let mut s = String::from("ALL MISSION TARGETS DESTROYED!!!\n\n");
+                let t = sim.accuracy_targets;
+                if t > 0 {
+                    let pct = sim.accuracy_destroyed as f32 / t as f32 * 100.0;
+                    s.push_str(&format!(
+                        "GROUND ACCURACY: {}/{} - {}%\n\n",
+                        sim.accuracy_destroyed, t, pct as i32
+                    ));
+                }
+                s.push_str("PRESS ANY KEY");
+                s
+            }
         }
         FlowState::GameOver => {
             let score: i64 = sim.players.iter().flatten().map(|p| p.score).sum();
