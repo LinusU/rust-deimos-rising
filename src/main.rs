@@ -260,6 +260,10 @@ fn main() {
         state_probe(v);
         return;
     }
+    if args.iter().any(|a| a == "--scores") {
+        score_census();
+        return;
+    }
     if args.iter().any(|a| a == "--flags") {
         flag_census();
         return;
@@ -592,6 +596,21 @@ fn pickups_probe() {
     }
 }
 
+
+fn score_census() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut v: Vec<_> = a.units.iter().collect();
+    v.sort_by_key(|(_, u)| u.score);
+    for (rid, u) in v.iter().take(15) {
+        println!("score={:>8} {:08x} {}", u.score, rid, u.name);
+    }
+    println!("--- top ---");
+    for (rid, u) in v.iter().rev().take(5) {
+        println!("score={:>8} {:08x} {}", u.score, rid, u.name);
+    }
+}
 
 fn flag_census() {
     let dir = data_dir();
