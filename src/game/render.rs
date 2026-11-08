@@ -67,6 +67,8 @@ pub struct Flow {
     pub ticks: u32,
     /// Level rids in mission order (sorted le01..le12).
     pub level_ids: Vec<ResId>,
+    /// Pause toggle (original: Caps Lock).
+    pub paused: bool,
 }
 
 /// Full-screen menu backdrop sprite (menu TGA / level preview).
@@ -870,7 +872,7 @@ fn sim_system(
     mut sim: ResMut<GameSim>,
     assets: Res<GameAssets>,
 ) {
-    if flow.state != FlowState::Playing {
+    if flow.state != FlowState::Playing || flow.paused {
         return;
     }
     let input = PlayerInput { p1: fi.p1, p2: fi.p2 };
@@ -888,6 +890,10 @@ pub fn flow_system(
     mut menu_q: Query<&mut Text, With<MenuText>>,
 ) {
     flow.ticks += 1;
+    // Caps Lock toggles pause during play (documented default).
+    if keys.just_pressed(KeyCode::CapsLock) && flow.state == FlowState::Playing {
+        flow.paused = !flow.paused;
+    }
     let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
     let space = keys.just_pressed(KeyCode::Space);
     let any = enter || space;
@@ -940,6 +946,7 @@ pub fn flow_system(
                         }
                         flow.state = FlowState::Playing;
                         flow.ticks = 0;
+                        flow.paused = false;
                     }
                 }
             }
@@ -1185,6 +1192,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             players: players.clamp(1, 2),
             ticks: 0,
             level_ids,
+            paused: false,
         })
         .insert_resource(Particles::default())
         .insert_resource(Blurs::default());
@@ -1295,6 +1303,10 @@ pub fn hud_system(
             continue;
         }
         let slot = hud.slot;
+        if flow.paused && slot == 0 {
+            text.0 = "PAUSED".to_string();
+            continue;
+        }
         let Some(p) = sim.players[slot].as_ref() else {
             text.0 = String::new();
             continue;

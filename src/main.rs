@@ -447,6 +447,13 @@ fn test_defs() {
         if st.motion_blur_required {mb+=1; if st.motion_blur_allow_glow {mba+=1;}}
     }}
     println!("MOTIONBLUR required={} glow={}", mb,mba);
+    // Weapon field census.
+    let mut wammo=0; let mut wauto=0; let mut wload=0; let mut wch=0;
+    for w in a.weapons.values() {
+        if w.num_ammo_in_pack>0 {wammo+=1;} if w.auto_repeat {wauto+=1;}
+        if w.delay_between_load_launches>0 {wload+=1;} if w.crosshair_face!=pak::NONE_ID {wch+=1;}
+    }
+    println!("WEAPONS ammo={} autoRep={} loadDelay={} crosshair={}", wammo,wauto,wload,wch);
     // pickup units: do their states set collides/collidesWithPlayers?
     let mut pu=0; let mut pcoll=0; let mut pcwp=0; let mut pnames=Vec::new();
     for (rid,u) in &a.units {
