@@ -408,6 +408,9 @@ pub struct Sim {
     pub scroll_speed: f32,
     /// Level finished scrolling.
     pub level_complete: bool,
+    /// Sum of player purses captured when the level ended, before the
+    /// MoneyCounter tally drains them (for the "Coin Bonus" display).
+    pub level_end_money: i64,
     /// Debug counters (hits landed / entities destroyed).
     pub stat_hits: u64,
     pub stat_kills: u64,
@@ -506,6 +509,7 @@ impl Sim {
             entity_scroll_pause: false,
             scroll_speed: 1.0,
             level_complete: false,
+            level_end_money: 0,
             stat_hits: 0,
             stat_kills: 0,
             stat_pickups: 0,
@@ -1084,6 +1088,7 @@ impl Sim {
                 // the defence-bonus object spawn, then the money counter
                 // tally converts each purse to score (BonusFactorPerCoinHeld
                 // * multiplier via Score_Adjust) and zeroes it.
+                let mut purse_total = 0i64;
                 for slot in 0..2 {
                     let info = self.players[slot].as_ref().and_then(|p| {
                         if p.phase == PlayerPhase::Dead {
@@ -1100,6 +1105,7 @@ impl Sim {
                         ))
                     });
                     let Some((def_obj, money, wpos, spawner)) = info else { continue };
+                    purse_total += money;
                     if def_obj != NONE_ID {
                         self.request_spawn(SpawnReq {
                             unit: def_obj,
@@ -1143,6 +1149,7 @@ impl Sim {
                         }
                     }
                 }
+                self.level_end_money = purse_total;
             }
         }
 

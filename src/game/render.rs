@@ -1513,18 +1513,41 @@ fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets, scores: &HighScores) -
         }
         FlowState::Cleared => {
             {
-                // Level-end banner + ground-accuracy readout
+                // Level-end banner + bonus breakdown
                 // (G_GameInterface level-clear display).
                 let mut s = String::from("ALL MISSION TARGETS DESTROYED!!!\n\n");
                 let t = sim.accuracy_targets;
                 if t > 0 {
                     let pct = sim.accuracy_destroyed as f32 / t as f32 * 100.0;
                     s.push_str(&format!(
-                        "GROUND ACCURACY: {}/{} - {}%\n\n",
+                        "GROUND ACCURACY: {}/{} - {}%\n",
                         sim.accuracy_destroyed, t, pct as i32
                     ));
                 }
-                s.push_str("PRESS ANY KEY");
+                // Defence bonus = levelNumber * pf(0xb8) per active player.
+                let active = sim
+                    .players
+                    .iter()
+                    .flatten()
+                    .filter(|p| p.phase != PlayerPhase::Dead)
+                    .count() as i64;
+                let defence = sim.level_number * crate::game::sim::pf(assets, 0xb8) as i64 * active;
+                if defence > 0 {
+                    s.push_str(&format!("   Bonus: {}\n", defence));
+                } else {
+                    s.push_str("   Bonus: None!\n");
+                }
+                // Coin Bonus: purse x pf(0xab) factor = score.
+                let factor = crate::game::sim::pf(assets, 0xab) as i64;
+                if sim.level_end_money > 0 {
+                    s.push_str(&format!(
+                        "Coin Bonus: {} x {} = {}\n",
+                        sim.level_end_money,
+                        factor,
+                        sim.level_end_money * factor
+                    ));
+                }
+                s.push_str("\nPRESS ANY KEY");
                 s
             }
         }
