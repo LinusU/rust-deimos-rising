@@ -53,6 +53,8 @@ pub enum FlowState {
     Playing,
     Cleared,
     GameOver,
+    /// Enter initials for a qualifying hi-score.
+    NameEntry,
     Credits,
 }
 
@@ -69,6 +71,84 @@ pub struct Flow {
     pub level_ids: Vec<ResId>,
     /// Pause toggle (original: Caps Lock).
     pub paused: bool,
+    /// Pending hi-score name entries (one per qualifying player).
+    pub pending_scores: Vec<PendingScore>,
+    /// Name-entry cursor state while in FlowState::NameEntry.
+    pub name_buf: [char; 3],
+    pub name_idx: usize,
+}
+
+/// A run result waiting for a player name.
+#[derive(Clone)]
+pub struct PendingScore {
+    pub score: i64,
+    pub level: String,
+}
+
+/// One row of the hi-score table (top 15 like the original prefs image).
+#[derive(Clone)]
+pub struct ScoreEntry {
+    pub name: String,
+    pub score: i64,
+    pub level: String,
+}
+
+const SCORES_PATH: &str = "deimos-hi-scores.txt";
+const MAX_SCORES: usize = 15;
+
+/// Local hi-score table. The original persists an encrypted prefs blob;
+/// the remake keeps a plain runtime file (never committed).
+#[derive(Resource, Default)]
+pub struct HighScores {
+    pub entries: Vec<ScoreEntry>,
+}
+
+impl HighScores {
+    pub fn load() -> Self {
+        let mut entries = Vec::new();
+        if let Ok(text) = std::fs::read_to_string(SCORES_PATH) {
+            for line in text.lines() {
+                let mut it = line.splitn(3, '|');
+                if let (Some(score), Some(level), Some(name)) =
+                    (it.next(), it.next(), it.next())
+                {
+                    if let Ok(s) = score.parse::<i64>() {
+                        entries.push(ScoreEntry {
+                            name: name.trim().to_string(),
+                            score: s,
+                            level: level.trim().to_string(),
+                        });
+                    }
+                }
+            }
+        }
+        entries.sort_by(|a, b| b.score.cmp(&a.score));
+        entries.truncate(MAX_SCORES);
+        HighScores { entries }
+    }
+
+    pub fn save(&self) {
+        let mut s = String::new();
+        for e in &self.entries {
+            s.push_str(&format!("{}|{}|{}\n", e.score, e.level, e.name));
+        }
+        let _ = std::fs::write(SCORES_PATH, s);
+    }
+
+    /// Would `score` make the table?
+    pub fn qualifies(&self, score: i64) -> bool {
+        score > 0
+            && (self.entries.len() < MAX_SCORES
+                || self.entries.last().map(|e| score > e.score).unwrap_or(true))
+    }
+
+    /// Insert a named score, keep top MAX_SCORES sorted.
+    pub fn insert(&mut self, name: String, score: i64, level: String) {
+        self.entries.push(ScoreEntry { name, score, level });
+        self.entries.sort_by(|a, b| b.score.cmp(&a.score));
+        self.entries.truncate(MAX_SCORES);
+        self.save();
+    }
 }
 
 /// Full-screen menu backdrop sprite (menu TGA / level preview).
@@ -886,6 +966,7 @@ pub fn flow_system(
     mut flow: ResMut<Flow>,
     mut sim: ResMut<GameSim>,
     mut assets: ResMut<GameAssets>,
+    mut scores: ResMut<HighScores>,
     mut audio: Option<ResMut<crate::game::audio::AudioEngine>>,
     mut menu_q: Query<&mut Text, With<MenuText>>,
 ) {
@@ -982,7 +1063,71 @@ pub fn flow_system(
         }
         FlowState::GameOver => {
             if enter {
-                flow.state = FlowState::Title;
+                // Queue hi-score entries for qualifying players, best first.
+                flow.pending_scores.clear();
+                let mut results: Vec<PendingScore> = sim
+                    .0
+                    .players
+                    .iter()
+                    .flatten()
+                    .filter_map(|p| {
+                        if p.score > 0 {
+                            Some(PendingScore {
+                                score: p.score,
+                                level: sim.0.level.name.clone(),
+                            })
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                results.sort_by(|a, b| b.score.cmp(&a.score));
+                flow.pending_scores = results
+                    .into_iter()
+                    .filter(|ps| scores.qualifies(ps.score))
+                    .collect();
+                if !flow.pending_scores.is_empty() {
+                    flow.name_buf = ['A', 'A', 'A'];
+                    flow.name_idx = 0;
+                    flow.state = FlowState::NameEntry;
+                } else {
+                    flow.state = FlowState::Title;
+                }
+                flow.ticks = 0;
+            }
+        }
+        FlowState::NameEntry => {
+            // 3-letter initials: up/down cycle A-Z, left/right move, enter ok.
+            if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
+                let ni = flow.name_idx;
+                let c = flow.name_buf[ni];
+                flow.name_buf[ni] =
+                    if c == 'Z' { 'A' } else { ((c as u8 - b'A' + 1) % 26 + b'A') as char };
+            }
+            if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
+                let ni = flow.name_idx;
+                let c = flow.name_buf[ni];
+                flow.name_buf[ni] =
+                    if c == 'A' { 'Z' } else { ((c as u8 - b'A' + 25) % 26 + b'A') as char };
+            }
+            if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyA) {
+                flow.name_idx = flow.name_idx.saturating_sub(1);
+            }
+            if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyD) {
+                flow.name_idx = (flow.name_idx + 1).min(2);
+            }
+            if enter {
+                if let Some(ps) = flow.pending_scores.first().cloned() {
+                    let name: String = flow.name_buf.iter().collect();
+                    scores.insert(name, ps.score, ps.level);
+                    flow.pending_scores.remove(0);
+                }
+                if flow.pending_scores.is_empty() {
+                    flow.state = FlowState::Title;
+                } else {
+                    flow.name_buf = ['A', 'A', 'A'];
+                    flow.name_idx = 0;
+                }
                 flow.ticks = 0;
             }
         }
@@ -995,13 +1140,13 @@ pub fn flow_system(
     }
 
     // Menu text.
-    let text = menu_text(&flow, &sim.0, &assets);
+    let text = menu_text(&flow, &sim.0, &assets, &scores);
     for mut t in menu_q.iter_mut() {
         t.0 = text.clone();
     }
 }
 
-fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets) -> String {
+fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets, scores: &HighScores) -> String {
     let name_of = |i: usize| -> String {
         flow.level_ids
             .get(i)
@@ -1033,7 +1178,38 @@ fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets) -> String {
         FlowState::GameOver => {
             let score: i64 = sim.players.iter().flatten().map(|p| p.score).sum();
             let money: i64 = sim.players.iter().flatten().map(|p| p.money).sum();
-            format!("GAME OVER\n\nSCORE {:>8}   BONUS ${}\n\nPRESS ENTER", score, money)
+            let mut s = format!("GAME OVER\n\nSCORE {:>8}   BONUS ${}\n", score, money);
+            if !scores.entries.is_empty() {
+                s.push_str("\nHI-SCORES\n");
+                for (i, e) in scores.entries.iter().take(5).enumerate() {
+                    s.push_str(&format!(
+                        "{:>2}. {:<3} {:>8}  {}\n",
+                        i + 1,
+                        e.name,
+                        e.score,
+                        e.level
+                    ));
+                }
+            }
+            s.push_str("\nPRESS ENTER");
+            s
+        }
+        FlowState::NameEntry => {
+            let ps = flow.pending_scores.first();
+            let mut s = String::from("NEW HIGH SCORE!\n\n");
+            if let Some(ps) = ps {
+                s.push_str(&format!("SCORE {:>8}  {}\n\n", ps.score, ps.level));
+            }
+            s.push_str("ENTER YOUR INITIALS\n\n   ");
+            for (i, c) in flow.name_buf.iter().enumerate() {
+                if i == flow.name_idx {
+                    s.push_str(&format!("[{}]", c));
+                } else {
+                    s.push(*c);
+                }
+            }
+            s.push_str("\n\nUP/DOWN change - LEFT/RIGHT move - ENTER ok");
+            s
         }
         FlowState::Credits => {
             let mut s = String::new();
@@ -1193,7 +1369,11 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             ticks: 0,
             level_ids,
             paused: false,
+            pending_scores: Vec::new(),
+            name_buf: ['A', 'A', 'A'],
+            name_idx: 0,
         })
+        .insert_resource(HighScores::load())
         .insert_resource(Particles::default())
         .insert_resource(Blurs::default());
     if let Some(engine) = crate::game::audio::AudioEngine::new() {
