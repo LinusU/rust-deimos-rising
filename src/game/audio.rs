@@ -198,6 +198,18 @@ pub fn drain_events(
                     audio.play_sfx(&pcm);
                 }
             }
+            // Weapon switch/cycle → "wesw" (weapon switch) perm sound.
+            SimEvent::PlayerEvent(_, "weapon_cycle")
+            | SimEvent::PlayerEvent(_, "weapon_air")
+            | SimEvent::PlayerEvent(_, "weapon_ground") => {
+                if let Some(sound) = assets.sound(crate::pak::id("wesw")) {
+                    audio.play_sfx(&Sound {
+                        samples: sound.samples.clone(),
+                        channels: sound.channels,
+                        sample_rate: sound.sample_rate,
+                    });
+                }
+            }
             // MoneyCounter drain tick → perm sound 0x14 ("moco" money count).
             SimEvent::PlayerEvent(_, "money_tick") => {
                 let rid = assets
@@ -215,6 +227,9 @@ pub fn drain_events(
                     }
                 }
             }
+            // Other player events (coin/life/shield/hit/dead/...) have no
+            // dedicated perm sound — their unit defs carry the sounds.
+            SimEvent::PlayerEvent(..) => {}
             other => eprintln!("[event] {:?}", other),
         }
     }
