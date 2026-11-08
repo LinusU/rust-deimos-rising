@@ -394,7 +394,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
         app.insert_resource(engine);
     }
 
-    app.add_systems(Startup, setup)
+    app.add_systems(Startup, (setup, setup_hud))
         .add_systems(
             Update,
             (
@@ -404,8 +404,76 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sync_terrain,
                 sync_entities,
                 sync_players,
+                hud_system,
             )
                 .chain(),
         );
     app.run();
+}
+
+// ---------------------------------------------------------------------------
+// HUD
+// ---------------------------------------------------------------------------
+
+/// One score-bar text line per player slot.
+#[derive(Component)]
+pub struct HudText {
+    pub slot: usize,
+}
+
+/// Spawn the two HUD text lines (top corners).
+pub fn setup_hud(mut commands: Commands) {
+    for slot in 0..2 {
+        let (left, right) = if slot == 0 {
+            (Val::Px(6.0), Val::Auto)
+        } else {
+            (Val::Auto, Val::Px(6.0))
+        };
+        commands.spawn((
+            Text::new(""),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(15.0),
+                ..default()
+            },
+            TextColor(Color::srgb(0.9, 0.95, 1.0)),
+            Node {
+                position_type: PositionType::Absolute,
+                top: Val::Px(4.0 + slot as f32 * 16.0),
+                left,
+                right,
+                ..default()
+            },
+            HudText { slot },
+        ));
+    }
+}
+
+/// Refresh HUD text from sim state each frame.
+pub fn hud_system(
+    sim_res: Res<GameSim>,
+    assets: Res<GameAssets>,
+    mut q: Query<(&HudText, &mut Text)>,
+) {
+    let sim = &sim_res.0;
+    for (hud, mut text) in q.iter_mut() {
+        let slot = hud.slot;
+        let Some(p) = sim.players[slot].as_ref() else {
+            text.0 = String::new();
+            continue;
+        };
+        let wname = assets
+            .weapons
+            .get(&p.air_weapon)
+            .map(|w| w.name.trim_start_matches("Air - ").to_string())
+            .unwrap_or_else(|| "---".into());
+        text.0 = format!(
+            "{:>7}  {:>4}  x{:<2}  L{:<2}  SH{:>3}  {}",
+            p.score,
+            p.money,
+            p.multiplier,
+            p.lives,
+            p.shields as i64,
+            wname,
+        );
+    }
 }
