@@ -128,6 +128,11 @@ pub struct Entity {
     /// Entity is homing/rotating toward a player target (rule condition
     /// "Is Tracking Player" — the original's `m_field_0xb5`).
     pub tracking: bool,
+    /// rotate_to_target sweep state: current direction index being
+    /// animated toward the target (-1 = derive from heading), and the
+    /// game-time of the last step (Priv_RotateToTargetLoc port).
+    pub rot_dir: i64,
+    pub rot_last: u32,
     /// Non-looping animation reached its last frame (rule condition
     /// "This Entity's Animation Has Stopped" — the original's `m_field_0xb6`).
     pub anim_stopped: bool,
@@ -754,6 +759,8 @@ impl Sim {
             dead: false,
             destroyed: false,
             tracking: false,
+            rot_dir: -1,
+            rot_last: 0,
             anim_stopped: false,
             activate_in,
             group_id,
@@ -1479,6 +1486,45 @@ impl Sim {
                 self.entities[i].tracking = state.rotate_to_target && has_target;
             }
 
+            // --- rotate_to_target sweep (Priv_RotateToTargetLoc): step the
+            // direction frame toward the tracked player, one direction per
+            // frame_delay ticks, in the direction of the wrapped angle.
+            if self.entities[i].tracking {
+                let nd = state.num_directions.max(1);
+                if nd > 1 {
+                    let epos = self.entities[i].pos;
+                    if let Some((tp, _)) = self.nearest_player(epos) {
+                        let target_dir = heading_to_dir(
+                            vector_to_heading(tp - epos),
+                            nd as usize,
+                        );
+                        let cur = if self.entities[i].rot_dir >= 0 {
+                            self.entities[i].rot_dir
+                        } else {
+                            heading_to_dir(self.entities[i].heading, nd as usize)
+                        };
+                        let delay = state.frame_delay.max(1) as u32;
+                        if target_dir != cur
+                            && self.game_time
+                                > self.entities[i].rot_last + delay
+                        {
+                            let mut diff = (target_dir - cur).rem_euclid(nd);
+                            if diff > nd / 2 {
+                                diff -= nd;
+                            }
+                            self.entities[i].rot_dir =
+                                (cur + diff.signum()).rem_euclid(nd);
+                            self.entities[i].rot_last = self.game_time;
+                            self.entities[i].frame_timer = 0;
+                        } else if self.entities[i].rot_dir < 0 {
+                            self.entities[i].rot_dir = cur;
+                        }
+                    }
+                }
+            } else {
+                self.entities[i].rot_dir = -1;
+            }
+
             // --- lifecycle flags ---
             // pause_vertical_scrolling aggregates into entity_scroll_pause
             // for the NEXT tick's scroll decision (G_EG_Process result).
@@ -1826,6 +1872,7 @@ impl Sim {
         e.frame = st.sprite_frame_min;
         e.anim_stopped = false;
         e.tracking = false;
+        e.rot_dir = -1;
         e.particle_bursts = 0;
         e.particle_last = 0;
         e.sound_play_count = 0;
@@ -2128,7 +2175,13 @@ impl Sim {
         let frame_max = state.sprite_frame_max.max(frame_min);
         let span = (frame_max - frame_min + 1).max(1) as usize;
         let per_dir = (span / num_dirs).max(1) as i64;
-        let dir = heading_to_dir(e.heading, num_dirs);
+        // rotate_to_target entities sweep rot_dir toward the player;
+        // everyone else derives direction from heading.
+        let dir = if e.tracking && e.rot_dir >= 0 {
+            e.rot_dir.rem_euclid(num_dirs as i64)
+        } else {
+            heading_to_dir(e.heading, num_dirs)
+        };
         if dir != e.dir_index {
             e.dir_index = dir;
             // Direction-major layout: each direction owns per_dir frames.

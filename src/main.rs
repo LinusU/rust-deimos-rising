@@ -584,12 +584,42 @@ fn flag_census() {
                 ("draw_to_terrain", st.draw_to_terrain),
                 ("use_on_shield_depletion", st.use_on_shield_depletion),
                 ("do_not_glow_on_collision", st.do_not_glow_on_collision),
+                ("do_colorise", st.do_colorise),
+                ("delete_on_no_active_players", st.delete_on_no_active_players),
+                ("destruct_on_no_active_players", st.destruct_on_no_active_players),
+                ("on_counter", st.on_counter != 0),
+                ("flee_id", st.flee_id != crate::pak::NONE_ID),
+                ("collision_spawn", st.collision_spawn_id != crate::pak::NONE_ID),
+                ("collision_repeat", st.collision_repeat_spawns),
+                ("rotate_to_target", st.rotate_to_target),
+                ("rule_unit", st.rules.iter().any(|r| r.unit_id != crate::pak::NONE_ID)),
             ];
             for (n, v) in checks {
                 if *v {
                     *counts.entry(n).or_default() += 1;
                     names.entry(n).or_default().push(format!("{}:{}", u.name, rid));
                 }
+            }
+            for ss in &st.spawn_sets {
+                for (n, v) in [
+                    ("spawn_if_fleeing", ss.spawn_if_fleeing),
+                    ("terrain_effects_option", ss.terrain_effects_option),
+                ] {
+                    if v {
+                        *counts.entry(n).or_default() += 1;
+                        names.entry(n).or_default().push(format!("{}:{}", u.name, rid));
+                    }
+                }
+            }
+        }
+        for (n, v) in [
+            ("do_burst", u.do_burst),
+            ("do_implode", u.do_implode),
+            ("destruct_draw_to_terrain", u.destruct_draw_to_terrain),
+        ] {
+            if v {
+                *counts.entry(n).or_default() += 1;
+                names.entry(n).or_default().push(format!("{}", u.name));
             }
         }
     }
