@@ -32,6 +32,10 @@ pub struct AudioEngine {
     music_player: Player,
     /// Currently playing music resource id.
     music_rid: Option<ResId>,
+    /// SFX bus volume 0..1 (Player::set_volume on the sfx driver).
+    sfx_volume: f32,
+    /// Music volume 0..1.
+    music_volume: f32,
 }
 
 impl AudioEngine {
@@ -57,6 +61,8 @@ impl AudioEngine {
             sfx,
             music_player,
             music_rid: None,
+            sfx_volume: 0.8,
+            music_volume: 0.6,
         })
     }
 
@@ -85,6 +91,14 @@ impl AudioEngine {
             .append(Self::pcm_source(sound).repeat_infinite());
         self.music_player.set_volume(0.6);
         self.music_player.play();
+    }
+
+    /// Adjust both buses by `delta` (clamped 0..1). F3/F4 keys.
+    pub fn adjust_volume(&mut self, delta: f32) {
+        self.sfx_volume = (self.sfx_volume + delta).clamp(0.0, 1.0);
+        self.music_volume = (self.music_volume + delta).clamp(0.0, 1.0);
+        self._sfx_driver.set_volume(self.sfx_volume);
+        self.music_player.set_volume(self.music_volume);
     }
 
     /// Ensure the level's music is playing (idempotent).

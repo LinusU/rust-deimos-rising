@@ -1112,6 +1112,17 @@ pub fn flow_system(
     if keys.just_pressed(KeyCode::CapsLock) && flow.state == FlowState::Playing {
         flow.paused = !flow.paused;
     }
+    // F3/F4 volume down/up (documented defaults), any flow state.
+    if keys.just_pressed(KeyCode::F3) {
+        if let Some(a) = audio.as_deref_mut() {
+            a.adjust_volume(-0.1);
+        }
+    }
+    if keys.just_pressed(KeyCode::F4) {
+        if let Some(a) = audio.as_deref_mut() {
+            a.adjust_volume(0.1);
+        }
+    }
     let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
     let space = keys.just_pressed(KeyCode::Space);
     let any = enter || space;
