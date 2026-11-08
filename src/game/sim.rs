@@ -1991,13 +1991,18 @@ impl Sim {
 
     /// Per-tick owner linkage (G_EG_Process tail): lock → link → orbit.
     fn step_owner_link(&mut self, idx: usize, assets: &GameAssets) {
-        let (lock, link, orbit) = {
+        let (lock, link, orbit, reflect) = {
             let e = &self.entities[idx];
             let Some(def) = assets.units.get(&e.unit) else { return };
             let Some(st) = def.states.get(e.state) else { return };
-            (st.lock_to_owner_loc, st.link_to_owner_loc, st.orbit_owner)
+            (
+                st.lock_to_owner_loc,
+                st.link_to_owner_loc,
+                st.orbit_owner,
+                st.visually_reflect_owner_hits,
+            )
         };
-        if !(lock || link || orbit) {
+        if !(lock || link || orbit || reflect) {
             return;
         }
         let Some(owner_pos) = self.owner_pos(idx) else { return };
@@ -2023,6 +2028,21 @@ impl Sim {
             }
             // Recompute the cached offset from the new position.
             e.owner_off = e.pos - owner_pos;
+        }
+        // visuallyReflectOwnerHits: mirror the owner's hit-flash glow
+        // (sub_41b5d0 copies the owner's glow fields each tick).
+        if reflect {
+            let owner_uid = self.entities[idx].owner;
+            if owner_uid != u32::MAX {
+                let flash = self
+                    .entities
+                    .iter()
+                    .find(|o| o.unique_num == owner_uid && !o.dead)
+                    .map(|o| o.hit_flash);
+                if let Some(flash) = flash {
+                    self.entities[idx].hit_flash = flash;
+                }
+            }
         }
     }
 
