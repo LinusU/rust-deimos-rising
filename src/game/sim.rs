@@ -190,6 +190,9 @@ pub struct Entity {
     pub cyc_off: Vec2,
     /// Cyclic-motion per-tick delta (original m_field_0x108/0x10c).
     cyc_delta: Vec2,
+    /// Priv_Flee target point (original m_field_0x114/0x118), computed once
+    /// per flee-state entry.
+    pub flee_target: Option<Vec2>,
     /// Visibility fade state (G_GameObject m_some62/66/6a): current %,
     /// required %, per-tick delta %.
     pub vis: f32,
@@ -949,6 +952,11 @@ impl Sim {
         } else {
             req.pos
         };
+        let flee_target = if state.flee_id != NONE_ID {
+            self.compute_flee_target(assets, state.flee_id, pos)
+        } else {
+            None
+        };
         self.entities.push(Entity {
             unit: req.unit,
             pos,
@@ -985,6 +993,7 @@ impl Sim {
             orbit_radius: f32::NAN,
             cyc_off: Vec2::ZERO,
             cyc_delta: Vec2::ZERO,
+            flee_target,
             vis: 100.0,
             vis_req: 100.0,
             vis_delta: 0.0,
@@ -1277,7 +1286,7 @@ impl Sim {
             .iter()
             .position(|s| s.use_on_weapon_powerup_release)
         {
-            self.change_state(idx, si, &def);
+            self.change_state(idx, si, &def, assets);
         }
     }
 
@@ -2052,17 +2061,12 @@ impl Sim {
             let mut brake = false;
             let mut flee_to: Option<Vec2> = None;
             let mut hunt_to: Option<Vec2> = None;
-            // Priv_Flee: flee_id picks a random point inside the visible
-            // play area, re-rolled every tick (panic scatter). Runs even
-            // with no active players — m_field_0xc0 bypasses target AI.
+            // Priv_Flee: the flee destination was computed once on state
+            // entry (m_field_0x114/0x118); the entity steers toward it for
+            // the state's duration. Runs even with no active players —
+            // m_field_0xc0 bypasses target AI.
             if state.flee_id != NONE_ID {
-                let tx = rand_float(&mut self.rng, 32.0, 448.0) as f32;
-                let ty = rand_float(
-                    &mut self.rng,
-                    self.scroll as f64,
-                    (self.scroll + SCREEN_H) as f64,
-                ) as f32;
-                flee_to = Some(Vec2::new(tx, ty));
+                flee_to = self.entities[i].flee_target;
             }
             if let Some((tp, td)) = target {
                 let in_range = state.on_range != 0.0 && td < state.on_range as f32;
@@ -2322,15 +2326,23 @@ impl Sim {
         let unit_id = self.entities[idx].unit;
         if let Some(def) = assets.units.get(&unit_id) {
             if let Some(ns) = find_state(def, name) {
-                self.change_state(idx, ns, def);
+                self.change_state(idx, ns, def, assets);
             }
         }
     }
 
-    fn change_state(&mut self, idx: usize, new_state: usize, def: &UnitDef) {
+    fn change_state(&mut self, idx: usize, new_state: usize, def: &UnitDef, assets: &GameAssets) {
+        let ns = new_state.min(def.states.len() - 1);
+        let epos = self.entities[idx].pos;
+        let flee_target = if def.states[ns].flee_id != NONE_ID {
+            self.compute_flee_target(assets, def.states[ns].flee_id, epos)
+        } else {
+            None
+        };
         let e = &mut self.entities[idx];
-        e.state = new_state.min(def.states.len() - 1);
+        e.state = ns;
         let state_idx = e.state;
+        e.flee_target = flee_target;
         e.state_time = 0;
         e.dir_index = -1;
         let st = &def.states[e.state];
@@ -2364,6 +2376,66 @@ impl Sim {
                 e.state_sound_played[state_idx] = true;
             }
         }
+    }
+
+    /// `G_Entity::Priv_Flee`: compute the flee destination (m_field_0x114/
+    /// 0x118) once per flee-state entry. The original dispatches on 14
+    /// fourCC flee-ids; each arm picks an off-screen/edge target from perm
+    /// floats (pf 0xe=-1000, 0xf=2000, 0x10=-1000, 0x11=2000, 0x36=416,
+    /// 0x37=480) with occasional RandomFloat/RandomInt rolls. Perm-float y
+    /// values are screen-band offsets, so world y = scroll + value. The
+    /// dat_004dfda8 constants at +0x738/+0x744 are runtime-initialised and
+    /// unrecovered; 0.0/1.0 reproduce the observed retail behaviour.
+    fn compute_flee_target(&mut self, assets: &GameAssets, flee_id: ResId, pos: Vec2) -> Option<Vec2> {
+        let scroll = self.scroll as f64;
+        let p = |i: usize| pf(assets, i) as f64;
+        let wy = |v: f64| (scroll + v) as f32;
+        let rx = |rng: &mut Crand, hi: f64| rand_float(rng, 0.0, hi) as f32;
+        let ry = |rng: &mut Crand, hi: f64| (scroll + rand_float(rng, 0.0, hi)) as f32;
+        let coin = |rng: &mut Crand| rand_int(rng, 0, 1) != 0;
+        let t = if flee_id == id("cega") {
+            Some(Vec2::new(p(0x36) as f32, wy(p(0x37))))
+        } else if flee_id == id("eara") {
+            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(p(0xe))))
+        } else if flee_id == id("wera") {
+            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(p(0xf))))
+        } else if flee_id == id("nora") {
+            Some(Vec2::new(p(0x10) as f32, ry(&mut self.rng, p(0x37))))
+        } else if flee_id == id("sora") {
+            Some(Vec2::new(p(0x11) as f32, ry(&mut self.rng, p(0x37))))
+        } else if flee_id == id("eace") {
+            Some(Vec2::new(p(0x36) as f32, wy(p(0xe))))
+        } else if flee_id == id("wece") {
+            Some(Vec2::new(p(0x36) as f32, wy(p(0xf))))
+        } else if flee_id == id("noce") {
+            Some(Vec2::new(p(0x10) as f32, wy(p(0x37))))
+        } else if flee_id == id("soce") {
+            Some(Vec2::new(p(0x11) as f32, wy(p(0x37))))
+        } else if flee_id == id("rave") {
+            let y = if coin(&mut self.rng) { p(0xe) } else { p(0xf) };
+            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(y)))
+        } else if flee_id == id("opve") {
+            let y = if p(0x37) < pos.y as f64 { p(0xe) } else { p(0xf) };
+            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(y)))
+        } else if flee_id == id("raho") {
+            let x = if coin(&mut self.rng) { p(0x11) } else { p(0x10) };
+            Some(Vec2::new(x as f32, ry(&mut self.rng, p(0x37))))
+        } else if flee_id == id("opho") {
+            let x = if p(0x36) < pos.x as f64 { p(0x10) } else { p(0x11) };
+            Some(Vec2::new(x as f32, ry(&mut self.rng, p(0x37))))
+        } else {
+            // Unknown flee-id: fall back to a random point in the visible
+            // play area (the pre-table behaviour).
+            Some(Vec2::new(
+                rand_float(&mut self.rng, 32.0, 448.0) as f32,
+                rand_float(
+                    &mut self.rng,
+                    self.scroll as f64,
+                    (self.scroll + SCREEN_H) as f64,
+                ) as f32,
+            ))
+        };
+        t
     }
 
     /// Copy a state's visibility/tint/scale requirements onto the entity
