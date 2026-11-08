@@ -607,6 +607,9 @@ fn test_floats() {
     let mut a = assets::GameAssets::open(&dir).expect("open");
     a.load_all_data();
     if let Some(fl) = &a.fill_list {
+        for i in 0x00usize..0x20 {
+            println!("flli[0x{:02x}] = {}", i, fl.get(i));
+        }
         for i in 0x30usize..0x45 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
@@ -880,6 +883,20 @@ fn flag_census() {
         }
     }
     println!("notice-string users: {}", notice_users);
+    // Distinct flee_id values in use (for the Priv_Flee arm census).
+    let mut flee_vals: Vec<String> = Vec::new();
+    for u in a.units.values() {
+        for st in &u.states {
+            if st.flee_id != crate::pak::NONE_ID {
+                let s = game::sim::rid_str(st.flee_id);
+                if !flee_vals.contains(&s) {
+                    flee_vals.push(s);
+                }
+            }
+        }
+    }
+    flee_vals.sort();
+    println!("flee_ids: {:?}", flee_vals);
     let mut ks: Vec<_> = counts.keys().collect();
     ks.sort();
     for k in ks {
