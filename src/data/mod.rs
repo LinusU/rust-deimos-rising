@@ -43,7 +43,12 @@ impl<'a> Cursor<'a> {
 
     pub fn get_int(&mut self, key: &str) -> i64 {
         self.get_raw(key)
-            .and_then(|v| v.trim().parse::<i64>().ok())
+            .and_then(|v| {
+                let t = v.trim();
+                t.parse::<i64>()
+                    .ok()
+                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+            })
             .unwrap_or(0)
     }
 
@@ -1241,7 +1246,14 @@ impl TextFormat {
     }
 
     pub fn get_int(&self, key: &str) -> i64 {
-        self.get(key).and_then(|v| v.parse().ok()).unwrap_or(0)
+        self.get(key)
+            .and_then(|v| {
+                let t = v.trim();
+                t.parse::<i64>()
+                    .ok()
+                    .or_else(|| t.parse::<f64>().ok().map(|f| f as i64))
+            })
+            .unwrap_or(0)
     }
 
     pub fn get_float(&self, key: &str) -> f64 {

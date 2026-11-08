@@ -114,6 +114,10 @@ pub struct Entity {
     pub hit_flash: u32,
     /// game_time of the last on-hit state change (rate limit).
     pub hit_change_time: u32,
+    /// Last collision-spawn time (original m_field_0xc2).
+    pub hit_fx_time: u32,
+    /// Total hits taken (original m_field_0xc6); gates one-shot collision spawns.
+    pub hit_count: u32,
     /// Marks entities to be removed.
     pub dead: bool,
     /// Removed via the Destroy (destruct) path rather than Delete —
@@ -220,6 +224,12 @@ pub struct Player {
     pub shield_recharge: u32,
     /// Score multiplier.
     pub multiplier: i64,
+    /// Game time of last accepted hit (m_shieldReset1 hit-delay gate).
+    pub last_hit_time: u32,
+    /// Game time of last hit-effect spawn (m_shieldReset2 throttle).
+    pub last_hit_fx: u32,
+    /// Low-shield warning already shown (pad7[1] latch).
+    pub shield_warned: bool,
     /// Age in ticks.
     pub age: u32,
     /// Entry animation progress (spawn entity index if any).
@@ -388,6 +398,9 @@ impl Sim {
             bombs: base_bombs.max(1).min(max_bombs.max(1)),
             shield_recharge: 0,
             multiplier: 1,
+            last_hit_time: 0,
+            last_hit_fx: 0,
+            shield_warned: false,
             age: 0,
             entry_entity: usize::MAX,
         });
@@ -556,6 +569,8 @@ impl Sim {
             hit_cooldown: 0,
             hit_flash: 0,
             hit_change_time: 0,
+            hit_fx_time: 0,
+            hit_count: 0,
             dead: false,
             destroyed: false,
             tracking: false,
@@ -726,11 +741,8 @@ impl Sim {
 
         if p.invuln > 0 { p.invuln -= 1; }
         if p.fire_timer > 0 { p.fire_timer -= 1; }
-        if p.shield_recharge > 0 {
-            p.shield_recharge -= 1;
-        } else if p.shields < 100.0 {
-            p.shields = (p.shields + 0.05).min(100.0);
-        }
+        // Shields do not passively regenerate in the original — they
+        // recover via "shie" pickups and respawn resets only.
         p.power = (p.power + 0.02).min(100.0);
 
         // Movement: velocity approaches ±max_speed by delta per tick,
@@ -1511,36 +1523,79 @@ impl Sim {
                 return;
             }
         }
-        let e = &mut self.entities[idx];
-        e.shields -= amount;
-        e.hit_cooldown = 2;
-        e.hit_flash = 4;
-        let died = e.shields <= 0.0;
-        if died && from_player >= 0 {
-            if let Some(p) = self.players[from_player as usize].as_mut() {
-                p.score += def.score as i64 * p.multiplier;
-            }
+        // Already-shieldless entities ignore further hits (shieldNonPos).
+        if self.entities[idx].shields <= 0.0 {
+            return;
         }
-        if died {
-            // Full destruct path: spawn/sound/coins/bonus/children.
-            self.destroy_entity(assets, idx, from_player);
-        } else {
-            // Non-fatal hit: shield vs unshielded sound (hit particles
-            // aren't ported yet) + on-hit state change (0x3b2/0x596).
-            let shields_left = self.entities[idx].shields;
-            let snd = if shields_left > 0.0 { def.shield_sound } else { def.unshielded_sound };
-            if snd.id != NONE_ID {
-                self.events.push(SimEvent::Sound(snd.id));
+        let old_shields = self.entities[idx].shields;
+        {
+            let e = &mut self.entities[idx];
+            e.shields = (e.shields - amount).max(0.0);
+            e.hit_cooldown = 2;
+            e.hit_flash = 4;
+            e.hit_count += 1;
+        }
+        // stateCollides... 0x344: shields do not deplete on collision —
+        // the subtraction is rolled back entirely.
+        if cur_state.shields_do_not_deplete_on_collision {
+            self.entities[idx].shields = old_shields;
+        }
+        // On-hit state change runs BEFORE the death check (0x3b2/0x596).
+        let oc = cur_state.on_hit_change_to.trim();
+        if !oc.is_empty()
+            && !oc.eq_ignore_ascii_case("none")
+            && self.game_time
+                > self.entities[idx].hit_change_time
+                    + cur_state.on_hit_change_state_delay.max(0) as u32
+        {
+            self.entities[idx].hit_change_time = self.game_time;
+            self.apply_state_change(idx, &cur_state.on_hit_change_to, assets);
+        }
+        if self.entities[idx].shields <= 0.0 {
+            // Score is awarded only on shield depletion.
+            if from_player >= 0 {
+                if let Some(p) = self.players[from_player as usize].as_mut() {
+                    p.score += def.score as i64 * p.multiplier;
+                }
             }
-            let oc = cur_state.on_hit_change_to.trim();
-            if !oc.is_empty()
-                && !oc.eq_ignore_ascii_case("none")
-                && self.game_time
-                    > self.entities[idx].hit_change_time
-                        + cur_state.on_hit_change_state_delay.max(0) as u32
-            {
-                self.entities[idx].hit_change_time = self.game_time;
-                self.apply_state_change(idx, &cur_state.on_hit_change_to, assets);
+            self.destroy_entity(assets, idx, from_player);
+            return;
+        }
+        // Survived: shield vs unshielded sound — 0x344 picks unshielded.
+        let snd = if cur_state.shields_do_not_deplete_on_collision {
+            def.unshielded_sound
+        } else {
+            def.shield_sound
+        };
+        if snd.id != NONE_ID {
+            self.events.push(SimEvent::Sound(snd.id));
+        }
+        // Collision spawn (state+0x2e0): throttled, repeat-gated, owned
+        // by the hit entity itself.
+        if cur_state.collision_spawn_id != NONE_ID {
+            let can_spawn = if cur_state.collision_repeat_spawns {
+                self.game_time as i64
+                    >= self.entities[idx].hit_fx_time as i64
+                        + cur_state.collision_spawn_delay.max(0) as i64
+            } else {
+                self.entities[idx].hit_count <= 1
+                    && self.game_time as i64
+                        >= self.entities[idx].hit_fx_time as i64
+                            + cur_state.collision_spawn_delay.max(0) as i64
+            };
+            if can_spawn {
+                let pos = self.entities[idx].pos;
+                let owner_idx = idx;
+                self.entities[idx].hit_fx_time = self.game_time;
+                self.request_spawn(SpawnReq {
+                    unit: cur_state.collision_spawn_id,
+                    pos,
+                    heading: None,
+                    owner: owner_idx,
+                    spawner_player: from_player,
+                    stationary: false,
+                    state: None,
+                });
             }
         }
     }
@@ -1685,29 +1740,79 @@ impl Sim {
             .filter(|r| *r != NONE_ID)
     }
 
-    /// Damage a player.
-    pub fn damage_player(&mut self, slot: usize, amount: f64) {
-        let p = match self.players[slot].as_mut() {
-            Some(p) if p.phase == PlayerPhase::Active => p,
-            _ => return,
+    /// `G_Player::Hit` — shield damage = shieldBaseHitPercentage × incoming,
+    /// gated by shieldHitDelay game-time cooldown and invulnerability.
+    pub fn damage_player(&mut self, assets: &GameAssets, slot: usize, amount: f64) {
+        let pdef_id = {
+            let Some(p) = self.players[slot].as_ref() else { return };
+            if p.phase != PlayerPhase::Active {
+                return;
+            }
+            p.def_id
         };
-        if p.invuln > 0 {
+        let pdef = match assets.players.get(&pdef_id) {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        // Hit-delay gate: inB >= m_shieldReset1 + shieldHitDelay.
+        let Some(p) = self.players[slot].as_mut() else { return };
+        if (self.game_time as i64) < p.last_hit_time as i64 + pdef.shield_hit_delay {
             return;
         }
-        p.shields -= amount;
+        p.last_hit_time = self.game_time;
         p.shield_recharge = 30;
-        if p.shields <= 0.0 {
-            p.lives -= 1;
+        if p.invuln == 0 {
+            let dmg = pdef.shield_base_hit_percentage as f64 * amount;
+            p.shields -= dmg;
+            if dmg > 0.0 {
+                self.events.push(SimEvent::PlayerEvent(slot, "hit"));
+            }
+        }
+        // Hit-effect spawn (active_SpawnOnHit), throttled by pf(0xa2).
+        if pdef.active_spawn_on_hit != NONE_ID
+            && self.game_time as i64
+                >= p.last_hit_fx as i64 + pf(assets, 0xa2) as i64
+        {
+            p.last_hit_fx = self.game_time;
+            let pos = Vec2::new(p.screen.x + self.cam_x, self.scroll + SCREEN_H - p.screen.y);
+            self.request_spawn(SpawnReq {
+                unit: pdef.active_spawn_on_hit,
+                pos,
+                heading: None,
+                owner: usize::MAX,
+                spawner_player: slot as i32,
+                stationary: true,
+                state: None,
+            });
+        }
+        let p = self.players[slot].as_mut().unwrap();
+        if p.shields < 0.0 {
             p.shields = 0.0;
-            self.events.push(SimEvent::PlayerEvent(slot, "hit"));
-            if p.lives > 0 {
-                p.phase = PlayerPhase::Dying;
-                p.phase_time = 0;
-                p.invuln = 0;
-            } else {
+            p.lives -= 1;
+            self.events.push(SimEvent::PlayerEvent(slot, "shield_break"));
+            if p.lives <= 0 {
                 p.phase = PlayerPhase::Dead;
                 self.events.push(SimEvent::PlayerEvent(slot, "dead"));
+                return;
             }
+            p.phase = PlayerPhase::Dying;
+            p.phase_time = 0;
+        } else if amount > 0.0 && !p.shield_warned
+            && (p.shields as i64) <= pdef.shield_warning_percentage
+            && pdef.active_shield_warning_object != NONE_ID
+        {
+            // Low-shield warning object, latched until shields recover.
+            p.shield_warned = true;
+            let pos = Vec2::new(p.screen.x + self.cam_x, self.scroll + SCREEN_H - p.screen.y);
+            self.request_spawn(SpawnReq {
+                unit: pdef.active_shield_warning_object,
+                pos,
+                heading: None,
+                owner: usize::MAX,
+                spawner_player: slot as i32,
+                stationary: true,
+                state: None,
+            });
         }
     }
 
@@ -1728,6 +1833,15 @@ impl Sim {
                 continue;
             }
             let Some(def) = assets.units.get(&e.unit) else { continue };
+            // G_EG_Process player-contact gate: stateCollides &&
+            // stateCollidesWithPlayers && !harmlessToPlayers.
+            let st = def.states.get(e.state);
+            let contacts_players = st
+                .map(|s| s.collides && s.collides_with_players)
+                .unwrap_or(false);
+            if !contacts_players || def.harmless_to_players {
+                continue;
+            }
             let r = entity_radius(def);
             for slot in 0..2 {
                 if ppos[slot].x < -999.0 {
@@ -1744,7 +1858,6 @@ impl Sim {
                 }
                 // Dangerous entity vs player.
                 if !def.player_projectile
-                    && !def.harmless_to_players
                     && !def.terrain_effect
                     && def.damage > 0.0
                 {
@@ -1780,6 +1893,16 @@ impl Sim {
                 if !tdef.can_be_hit_by_player_projectile {
                     continue;
                 }
+                // Entity-vs-entity collision requires stateCollides (0x343).
+                let tst = self.entities[j].state;
+                if !tdef
+                    .states
+                    .get(tst)
+                    .map(|s| s.collides)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
                 let tr = entity_radius(tdef);
                 if epos.distance(self.entities[j].pos) < pr + tr {
                     hits.push((j, pdef.damage, espawner));
@@ -1813,7 +1936,7 @@ impl Sim {
             self.damage_entity(assets, j, dmg, pl);
         }
         for (eidx, slot, dmg) in player_hits {
-            self.damage_player(slot, dmg);
+            self.damage_player(assets, slot, dmg);
             // pass_hits_to_owner (state 0x327): the owner entity soaks
             // pf(0xa1) damage credited to the contacting player.
             let pass = self.entities.get(eidx).and_then(|e| {

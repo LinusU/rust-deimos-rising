@@ -395,6 +395,37 @@ fn test_defs() {
         if st.cyclic_motion {ncyc+=1;} if st.hold_position_to_target {nhold+=1;}
     }}
     println!("STATES lock={} link={} orbit={} cyclic={} hold={}", nlock,nlink,norb,ncyc,nhold);
+    let mut ncoll=0; let mut ncwp=0; let mut ntarg=0; let mut nnodepl=0; let mut nrev=0; let mut nshieldst=0; let mut nusevis=0; let mut nusescale=0; let mut ndestowner=0; let mut nvisrefl=0; let mut nparentdir=0; let mut ncolspawn=0;
+    for u in a.units.values() { for st in &u.states {
+        if st.collides {ncoll+=1;} if st.collides_with_players {ncwp+=1;} if st.is_targetable {ntarg+=1;}
+        if st.shields_do_not_deplete_on_collision {nnodepl+=1;} if st.reverse_direction_on_reaction {nrev+=1;}
+        if st.use_on_shield_depletion {nshieldst+=1;} if st.use_owners_visibility {nusevis+=1;}
+        if st.use_owners_scale {nusescale+=1;} if st.destroy_owner_on_destruction {ndestowner+=1;}
+        if st.visually_reflect_owner_hits {nvisrefl+=1;} if st.use_parent_direction {nparentdir+=1;}
+        if st.collision_spawn_id != pak::NONE_ID {ncolspawn+=1;}
+    }}
+    println!("STATES collides={} collPlayers={} targetable={} noDeplete={} reverse={} shieldState={} useVis={} useScale={} destOwner={} visRefl={} parentDir={} colSpawn={}", ncoll,ncwp,ntarg,nnodepl,nrev,nshieldst,nusevis,nusescale,ndestowner,nvisrefl,nparentdir,ncolspawn);
+    // pickup units: do their states set collides/collidesWithPlayers?
+    let mut pu=0; let mut pcoll=0; let mut pcwp=0; let mut pnames=Vec::new();
+    for (rid,u) in &a.units {
+        if u.pickup_type == pak::NONE_ID { continue; }
+        pu+=1;
+        let any_coll = u.states.iter().any(|st| st.collides);
+        let any_cwp = u.states.iter().any(|st| st.collides_with_players);
+        if any_coll {pcoll+=1;} if any_cwp {pcwp+=1;}
+        if pnames.len()<8 { pnames.push(format!("{:08x} {} coll={} cwp={} pt={:08x}", rid,u.name,any_coll,any_cwp,u.pickup_type)); }
+    }
+    println!("PICKUPS units={} anyCollides={} anyCollPlayers={}", pu,pcoll,pcwp);
+    for n in pnames { println!("  {}", n); }
+    // damage census: which units hurt players on contact?
+    let mut hurts: Vec<String> = Vec::new();
+    for (rid,u) in &a.units {
+        if u.damage > 0.0 && !u.harmless_to_players {
+            hurts.push(format!("{:08x} {} dmg={} proj={} terr={}", rid,u.name,u.damage,u.player_projectile,u.terrain_effect));
+        }
+    }
+    println!("HARMFUL units={}", hurts.len());
+    for n in hurts.iter().take(25) { println!("  {}", n); }
     for (r,n) in grp_units.iter().take(20) { println!("  grp {:08x} {}", r, n); }
     // le01 objects sample
     if let Some(l) = a.levels.get(&id("le01")) {
