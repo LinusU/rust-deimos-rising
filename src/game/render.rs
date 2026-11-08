@@ -467,12 +467,13 @@ pub fn hud_system(
             .map(|w| w.name.trim_start_matches("Air - ").to_string())
             .unwrap_or_else(|| "---".into());
         text.0 = format!(
-            "{:>7}  {:>4}  x{:<2}  L{:<2}  SH{:>3}  {}",
+            "{:>7}  {:>4}  x{:<2}  L{:<2}  SH{:>3}  P{:>3}  {}",
             p.score,
             p.money,
             p.multiplier,
             p.lives,
             p.shields as i64,
+            p.power as i64,
             wname,
         );
     }

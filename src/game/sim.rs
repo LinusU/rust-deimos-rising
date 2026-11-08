@@ -236,6 +236,34 @@ pub struct Player {
     pub age: u32,
     /// Entry animation progress (spawn entity index if any).
     pub entry_entity: usize,
+    /// Air-weapon charge/release power-up state.
+    pub air_power: PowerupRt,
+    /// Ground-weapon charge/release power-up state.
+    pub gnd_power: PowerupRt,
+    /// Ground-weapon fire cooldown.
+    pub gnd_timer: u32,
+    /// Ground-weapon power meter 0..100.
+    pub gpower: f64,
+}
+
+/// Runtime state for a weapon's charge/release power-up — the air bank
+/// (G_WeaponHandler fields 0x11..0x2d) and ground bank (0x35..0x51).
+#[derive(Clone, Default)]
+pub struct PowerupRt {
+    /// 0 idle, 1 charging, 2 overload, 3 releasing.
+    pub state: u8,
+    /// Consecutive fire-hold ticks (m_field_0x2d / 0x51).
+    pub hold: u32,
+    /// Current power level (m_field_0x21 / 0x45).
+    pub level: i64,
+    /// Tick the current state began (m_field_0x15 / 0x39).
+    pub state_start: u32,
+    /// Tick of last power-level change (m_field_0x1d / 0x41).
+    pub last_change: u32,
+    /// Tick of next release spawn (m_field_0x29 / 0x4d).
+    pub next_release: u32,
+    /// Unit id of the activation spawn (stands in for the tracked uid).
+    pub act_unit: ResId,
 }
 
 impl Player {
@@ -407,6 +435,10 @@ impl Sim {
             shield_warned: false,
             age: 0,
             entry_entity: usize::MAX,
+            air_power: PowerupRt::default(),
+            gnd_power: PowerupRt::default(),
+            gnd_timer: 0,
+            gpower: 0.0,
         });
         // Spawn the entry effect unit ("plen").
         if def.entry_spawn != NONE_ID {
@@ -618,12 +650,39 @@ impl Sim {
 
     /// Fire a weapon's projectile pattern for a player.
     fn fire_weapon(&mut self, assets: &GameAssets, slot: usize) {
-        let (weapon_id, pos) = {
+        let weapon_id = {
             let p = match self.players[slot].as_ref() {
                 Some(p) if p.phase == PlayerPhase::Active => p,
                 _ => return,
             };
-            (p.air_weapon, p.world_pos(self))
+            p.air_weapon
+        };
+        self.fire_weapon_id(assets, slot, weapon_id);
+        if let Some(p) = self.players[slot].as_mut() {
+            if let Some(w) = assets.weapons.get(&weapon_id) {
+                p.fire_timer = w.delay_between_launches.max(1) as u32;
+            }
+        }
+    }
+
+    /// Fire the ground (plasma bomb) weapon — consumes one bomb per shot.
+    fn fire_ground_weapon(&mut self, assets: &GameAssets, slot: usize) {
+        let weapon_id = match self.players[slot].as_ref() {
+            Some(p) if p.phase == PlayerPhase::Active => p.ground_weapon,
+            _ => return,
+        };
+        self.fire_weapon_id(assets, slot, weapon_id);
+        if let Some(p) = self.players[slot].as_mut() {
+            if let Some(w) = assets.weapons.get(&weapon_id) {
+                p.gnd_timer = w.delay_between_launches.max(1) as u32;
+            }
+        }
+    }
+
+    fn fire_weapon_id(&mut self, assets: &GameAssets, slot: usize, weapon_id: ResId) {
+        let pos = match self.players[slot].as_ref() {
+            Some(p) if p.phase == PlayerPhase::Active => p.world_pos(self),
+            _ => return,
         };
         let wdef = match assets.weapons.get(&weapon_id) {
             Some(w) => w.clone(),
@@ -648,8 +707,189 @@ impl Sim {
                 state: None,
             });
         }
+    }
+
+    /// `Priv_AirPowerup_Process` / ground-bank mirror: charge while the fire
+    /// button is held, overload or auto-release at max level, then drain
+    /// power level into release-spawn salvos until empty.
+    fn step_powerup(&mut self, assets: &GameAssets, slot: usize, ground: bool, held: bool) {
+        let wdef = {
+            let Some(p) = self.players[slot].as_ref() else { return };
+            if p.phase != PlayerPhase::Active {
+                return;
+            }
+            let wid = if ground { p.ground_weapon } else { p.air_weapon };
+            match assets.weapons.get(&wid) {
+                Some(w) => w.clone(),
+                None => return,
+            }
+        };
+        let pu = &wdef.powerup;
+        let (until_act, act_spawn, tbc, max_lvl, over, rel_spawn, tbr, do_rel) = if ground {
+            (
+                pu.ground_time_until_activation,
+                pu.ground_activation_spawn,
+                pu.ground_time_between_power_changes,
+                pu.ground_max_power_level,
+                pu.ground_overload_time,
+                pu.ground_release_spawn,
+                pu.ground_time_between_release_spawns,
+                pu.ground_do_release_on_max,
+            )
+        } else {
+            (
+                pu.air_time_until_activation,
+                pu.air_activation_spawn,
+                pu.air_time_between_power_changes,
+                pu.air_max_power_level,
+                pu.air_overload_time,
+                pu.air_release_spawn,
+                pu.air_time_between_release_spawns,
+                pu.air_do_release_on_max,
+            )
+        };
+        if act_spawn == NONE_ID && rel_spawn == NONE_ID {
+            return;
+        }
+        let now = self.game_time;
+        let mut rt = {
+            let p = self.players[slot].as_ref().unwrap();
+            if ground { p.gnd_power.clone() } else { p.air_power.clone() }
+        };
+
+        // Consecutive-hold counter and release-fire early out.
+        rt.hold = if held { rt.hold.saturating_add(1) } else { 0 };
+        if !held && (rt.state == 1 || rt.state == 2) {
+            rt.state = 3;
+            rt.state_start = now;
+            self.release_activation(assets, slot, rt.act_unit);
+        }
+
+        match rt.state {
+            0 => {
+                if rt.hold as i64 >= until_act {
+                    rt.hold = 0;
+                    let pos = self.players[slot].as_ref().unwrap().world_pos(self);
+                    self.request_spawn(SpawnReq {
+                        unit: act_spawn,
+                        pos,
+                        heading: None,
+                        owner: usize::MAX,
+                        spawner_player: slot as i32,
+                        stationary: false,
+                        state: None,
+                    });
+                    rt.act_unit = act_spawn;
+                    rt.state = 1;
+                    rt.state_start = now;
+                    rt.last_change = now;
+                    rt.next_release = now;
+                    rt.level = 0;
+                }
+            }
+            1 => {
+                // Overload: charge stalls after overload_time ticks.
+                if over >= 1 && rt.state_start as i64 + over < now as i64 {
+                    rt.state = 2;
+                    rt.state_start = now;
+                    let def_id = self.players[slot].as_ref().map(|p| p.def_id).unwrap_or(NONE_ID);
+                    if let Some(pd) = assets.players.get(&def_id) {
+                        if pd.powerup_overload_sound.id != NONE_ID {
+                            self.events.push(SimEvent::Sound(pd.powerup_overload_sound.id));
+                        }
+                    }
+                } else if now as i64 > rt.last_change as i64 + tbc {
+                    rt.level += 1;
+                    rt.last_change = now;
+                    let pct = if max_lvl >= 1 {
+                        ((rt.level as f64 / max_lvl as f64) * 100.0).clamp(0.0, 100.0)
+                    } else {
+                        0.0
+                    };
+                    if let Some(p) = self.players[slot].as_mut() {
+                        if ground { p.gpower = pct } else { p.power = pct }
+                    }
+                    if rt.level > max_lvl {
+                        rt.level = max_lvl;
+                        if let Some(p) = self.players[slot].as_mut() {
+                            if ground { p.gpower = 100.0 } else { p.power = 100.0 }
+                        }
+                        if do_rel {
+                            rt.state = 3;
+                            rt.state_start = now;
+                            self.release_activation(assets, slot, rt.act_unit);
+                        }
+                    }
+                }
+            }
+            2 => {}
+            3 => {
+                if rt.level > 0 && now as i64 > rt.next_release as i64 + tbr {
+                    let pos = self.players[slot].as_ref().unwrap().world_pos(self);
+                    self.request_spawn(SpawnReq {
+                        unit: rel_spawn,
+                        pos,
+                        heading: None,
+                        owner: usize::MAX,
+                        spawner_player: slot as i32,
+                        stationary: false,
+                        state: None,
+                    });
+                    rt.next_release = now;
+                    rt.level -= 1;
+                    let pct = if max_lvl >= 1 {
+                        ((rt.level as f64 / max_lvl as f64) * 100.0).clamp(0.0, 100.0)
+                    } else {
+                        0.0
+                    };
+                    if let Some(p) = self.players[slot].as_mut() {
+                        if ground { p.gpower = pct } else { p.power = pct }
+                    }
+                }
+                if rt.level <= 0 {
+                    rt.state = 0;
+                    rt.level = 0;
+                    rt.hold = 0;
+                    rt.act_unit = NONE_ID;
+                    if let Some(p) = self.players[slot].as_mut() {
+                        if ground { p.gpower = 0.0 } else { p.power = 0.0 }
+                    }
+                }
+            }
+            _ => {}
+        }
+
         if let Some(p) = self.players[slot].as_mut() {
-            p.fire_timer = wdef.delay_between_launches.max(1) as u32;
+            if ground {
+                p.gnd_power = rt;
+            } else {
+                p.air_power = rt;
+            }
+        }
+    }
+
+    /// `G_EG_ChangeStateOnWeaponPowerupReleaseByUniqueEntityNum`: the
+    /// activation entity switches to its `use_on_weapon_powerup_release` state.
+    fn release_activation(&mut self, assets: &GameAssets, slot: usize, act_unit: ResId) {
+        if act_unit == NONE_ID {
+            return;
+        }
+        let Some(idx) = self
+            .entities
+            .iter()
+            .position(|e| !e.dead && e.unit == act_unit && e.spawner_player == slot as i32)
+        else {
+            return;
+        };
+        let Some(def) = assets.units.get(&act_unit).cloned() else {
+            return;
+        };
+        if let Some(si) = def
+            .states
+            .iter()
+            .position(|s| s.use_on_weapon_powerup_release)
+        {
+            self.change_state(idx, si, &def);
         }
     }
 
@@ -763,9 +1003,10 @@ impl Sim {
 
         if p.invuln > 0 { p.invuln -= 1; }
         if p.fire_timer > 0 { p.fire_timer -= 1; }
+        if p.gnd_timer > 0 { p.gnd_timer -= 1; }
         // Shields do not passively regenerate in the original — they
-        // recover via "shie" pickups and respawn resets only.
-        p.power = (p.power + 0.02).min(100.0);
+        // recover via "shie" pickups and respawn resets only. The power
+        // meters are driven by the weapon power-up state machine.
 
         // Movement: velocity approaches ±max_speed by delta per tick,
         // decays toward 0 when input released.
@@ -812,14 +1053,24 @@ impl Sim {
             p.vel.y = 0.0;
         }
 
-        // Bomb (ground weapon) — TODO full implementation.
-        if inp.bomb && p.bombs > 0 {
+        // Ground weapon (plasma bomb): hold to keep firing, each shot
+        // consumes one bomb.
+        let fire_gnd = inp.bomb && p.bombs > 0 && p.gnd_timer == 0;
+        let fire_air = inp.fire && p.fire_timer == 0;
+        if fire_gnd {
             p.bombs -= 1;
         }
         // Firing.
-        if inp.fire && p.fire_timer == 0 {
+        if fire_gnd {
+            self.fire_ground_weapon(assets, slot);
+        }
+        if fire_air {
             self.fire_weapon(assets, slot);
         }
+        // Weapon charge/release power-up machines (air = fire held,
+        // ground = bomb held).
+        self.step_powerup(assets, slot, false, inp.fire);
+        self.step_powerup(assets, slot, true, inp.bomb);
     }
 
     fn two_player_active(&self) -> bool {
