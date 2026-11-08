@@ -135,7 +135,7 @@ pub fn sync_entities(
     // Desired set: unique_num -> (sprite rid, frame, screen pos).
     let mut desired: HashMap<u32, (ResId, i64, Vec2, f32)> = HashMap::new();
     for e in &sim.entities {
-        if e.dead {
+        if e.dead || e.activate_in > 0 {
             continue;
         }
         let (rid, frame) = entity_sprite(&*assets, e);

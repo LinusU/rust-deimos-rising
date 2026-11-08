@@ -379,6 +379,23 @@ fn test_defs() {
     for (rid,w) in &a.weapons {
         println!("WEAPON {:08x} {:?}", rid, w);
     }
+    // group-spawn flag census
+    let mut grp=0; let mut nospawn=0; let mut delown=0; let mut onlyact=0;
+    let mut grp_units=Vec::new();
+    for (rid,u) in &a.units {
+        if u.num_in_group_max > 1 || u.num_in_group_min > 1 { grp+=1; grp_units.push((*rid,u.name.clone())); }
+        if u.do_not_spawn_if_type_exists { nospawn+=1; }
+        if u.delete_existing_owned_by_player { delown+=1; }
+        if u.spawn_only_when_players_active { onlyact+=1; }
+    }
+    println!("UNITS total={} groups={} nospawn={} delown={} onlyactive={}", a.units.len(), grp, nospawn, delown, onlyact);
+    let mut nlock=0; let mut nlink=0; let mut norb=0; let mut ncyc=0; let mut nhold=0;
+    for u in a.units.values() { for st in &u.states {
+        if st.lock_to_owner_loc {nlock+=1;} if st.link_to_owner_loc {nlink+=1;} if st.orbit_owner {norb+=1;}
+        if st.cyclic_motion {ncyc+=1;} if st.hold_position_to_target {nhold+=1;}
+    }}
+    println!("STATES lock={} link={} orbit={} cyclic={} hold={}", nlock,nlink,norb,ncyc,nhold);
+    for (r,n) in grp_units.iter().take(20) { println!("  grp {:08x} {}", r, n); }
     // le01 objects sample
     if let Some(l) = a.levels.get(&id("le01")) {
         println!("LEVEL le01 bg={:?} img={:08x} music={:08x} objs={}", l.background, l.background_image, l.music, l.objects.len());

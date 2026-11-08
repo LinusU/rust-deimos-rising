@@ -125,6 +125,24 @@ pub struct Entity {
     /// Non-looping animation reached its last frame (rule condition
     /// "This Entity's Animation Has Stopped" — the original's `m_field_0xb6`).
     pub anim_stopped: bool,
+    /// Ticks until this entity activates (original `m_fielda4`, fed by
+    /// cumulative groupDelay rolls). While >0 it skips all processing.
+    pub activate_in: u32,
+    /// Group id shared by members of one spawn request (original group
+    /// entity); used for group-kill bonus coins.
+    pub group_id: u32,
+    /// Cached owner-relative offset (original m_field11c/m_field120).
+    owner_off: Vec2,
+    /// Owner location at last link update (original m_field124/m_field128).
+    owner_prev: Vec2,
+    /// Orbit angle in degrees (original m_fieldd8).
+    orbit_angle: f32,
+    /// Orbit radius; NaN = "use fixed offset" sentinel (original dat_4e34c0).
+    orbit_radius: f32,
+    /// Cyclic-motion wander offset (original m_prevX/m_prevY → m_field_0x100/0x104).
+    pub cyc_off: Vec2,
+    /// Cyclic-motion per-tick delta (original m_field_0x108/0x10c).
+    cyc_delta: Vec2,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -148,7 +166,8 @@ pub struct SpawnSetRt {
 impl Entity {
     /// Screen-space position for rendering.
     pub fn screen_pos(&self, sim: &Sim) -> Vec2 {
-        Vec2::new(self.pos.x - sim.cam_x, sim.scroll + SCREEN_H - self.pos.y)
+        let p = self.pos + self.cyc_off;
+        Vec2::new(p.x - sim.cam_x, sim.scroll + SCREEN_H - p.y)
     }
 }
 
@@ -261,6 +280,8 @@ pub struct Sim {
     /// Fixed-timestep accumulator (seconds).
     pub acc: f32,
     next_unique: u32,
+    next_group_id: u32,
+    limit_message_shown: bool,
     pub rng: rand::rngs::StdRng,
     spawn_queue: Vec<SpawnReq>,
     /// Deferred one-shot actions (e.g. spawn at pos next tick).
@@ -275,6 +296,8 @@ pub enum SimEvent {
     PlayerEvent(usize, &'static str),
     /// Level finished.
     LevelComplete,
+    /// Entity cap reached (original "Reached Entity Limit" notice).
+    EntityLimit,
 }
 
 /// Internal spawn request.
@@ -314,6 +337,8 @@ impl Sim {
             phase: Phase::Intro,
             acc: 0.0,
             next_unique: 1,
+            next_group_id: 1,
+            limit_message_shown: false,
             rng: rand::rngs::StdRng::seed_from_u64(seed),
             spawn_queue: Vec::new(),
             events: Vec::new(),
@@ -390,7 +415,100 @@ impl Sim {
         self.spawn_queue.push(req);
     }
 
-    fn spawn_entity(&mut self, assets: &GameAssets, req: &SpawnReq) -> Option<usize> {
+    /// `G_EG_RequestSpawn` group path (`sub_41b650` + spawn loop): rolls
+    /// num_in_group count, culls per-member by appearsPercent, then
+    /// spawns each member with cumulative groupDelay activation delay.
+    fn spawn_group(&mut self, assets: &GameAssets, req: &SpawnReq) {
+        let Some(def) = assets.units.get(&req.unit).cloned() else {
+            return;
+        };
+        if def.states.is_empty() {
+            return;
+        }
+        // canBeSpawnedOnlyWhenPlayersActive gate (also blocks while the
+        // level is waiting to end, per G_EG_RequestSpawn).
+        if def.spawn_only_when_players_active
+            && (self.phase != Phase::Playing
+                || !self
+                    .players
+                    .iter()
+                    .flatten()
+                    .any(|p| p.phase == PlayerPhase::Active))
+        {
+            return;
+        }
+        // doNotSpawnIfTypeAlreadyExists gate.
+        if def.do_not_spawn_if_type_exists
+            && self.entities.iter().any(|e| !e.dead && e.unit == req.unit)
+        {
+            return;
+        }
+        // deleteExistingEntitiesOfThisTypeOwnedByPlayer gate.
+        if def.delete_existing_owned_by_player && req.spawner_player >= 0 {
+            for e in self.entities.iter_mut() {
+                if !e.dead && e.unit == req.unit && e.spawner_player == req.spawner_player {
+                    e.dead = true;
+                }
+            }
+        }
+        // Count roll: clamp(min,1)..=max, min>max → max.
+        let mut lo = def.num_in_group_min.max(1);
+        let hi = def.num_in_group_max;
+        if lo > hi {
+            lo = hi;
+        }
+        let mut count = if lo != hi {
+            rand_range(&mut self.rng, lo as f64, hi.max(lo) as f64) as i64
+        } else {
+            lo
+        };
+        // appearsPercent per-member cull.
+        if count > 0 {
+            let mut culled = 0i64;
+            for _ in 0..count {
+                let chance = def.appears_percent;
+                if chance != 100
+                    && (chance == 0 || rand_range(&mut self.rng, 0.0, 100.0) as i64 > chance)
+                {
+                    culled += 1;
+                }
+            }
+            count -= culled;
+        }
+        if count <= 0 {
+            return;
+        }
+        // Original entity cap: active + requested > 1000 → reject once.
+        let active = self
+            .entities
+            .iter()
+            .filter(|e| !e.dead && e.activate_in == 0)
+            .count();
+        if active + count as usize > MAX_ENTITIES {
+            if !self.limit_message_shown {
+                self.limit_message_shown = true;
+                self.events.push(SimEvent::EntityLimit);
+            }
+            return;
+        }
+        let gid = self.next_group_id;
+        self.next_group_id = self.next_group_id.wrapping_add(1).max(1);
+        let mut acc = 0u32;
+        for _ in 0..count {
+            acc = acc.saturating_add(if def.group_delay_min != def.group_delay_max {
+                rand_range(
+                    &mut self.rng,
+                    def.group_delay_min as f64,
+                    def.group_delay_max.max(def.group_delay_min) as f64,
+                ) as u32
+            } else {
+                def.group_delay_min.max(0) as u32
+            });
+            self.spawn_one(assets, req, acc, gid);
+        }
+    }
+
+    fn spawn_one(&mut self, assets: &GameAssets, req: &SpawnReq, activate_in: u32, group_id: u32) -> Option<usize> {
         let def = assets.units.get(&req.unit)?;
         if def.states.is_empty() {
             return None;
@@ -442,6 +560,14 @@ impl Sim {
             destroyed: false,
             tracking: false,
             anim_stopped: false,
+            activate_in,
+            group_id,
+            owner_off: Vec2::ZERO,
+            owner_prev: Vec2::ZERO,
+            orbit_angle: 0.0,
+            orbit_radius: f32::NAN,
+            cyc_off: Vec2::ZERO,
+            cyc_delta: Vec2::ZERO,
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
@@ -449,6 +575,9 @@ impl Sim {
         if def.pickup_type != NONE_ID {
             self.stat_pickups += 1;
         }
+        let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
+        self.cache_owner_link(idx, has_link, state.orbit_owner);
+        self.init_cyclic(idx, state);
         Some(idx)
     }
 
@@ -533,7 +662,7 @@ impl Sim {
         // --- process queued spawns ---
         let queue = std::mem::take(&mut self.spawn_queue);
         for req in &queue {
-            self.spawn_entity(assets, req);
+            self.spawn_group(assets, req);
         }
 
         // --- players ---
@@ -667,6 +796,12 @@ impl Sim {
         self.entity_scroll_pause = false;
         for i in 0..self.entities.len() {
             if self.entities[i].dead {
+                continue;
+            }
+            // m_fielda4: activation delay — decrement, skip while >0.
+            let e = &mut self.entities[i];
+            e.activate_in = e.activate_in.saturating_sub(1);
+            if e.activate_in > 0 {
                 continue;
             }
             let unit_id = self.entities[i].unit;
@@ -864,6 +999,15 @@ impl Sim {
                 }
             }
 
+            // --- cyclic motion (Priv_DoCyclicMotion): bounded random walk
+            // of a display offset, amplitude = stateMaxSpeed ---
+            if state.cyclic_motion {
+                self.step_cyclic(i, &state);
+            }
+
+            // --- owner linkage (lock/link/orbit) ---
+            self.step_owner_link(i, assets);
+
             // --- spawn sets ---
             self.step_spawn_sets(i, &state);
 
@@ -911,6 +1055,132 @@ impl Sim {
         e.frame = st.sprite_frame_min;
         e.anim_stopped = false;
         e.tracking = false;
+        let has_link = st.lock_to_owner_loc || st.link_to_owner_loc || st.orbit_owner;
+        let orbit = st.orbit_owner;
+        self.cache_owner_link(idx, has_link, orbit);
+        self.init_cyclic(idx, st);
+    }
+
+    /// Seed the cyclic-motion walk for states with stateCyclicMotion.
+    /// Amplitude aliases #stateMaxSpeed (rec+0x452 == st+0x452 in the
+    /// original's overlapping struct views).
+    fn init_cyclic(&mut self, idx: usize, st: &UnitState) {
+        let e = &mut self.entities[idx];
+        e.cyc_off = Vec2::ZERO;
+        if st.cyclic_motion {
+            let amp = st.max_speed.abs().max(4.0) as f32;
+            // Drift speed ~ amplitude/8, random direction.
+            let ang = rand_range(&mut self.rng, 0.0, 360.0) as f32;
+            let hr = ang.to_radians();
+            e.cyc_delta = Vec2::new(hr.sin(), hr.cos()) * (amp / 8.0).max(0.5);
+        } else {
+            e.cyc_delta = Vec2::ZERO;
+        }
+    }
+
+    /// `G_EG_CacheOwnerLocOffsetsAndAngles`: snapshot the owner-relative
+    /// offset (and orbit radius/angle for orbit states) on state entry.
+    fn cache_owner_link(&mut self, idx: usize, has_link: bool, orbit: bool) {
+        if !has_link {
+            return;
+        }
+        let self_pos = self.entities[idx].pos;
+        let Some(owner_pos) = self.owner_pos(idx) else { return };
+        let e = &mut self.entities[idx];
+        e.owner_prev = owner_pos;
+        e.owner_off = self_pos - owner_pos;
+        if orbit {
+            // radius = current distance, angle = bearing owner→self.
+            let dist = e.owner_off.length();
+            e.orbit_radius = if dist > 0.001 { dist } else { f32::NAN };
+            e.orbit_angle = if dist > 0.001 {
+                vector_to_heading(e.owner_off)
+            } else {
+                0.0
+            };
+        }
+    }
+
+    /// Resolve the position of an entity's owner: the owner entity by
+    /// unique_num, falling back to the spawning player (original m_fieldca).
+    fn owner_pos(&self, idx: usize) -> Option<Vec2> {
+        let e = &self.entities[idx];
+        if e.owner != u32::MAX {
+            if let Some(o) = self.entities.iter().find(|o| o.unique_num == e.owner && !o.dead) {
+                return Some(o.pos);
+            }
+        }
+        if e.spawner_player >= 0 {
+            if let Some(p) = self.players[e.spawner_player as usize].as_ref() {
+                if p.phase == PlayerPhase::Active {
+                    return Some(p.world_pos(self));
+                }
+            }
+        }
+        None
+    }
+
+    /// `G_Entity::Priv_DoCyclicMotion`: reflected random walk bounded by a
+    /// per-tick random step in [amp/2, amp] + jitter.
+    fn step_cyclic(&mut self, idx: usize, state: &UnitState) {
+        let amp = (state.max_speed.abs() as i64).max(1);
+        let step = rand_range(&mut self.rng, (amp / 2).max(1) as f64, amp as f64)
+            + rand_range(&mut self.rng, 1.0, 100.0) / 100.0;
+        let step = step as f32;
+        let e = &mut self.entities[idx];
+        for axis in 0..2 {
+            let (off, delta) = if axis == 0 {
+                (&mut e.cyc_off.x, &mut e.cyc_delta.x)
+            } else {
+                (&mut e.cyc_off.y, &mut e.cyc_delta.y)
+            };
+            if *off > step {
+                *off = step;
+                *delta = -*delta;
+            }
+            if *off < -step {
+                *off = -step;
+                *delta = -*delta;
+            }
+            *off += *delta;
+        }
+    }
+
+    /// Per-tick owner linkage (G_EG_Process tail): lock → link → orbit.
+    fn step_owner_link(&mut self, idx: usize, assets: &GameAssets) {
+        let (lock, link, orbit) = {
+            let e = &self.entities[idx];
+            let Some(def) = assets.units.get(&e.unit) else { return };
+            let Some(st) = def.states.get(e.state) else { return };
+            (st.lock_to_owner_loc, st.link_to_owner_loc, st.orbit_owner)
+        };
+        if !(lock || link || orbit) {
+            return;
+        }
+        let Some(owner_pos) = self.owner_pos(idx) else { return };
+        let e = &mut self.entities[idx];
+        if lock {
+            e.pos = owner_pos + e.owner_off;
+        }
+        if link {
+            // Rigid translation: move by the owner's delta since last tick.
+            let delta = owner_pos - e.owner_prev;
+            e.pos += delta;
+            e.owner_prev = owner_pos;
+        }
+        if orbit {
+            // angleStep ≈ original (int)m_prevX — smoothed x-velocity.
+            let angle_step = e.vel.x as i32;
+            if !e.orbit_radius.is_nan() && angle_step != 0 {
+                e.orbit_angle = (e.orbit_angle + angle_step as f32).rem_euclid(360.0);
+                let hr = e.orbit_angle.to_radians();
+                e.pos = owner_pos + Vec2::new(hr.sin(), hr.cos()) * e.orbit_radius;
+            } else {
+                e.pos = owner_pos + e.owner_off;
+            }
+            // Recompute the cached offset from the new position.
+            e.owner_off = e.pos - owner_pos;
+        }
     }
 
     fn step_animation(&mut self, idx: usize, state: &UnitState) {
@@ -1078,7 +1348,7 @@ impl Sim {
             return false;
         }
         for e in &self.entities {
-            if e.dead || e.unit != unit_id {
+            if e.dead || e.activate_in > 0 || e.unit != unit_id {
                 continue;
             }
             if tracking_only && !e.tracking {
@@ -1096,7 +1366,7 @@ impl Sim {
         if unit_id == NONE_ID {
             return 0;
         }
-        self.entities.iter().filter(|e| !e.dead && e.unit == unit_id).count()
+        self.entities.iter().filter(|e| !e.dead && e.activate_in == 0 && e.unit == unit_id).count()
     }
 
     /// "Destroyable air/ground entities" map to the unit's
@@ -1288,7 +1558,7 @@ impl Sim {
         };
         let epos = self.entities[idx].pos;
         let my_uid = self.entities[idx].unique_num;
-        let owner_uid = self.entities[idx].owner;
+        let my_gid = self.entities[idx].group_id;
 
         // Children first (destruct_destroy/delete_children).
         if def.destruct_destroy_children || def.destruct_delete_children {
@@ -1344,13 +1614,13 @@ impl Sim {
         self.entities[idx].destroyed = true;
         self.stat_kills += 1;
 
-        // Group-kill bonus coin: when the last sibling under the same
-        // owner goes down, spawn destruct_coin_on_group_kill once.
-        if def.destruct_coin_on_group_kill != NONE_ID && owner_uid != u32::MAX {
+        // Group-kill bonus coin: when the last member of this spawn
+        // group goes down, spawn destruct_coin_on_group_kill once.
+        if def.destruct_coin_on_group_kill != NONE_ID && my_gid != 0 {
             let any_left = self
                 .entities
                 .iter()
-                .any(|e| !e.dead && e.owner == owner_uid);
+                .any(|e| !e.dead && e.group_id == my_gid);
             if !any_left {
                 self.request_spawn(SpawnReq {
                     unit: def.destruct_coin_on_group_kill,
@@ -1454,7 +1724,7 @@ impl Sim {
             .collect();
 
         for (i, e) in self.entities.iter().enumerate() {
-            if e.dead {
+            if e.dead || e.activate_in > 0 {
                 continue;
             }
             let Some(def) = assets.units.get(&e.unit) else { continue };
@@ -1484,7 +1754,7 @@ impl Sim {
         }
 
         for i in 0..self.entities.len() {
-            if self.entities[i].dead {
+            if self.entities[i].dead || self.entities[i].activate_in > 0 {
                 continue;
             }
             let (epos, espawner) = {
@@ -1500,7 +1770,7 @@ impl Sim {
             }
             let pr = entity_radius(pdef);
             for j in 0..self.entities.len() {
-                if i == j || self.entities[j].dead {
+                if i == j || self.entities[j].dead || self.entities[j].activate_in > 0 {
                     continue;
                 }
                 if self.entities[j].spawner_player == espawner {
