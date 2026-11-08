@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+bevy = "0.20.1"
+gif = "0.14.2"
+image = { version = "0.25", default-features = false, features = ["tga"] }
 # bevy = "0.20"
 
 [profile.dev]

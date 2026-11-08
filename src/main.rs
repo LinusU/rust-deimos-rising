@@ -1,3 +1,4 @@
+mod assets;
 mod data;
 mod pak;
 
@@ -145,6 +146,56 @@ fn dump_data() {
     let _ = NONE_ID;
 }
 
+fn test_assets() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    println!(
+        "data: {} units {} weapons {} players {} levels {} strings {} tefos",
+        a.units.len(),
+        a.weapons.len(),
+        a.players.len(),
+        a.levels.len(),
+        a.strings.len(),
+        a.text_formats.len()
+    );
+    println!(
+        "lists: flli={} reli={} coli={} objids={} spriteids={}",
+        a.fill_list.as_ref().map(|f| f.entries.len()).unwrap_or(0),
+        a.rect_list.as_ref().map(|r| r.entries.len()).unwrap_or(0),
+        a.color_list.as_ref().map(|c| c.entries.len()).unwrap_or(0),
+        a.object_ids.entries.len(),
+        a.sprite_ids.entries.len(),
+    );
+
+    // GIF sprite with frames.
+    let sp = a.sprite(id("bgbu")).expect("bgbu sprite");
+    println!(
+        "bgbu: {}x{} frames={} delay0={:?}",
+        sp.width,
+        sp.height,
+        sp.frames.len(),
+        sp.frames.first().map(|f| f.delay)
+    );
+    // TGA background.
+    let img = a.image16(id("cam1")).expect("cam1 tga");
+    println!("cam1: {}x{} rgba={}", img.0, img.1, img.2.len());
+    // Audio.
+    for rid in [id("cohi"), id("bgbu"), id("cash")] {
+        match a.sound(rid) {
+            Some(s) => println!(
+                "soun {:08x}: {:.2}s {}ch {}Hz {} samples",
+                rid,
+                s.duration_secs(),
+                s.channels,
+                s.sample_rate,
+                s.samples.len()
+            ),
+            None => println!("soun {:08x}: decode failed", rid),
+        }
+    }
+}
+
 fn cat(tagname: &str, ridname: &str) {
     let dir = data_dir();
     let mut set = PakSet::open_dir(&dir).expect("open paks");
@@ -172,5 +223,55 @@ fn main() {
         cat(&args[2], &args[3]);
         return;
     }
+    if args.iter().any(|a| a == "--test-assets") {
+        test_assets();
+        return;
+    }
+    if args.iter().any(|a| a == "--test-sprites") {
+        test_sprites();
+        return;
+    }
     println!("Deimos Rising remake — run with --dump-data to verify assets.");
+}
+
+fn test_sprites() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    // Every lowercase im08 rid should have an uppercase alpha partner.
+    let mut rids: Vec<pak::ResId> = a
+        .set
+        .entries_of_tag(Tag::Im08)
+        .iter()
+        .map(|e| e.rid)
+        .collect();
+    rids.sort();
+    rids.dedup();
+    let mut ok = 0;
+    let mut fail = 0;
+    let mut total_frames = 0usize;
+    let mut hist: std::collections::BTreeMap<usize, usize> = Default::default();
+    for rid in rids {
+        // only decode colour (lowercase) plates; skip pure-uppercase alpha ids
+        let b = rid.to_le_bytes();
+        if b.iter().all(|c| c.is_ascii_uppercase()) {
+            continue;
+        }
+        match a.sprite(rid) {
+            Some(s) => {
+                ok += 1;
+                total_frames += s.frames.len();
+                *hist.entry(s.frames.len()).or_default() += 1;
+                if s.frames.is_empty() {
+                    println!("  EMPTY {:08x}", rid);
+                }
+            }
+            None => {
+                fail += 1;
+                println!("  FAIL {:08x}", rid);
+            }
+        }
+    }
+    println!("sprites: {} ok {} fail, {} total frames", ok, fail, total_frames);
+    println!("frame-count histogram: {:?}", hist);
 }
