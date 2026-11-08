@@ -1090,9 +1090,20 @@ impl Sim {
                 if obj.unit_id == NONE_ID {
                     continue;
                 }
+                // Ground-class level objects spawn 32px higher
+                // (sub_41a5b0: typeCode "grnd" → y -= dat_4e34b8 = 32.0f).
+                let mut pos = Vec2::new(obj.x as f32, obj.y as f32);
+                if assets
+                    .units
+                    .get(&obj.unit_id)
+                    .map(|d| d.is_ground_based)
+                    .unwrap_or(false)
+                {
+                    pos.y -= 32.0;
+                }
                 self.request_spawn(SpawnReq {
                     unit: obj.unit_id,
-                    pos: Vec2::new(obj.x as f32, obj.y as f32),
+                    pos,
                     heading: Some(obj.heading_degrees as f32),
                     owner: usize::MAX,
                     spawner_player: -1,
