@@ -432,7 +432,7 @@ fn test_sim() {
                 }
             }
             println!(
-                "t={:>4}s scroll={:7.1} entities={:>4} projs={:>3} hits={} kills={} phase={:?} p=({:5.1},{:5.1}) shields={:5.1} score={} lives={} complete={}",
+                "t={:>4}s scroll={:7.1} ent={:>4} proj={:>3} hit={} kill={} ph={:?} p=({:5.1},{:5.1}) sh={:5.1} score={} money={} mult={} lives={} wpn={:08x} done={}",
                 tick / 60,
                 sim.scroll,
                 sim.entities.len(),
@@ -444,7 +444,10 @@ fn test_sim() {
                 p.screen.y,
                 p.shields,
                 p.score,
+                p.money,
+                p.multiplier,
                 p.lives,
+                p.air_weapon,
                 sim.level_complete,
             );
         }

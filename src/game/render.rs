@@ -368,6 +368,10 @@ pub fn start_level(
 ) -> Option<Sim> {
     let level = assets.levels.get(&level_id)?.clone();
     let mut sim = Sim::new(level, level_id, seed);
+    // 1-based level number for weapon level-availability filtering.
+    let mut level_ids: Vec<ResId> = assets.levels.keys().copied().collect();
+    level_ids.sort();
+    sim.level_number = level_ids.iter().position(|&r| r == level_id).map(|i| i as i64 + 1).unwrap_or(1);
     sim.phase = crate::game::sim::Phase::Playing;
     for slot in 0..players.min(2) {
         sim.add_player(assets, slot, players > 1);

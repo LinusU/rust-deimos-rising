@@ -114,6 +114,11 @@ pub struct Entity {
     pub dead: bool,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
+    /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
+    /// the weapon def this pickup grants, resolved at spawn the way the
+    /// original does (`GetNextRefPtrByType(type, NONE, level)` → first
+    /// available weapon of the class at the current level).
+    pub carried_weapon: ResId,
 }
 
 /// Per-spawn-set runtime state.
@@ -229,6 +234,8 @@ pub struct Sim {
     pub stat_kills: u64,
     /// Global game tick counter.
     pub game_time: u32,
+    /// 1-based level number (weapon level-availability filtering).
+    pub level_number: i64,
     pub players: [Option<Player>; 2],
     pub entities: Vec<Entity>,
     /// Indices into `level.objects` not yet spawned (sorted by world y).
@@ -281,6 +288,7 @@ impl Sim {
             stat_hits: 0,
             stat_kills: 0,
             game_time: 0,
+            level_number: 1,
             players: [None, None],
             entities: Vec::new(),
             pending_objects: pending,
@@ -407,6 +415,7 @@ impl Sim {
             hit_flash: 0,
             dead: false,
             unique_num: self.next_unique,
+            carried_weapon: carried_weapon(assets, def, self.level_number),
         });
         self.next_unique = self.next_unique.wrapping_add(1);
         Some(idx)
@@ -995,22 +1004,37 @@ impl Sim {
         let mut hits: Vec<(usize, f64, i32)> = Vec::new(); // (target idx, dmg, owner)
         let mut shots: Vec<usize> = Vec::new();            // projectile idx that hit
         let mut player_hits: Vec<(usize, f64)> = Vec::new();
+        let mut pickups: Vec<(usize, usize)> = Vec::new();  // (entity idx, player slot)
 
         let ppos: Vec<Vec2> = self.players.iter()
             .map(|p| p.as_ref().map(|p| p.world_pos(self)).unwrap_or(Vec2::splat(-9999.0)))
             .collect();
 
-        for e in &self.entities {
+        for (i, e) in self.entities.iter().enumerate() {
             if e.dead {
                 continue;
             }
             let Some(def) = assets.units.get(&e.unit) else { continue };
-            if def.player_projectile || def.harmless_to_players || def.terrain_effect || def.damage <= 0.0 {
-                continue;
-            }
             let r = entity_radius(def);
             for slot in 0..2 {
-                if ppos[slot].distance(e.pos) < r + 10.0 {
+                if ppos[slot].x < -999.0 {
+                    continue; // no active player in this slot
+                }
+                let dist = ppos[slot].distance(e.pos);
+                if dist >= r + 12.0 {
+                    continue;
+                }
+                // Pickup overlap (original checks pickup_type != none first).
+                if def.pickup_type != NONE_ID {
+                    pickups.push((i, slot));
+                    continue;
+                }
+                // Dangerous entity vs player.
+                if !def.player_projectile
+                    && !def.harmless_to_players
+                    && !def.terrain_effect
+                    && def.damage > 0.0
+                {
                     player_hits.push((slot, def.damage));
                 }
             }
@@ -1061,6 +1085,16 @@ impl Sim {
             };
             let max_hp = assets.units.get(&unit).map(|d| d.shields_max).unwrap_or(1.0);
             self.damage_entity(assets, i, max_hp + 1.0, owner);
+        }
+        // Pickups: apply effect, destroy entity (full Destroy → destruct_spawn).
+        for (i, slot) in pickups {
+            if self.entities[i].dead {
+                continue;
+            }
+            if self.apply_pickup(assets, slot, i) {
+                let owner = slot as i32;
+                self.damage_entity(assets, i, f64::MAX, owner);
+            }
         }
         for (j, dmg, pl) in hits {
             self.damage_entity(assets, j, dmg, pl);
@@ -1124,7 +1158,124 @@ fn vector_to_heading(v: Vec2) -> f32 {
     (90.0 - deg).rem_euclid(360.0)
 }
 
-/// Rough collision radius.
+// ---------------------------------------------------------------------------
+// Weapons / pickups
+// ---------------------------------------------------------------------------
+
+/// `G_WepDef_MasterList_GetNextRefPtrByType`: weapons of `wtype` available
+/// at `level`, in master-list order.
+fn weapon_chain(assets: &GameAssets, wtype: ResId, level: i64) -> Vec<ResId> {
+    assets
+        .weapon_order
+        .iter()
+        .copied()
+        .filter(|&w| {
+            assets.weapons.get(&w).map_or(false, |d| {
+                d.weapon_type == wtype
+                    && level >= d.min_level_available
+                    && level <= d.max_level_available
+            })
+        })
+        .collect()
+}
+
+/// Next weapon after `after` in the type chain (wraps to first, like the
+/// original's `first` fallback). `NONE_ID` → first available.
+fn next_weapon_after(assets: &GameAssets, wtype: ResId, after: ResId, level: i64) -> Option<ResId> {
+    let chain = weapon_chain(assets, wtype, level);
+    if chain.is_empty() {
+        return None;
+    }
+    if after == NONE_ID {
+        return Some(chain[0]);
+    }
+    match chain.iter().position(|&w| w == after) {
+        Some(i) => Some(chain[(i + 1) % chain.len()]),
+        None => Some(chain[0]),
+    }
+}
+
+/// Weapon class carried by a weapon-pickup unit, per `G_Entity` state init:
+/// "air "→PEAA, "grnd"→PEAG, "spec"→PEAG (approximation; spec is rare).
+fn pickup_weapon_type(pickup: ResId) -> Option<ResId> {
+    if pickup == id("air ") {
+        Some(id("PEAA"))
+    } else if pickup == id("grnd") || pickup == id("spec") {
+        Some(id("PEAG"))
+    } else {
+        None
+    }
+}
+
+/// Resolve the weapon a pickup unit carries at spawn.
+fn carried_weapon(assets: &GameAssets, def: &UnitDef, level: i64) -> ResId {
+    match pickup_weapon_type(def.pickup_type) {
+        Some(wt) => next_weapon_after(assets, wt, NONE_ID, level).unwrap_or(NONE_ID),
+        None => NONE_ID,
+    }
+}
+
+impl Sim {
+    /// Apply a pickup effect for player `slot` touching entity `idx`.
+    /// Returns true if the entity should be destroyed.
+    fn apply_pickup(&mut self, assets: &GameAssets, slot: usize, idx: usize) -> bool {
+        let def = match assets.units.get(&self.entities[idx].unit) {
+            Some(d) => d.clone(),
+            None => return true,
+        };
+        let pickup = def.pickup_type;
+        let Some(p) = self.players[slot].as_mut() else { return true };
+        if p.phase != PlayerPhase::Active {
+            return false;
+        }
+        // Weapon pickups can't be grabbed while invulnerable (original
+        // sub_41c1b0 returns false → entity is NOT destroyed).
+        if pickup_weapon_type(pickup).is_some() && p.invuln > 0 {
+            return false;
+        }
+        if pickup == id("air ") {
+            if let Some(w) = next_weapon_after(assets, id("PEAA"), p.air_weapon, self.level_number) {
+                p.air_weapon = w;
+            }
+            self.events.push(SimEvent::PlayerEvent(slot, "weapon_air"));
+        } else if pickup == id("grnd") {
+            if let Some(w) = next_weapon_after(assets, id("PEAG"), p.ground_weapon, self.level_number) {
+                p.ground_weapon = w;
+            }
+            self.events.push(SimEvent::PlayerEvent(slot, "weapon_ground"));
+        } else if pickup == id("coin") {
+            p.money += def.pickup_value;
+            self.events.push(SimEvent::PlayerEvent(slot, "coin"));
+        } else if pickup == id("mult") {
+            // 1→2→3→4→5→10, then stuck (G_Player::Multiplier_Advance).
+            p.multiplier = match p.multiplier {
+                1 => 2,
+                2 => 3,
+                3 => 4,
+                4 => 5,
+                5 => 10,
+                _ => p.multiplier,
+            };
+            self.events.push(SimEvent::PlayerEvent(slot, "multiplier"));
+        } else if pickup == id("exli") {
+            let max_lives = assets
+                .players
+                .get(&p.def_id)
+                .map(|d| d.life_max_num)
+                .unwrap_or(i64::MAX);
+            if p.lives < max_lives {
+                p.lives += 1;
+            }
+            self.events.push(SimEvent::PlayerEvent(slot, "life"));
+        } else if pickup == id("shie") {
+            p.shields = (p.shields + def.pickup_value as f64).min(100.0);
+            self.events.push(SimEvent::PlayerEvent(slot, "shield"));
+        }
+        // "spec" and unknown types: entity is still consumed (result=true).
+        true
+    }
+}
+
 fn entity_radius(def: &UnitDef) -> f32 {
     if def.player_projectile {
         4.0

@@ -51,6 +51,9 @@ pub struct GameAssets {
     // Parsed text resources, cached by (tag, id).
     pub units: HashMap<ResId, crate::data::UnitDef>,
     pub weapons: HashMap<ResId, crate::data::WeaponDef>,
+    /// Weapon IDs in master-list (pak) order — the original iterates the
+    /// weapon master list for type/level-filtered "next weapon" lookups.
+    pub weapon_order: Vec<ResId>,
     pub players: HashMap<ResId, crate::data::PlayerDef>,
     pub levels: HashMap<ResId, crate::data::LevelDef>,
     pub fill_list: Option<crate::data::FillList>,
@@ -72,6 +75,7 @@ impl GameAssets {
             sounds: HashMap::new(),
             units: HashMap::new(),
             weapons: HashMap::new(),
+            weapon_order: Vec::new(),
             players: HashMap::new(),
             levels: HashMap::new(),
             fill_list: None,
@@ -131,6 +135,7 @@ impl GameAssets {
         for (rid, _) in pairs(&self.set, Tag::Wede) {
             if let Some(t) = self.set.read_text(Tag::Wede, rid) {
                 self.weapons.insert(rid, crate::data::WeaponDef::parse(rid, &t));
+                self.weapon_order.push(rid);
             }
         }
         for (rid, _) in pairs(&self.set, Tag::Plde) {
