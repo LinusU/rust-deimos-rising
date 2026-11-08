@@ -186,10 +186,20 @@ pub struct Entity {
     orbit_angle: f32,
     /// Orbit radius; NaN = "use fixed offset" sentinel (original dat_4e34c0).
     orbit_radius: f32,
-    /// Cyclic-motion wander offset (original m_prevX/m_prevY → m_field_0x100/0x104).
-    pub cyc_off: Vec2,
-    /// Cyclic-motion per-tick delta (original m_field_0x108/0x10c).
-    cyc_delta: Vec2,
+    /// Target velocity (original m_field_0x100/0x104): the velocity
+    /// Priv_AdjustToRequiredVelocity eases toward; for cyclic states it
+    /// mirrors the walk value.
+    pub tvel: Vec2,
+    /// Per-tick velocity delta (original m_field_0x108/0x10c): the
+    /// acceleration applied to vel each tick (walk delta when cyclic).
+    vdelta: Vec2,
+    /// Fleeing flag (original m_field_0xc0): set by Priv_Flee on flee-state
+    /// entry or by the no-active-players flee paths; cleared on state
+    /// change into a non-flee state.
+    pub fleeing: bool,
+    /// Stationary spawn flag (original m_field_0x134): zeroes the velocity
+    /// fields in Priv_AdjustToRequiredVelocity.
+    pub stationary: bool,
     /// Priv_Flee target point (original m_field_0x114/0x118), computed once
     /// per flee-state entry.
     pub flee_target: Option<Vec2>,
@@ -249,8 +259,7 @@ impl Entity {
         if let Some(sp) = self.screen_lock {
             return sp;
         }
-        let p = self.pos + self.cyc_off;
-        Vec2::new(p.x - sim.cam_x + WORLD_TO_SCREEN_X, sim.scroll + SCREEN_H - p.y)
+        Vec2::new(self.pos.x - sim.cam_x + WORLD_TO_SCREEN_X, sim.scroll + SCREEN_H - self.pos.y)
     }
 }
 
@@ -903,7 +912,10 @@ impl Sim {
         } else {
             heading_base
         };
-        let hr = heading.to_radians();
+        // Spawn velocity uses the INVERTED heading (sub_01c840 calls
+        // U_Math_InvertAngle before GetVectorFromAngleAndSpeed); the stored
+        // heading (entity+0x130) keeps the uninverted facing.
+        let hr = invert_angle(heading).to_radians();
         let vel = if req.stationary {
             Vec2::ZERO
         } else {
@@ -991,8 +1003,10 @@ impl Sim {
             owner_prev: Vec2::ZERO,
             orbit_angle: 0.0,
             orbit_radius: f32::NAN,
-            cyc_off: Vec2::ZERO,
-            cyc_delta: Vec2::ZERO,
+            tvel: vel,
+            vdelta: Vec2::ZERO,
+            fleeing: state.flee_id != NONE_ID,
+            stationary: req.stationary,
             flee_target,
             vis: 100.0,
             vis_req: 100.0,
@@ -1024,7 +1038,8 @@ impl Sim {
         }
         let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
         self.cache_owner_link(idx, has_link, state.orbit_owner);
-        self.init_cyclic(idx, state);
+        self.state_velocity_init(idx, state, true);
+        self.scatter_cyclic_spawn(assets, idx);
         self.set_visual_targets(idx, state);
         // Initial state entry sound.
         if state.entry_sound.id != NONE_ID {
@@ -2054,135 +2069,105 @@ impl Sim {
                 }
             }
 
-            // --- movement + hunt/on-range AI (DoMovementAI approximation) ---
+            // --- DoMovementAI ---
             let epos0 = self.entities[i].pos;
-            let target = self.nearest_player(epos0);
+            let fleeing = self.entities[i].fleeing;
             let mut pending_change: Option<String> = None;
-            let mut brake = false;
-            let mut flee_to: Option<Vec2> = None;
-            let mut hunt_to: Option<Vec2> = None;
-            // Priv_Flee: the flee destination was computed once on state
-            // entry (m_field_0x114/0x118); the entity steers toward it for
-            // the state's duration. Runs even with no active players —
-            // m_field_0xc0 bypasses target AI.
-            if state.flee_id != NONE_ID {
-                flee_to = self.entities[i].flee_target;
-            }
-            if let Some((tp, td)) = target {
-                let in_range = state.on_range != 0.0 && td < state.on_range as f32;
-                if in_range {
-                    let oc = state.on_range_change_to.trim();
-                    if !oc.is_empty() && !oc.eq_ignore_ascii_case("none") {
-                        pending_change = Some(state.on_range_change_to.clone());
-                    }
-                    if state.hold_position_to_target {
-                        brake = true;
-                        // Priv_HoldToTarget: bounded display-offset drift
-                        // away from the target (m_prevX/Y += ±marginB,
-                        // clamped ±marginA where marginA ≈ stateMaxSpeed).
-                        let e = &mut self.entities[i];
-                        let amp = (state.max_speed.abs() as i64).max(4);
-                        let step = ((state.delta.abs() as i64).max(1)).min(amp) as f32;
-                        let away = epos0 - tp;
-                        e.cyc_off.x = (e.cyc_off.x + away.x.signum() * step)
-                            .clamp(-(amp as f32), amp as f32);
-                        e.cyc_off.y = (e.cyc_off.y + away.y.signum() * step)
-                            .clamp(-(amp as f32), amp as f32);
-                    }
-                }
-                if state.flee_id == NONE_ID {
-                    if state.hunts && !brake {
-                        hunt_to = Some(tp);
-                    }
+
+            if fleeing {
+                // m_field_0xc0: MoveToTargetLoc toward the flee destination
+                // (Priv_RotateToTargetLoc runs via the rot_dir sweep).
+                if let Some(t) = self.entities[i].flee_target {
+                    self.move_to_target_loc(i, &state, t);
                 }
             } else {
-                // No active players: unit-level flee flags pick a heading.
-                let udef = assets.units.get(&self.entities[i].unit);
-                if let Some(d) = udef {
-                    if d.flees_north_on_no_players {
-                        hunt_to = Some(epos0 + Vec2::new(0.0, 4096.0));
-                    } else if d.flees_south_on_no_players {
-                        hunt_to = Some(epos0 + Vec2::new(0.0, -4096.0));
+                let target = self.nearest_player(epos0);
+                let mut fled = false;
+                if target.is_none() {
+                    if state.delete_on_no_active_players {
+                        self.entities[i].dead = true;
+                        continue;
+                    }
+                    if state.destruct_on_no_active_players {
+                        let sp = self.entities[i].spawner_player;
+                        self.destroy_entity(assets, i, sp);
+                        continue;
+                    }
+                    // No active players: unit flee flags trigger Priv_Flee
+                    // with the north/south flee ids, then skip motion AI.
+                    if let Some(d) = assets.units.get(&self.entities[i].unit) {
+                        let fid = if d.flees_north_on_no_players {
+                            Some(id("nora"))
+                        } else if d.flees_south_on_no_players {
+                            Some(id("sora"))
+                        } else {
+                            None
+                        };
+                        if let Some(fid) = fid {
+                            self.begin_flee(i, assets, fid);
+                            fled = true;
+                        }
+                    }
+                }
+                if !fled {
+                    // Cyclic walk + game-area constrain run before the
+                    // target-move decision (original DoMovementAI order).
+                    if state.cyclic_motion {
+                        self.step_cyclic(i, &state);
+                    }
+                    let constrain = assets
+                        .units
+                        .get(&self.entities[i].unit)
+                        .map(|d| d.constrain_in_game_area)
+                        .unwrap_or(false);
+                    if constrain {
+                        self.constrain_in_game_area(i, assets);
+                    }
+                    let mut hold = false;
+                    let mut reverse: Option<(Vec2, f32)> = None;
+                    let mut target_pos: Option<Vec2> = None;
+                    if let Some((tp, td)) = target {
+                        target_pos = Some(tp);
+                        let in_range = state.on_range != 0.0 && td < state.on_range as f32;
+                        if in_range {
+                            let oc = state.on_range_change_to.trim();
+                            if !oc.is_empty() && !oc.eq_ignore_ascii_case("none") {
+                                pending_change = Some(state.on_range_change_to.clone());
+                            }
+                            hold = state.hold_position_to_target;
+                            if state.reverse_direction_on_reaction {
+                                reverse = Some((tp, td));
+                            }
+                        }
+                    }
+                    if let Some(name) = pending_change {
+                        self.apply_state_change(i, &name, assets);
+                        continue;
+                    }
+                    if let Some(tp) = target_pos {
+                        if let Some((rtp, rtd)) = reverse {
+                            self.reverse_from_target(i, &state, rtp, rtd);
+                        }
+                        if hold {
+                            self.hold_to_target(i, &state, tp);
+                        } else if state.hunts {
+                            self.move_to_target_loc(i, &state, tp);
+                        } else {
+                            self.adjust_to_required_velocity(i, &state);
+                        }
+                    } else {
+                        self.adjust_to_required_velocity(i, &state);
                     }
                 }
             }
-            if let Some(name) = pending_change {
-                self.apply_state_change(i, &name, assets);
-                continue;
-            }
+            // Position integration (G_GameObject::MoveAndCheckPosition):
+            // m_x += m_prevX; m_y += m_prevY.
             {
                 let e = &mut self.entities[i];
-                let target_speed = state.max_speed as f32;
-                let cur_speed = e.vel.length();
-                if brake {
-                    e.vel *= 0.85;
-                } else if let Some(tp) = flee_to.or(hunt_to) {
-                    // Steer toward the flee point or hunt target.
-                    let dir = (tp - epos0).normalize_or_zero();
-                    if dir.length_squared() > 0.0001 {
-                        let fleeing = flee_to.is_some();
-                        let speed = if fleeing {
-                            state.flee_speed.max(state.max_speed) as f32
-                        } else {
-                            target_speed
-                        };
-                        let delta = if fleeing {
-                            state.flee_delta.max(state.delta) as f32
-                        } else {
-                            state.delta as f32
-                        };
-                        let new_speed = (cur_speed + delta).min(speed.max(1.0));
-                        e.vel = dir * new_speed;
-                        e.heading = vector_to_heading(e.vel);
-                    }
-                } else if target_speed > 0.0 && cur_speed > 0.001 {
-                    let delta = state.delta as f32;
-                    let new_speed = (cur_speed + delta).min(target_speed);
-                    e.vel = e.vel.normalize() * new_speed;
-                }
                 e.pos += e.vel;
                 if e.vel.length_squared() > 0.0001 {
                     e.heading = vector_to_heading(e.vel);
                 }
-            }
-
-            // --- constrainInGameArea: bounce-clamp to the visible area ---
-            {
-                let defc = assets.units.get(&self.entities[i].unit);
-                if defc.map(|d| d.constrain_in_game_area).unwrap_or(false) {
-                    // World-space clamp: x∈[0,480] (bg width), y within the
-                    // visible scroll band — with velocity bounce.
-                    let w = self.level_width();
-                    let h = pf(assets, pf::VISIBLE_GAME_HEIGHT) as f32;
-                    let e = &mut self.entities[i];
-                    let r = entity_radius(defc.unwrap()) * 0.5;
-                    if e.pos.x < r {
-                        e.pos.x = r;
-                        e.vel.x = -e.vel.x;
-                        e.heading = vector_to_heading(e.vel);
-                    } else if e.pos.x > w - r {
-                        e.pos.x = w - r;
-                        e.vel.x = -e.vel.x;
-                        e.heading = vector_to_heading(e.vel);
-                    }
-                    let min_y = self.scroll;
-                    let max_y = self.scroll + h;
-                    if e.pos.y < min_y {
-                        e.pos.y = min_y;
-                        e.vel.y = -e.vel.y;
-                        e.heading = vector_to_heading(e.vel);
-                    } else if e.pos.y > max_y {
-                        e.pos.y = max_y;
-                        e.vel.y = -e.vel.y;
-                        e.heading = vector_to_heading(e.vel);
-                    }
-                }
-            }
-
-            // --- cyclic motion (Priv_DoCyclicMotion): bounded random walk
-            // of a display offset, amplitude = stateMaxSpeed ---
-            if state.cyclic_motion {
-                self.step_cyclic(i, &state);
             }
 
             // --- visibility/tint/scale fades (AdjustVisibilityAndTinting) ---
@@ -2342,6 +2327,9 @@ impl Sim {
         let e = &mut self.entities[idx];
         e.state = ns;
         let state_idx = e.state;
+        // Priv_Flee on state entry: flee_id != "none" sets m_field_0xc0 and
+        // computes the destination; any other state clears the flag.
+        e.fleeing = def.states[ns].flee_id != NONE_ID;
         e.flee_target = flee_target;
         e.state_time = 0;
         e.dir_index = -1;
@@ -2364,7 +2352,7 @@ impl Sim {
         let has_link = st.lock_to_owner_loc || st.link_to_owner_loc || st.orbit_owner;
         let orbit = st.orbit_owner;
         self.cache_owner_link(idx, has_link, orbit);
-        self.init_cyclic(idx, st);
+        self.state_velocity_init(idx, st, false);
         self.set_visual_targets(idx, st);
         // stateEntrySound plays on every state entry; the per-state-index
         // flag (entity +0x144 array) records it has played once.
@@ -2567,26 +2555,77 @@ impl Sim {
         }
     }
 
-    /// Seed the cyclic-motion walk for states with stateCyclicMotion.
-    /// Amplitude aliases #stateMaxSpeed (rec+0x452 == st+0x452 in the
-    /// original's overlapping struct views).
-    fn init_cyclic(&mut self, idx: usize, st: &UnitState) {
+    /// `G_Entity::ChangeState` velocity block: on state entry the entity's
+    /// velocity is retargeted — `vdelta` (0x108/0x10c) becomes the per-tick
+    /// step toward a speed `mag` one `delta`-sized move closer to
+    /// `max_speed`, and `tvel` (0x100/0x104) the full target velocity along
+    /// the (inverted) heading. `stateLockToOwnerLoc` (0x32a) zeroes all
+    /// velocity fields. `spawn_like` selects the inFlag1 path (spawn
+    /// heading at entity+0x130); later changes derive the angle from the
+    /// current velocity.
+    fn state_velocity_init(&mut self, idx: usize, st: &UnitState, spawn_like: bool) {
         let e = &mut self.entities[idx];
-        e.cyc_off = Vec2::ZERO;
-        if st.cyclic_motion {
-            // The original has no init roll here — the walk delta starts
-            // from the entity's velocity direction.
-            let amp = st.max_speed.abs().max(4.0) as f32;
-            let v = e.vel;
-            let m = (amp / 8.0).max(0.5);
-            e.cyc_delta = if v.length_squared() > 0.0001 {
-                v.normalize() * m
-            } else {
-                Vec2::new(m, 0.0)
-            };
-        } else {
-            e.cyc_delta = Vec2::ZERO;
+        if st.lock_to_owner_loc {
+            e.vel = Vec2::ZERO;
+            e.tvel = Vec2::ZERO;
+            e.vdelta = Vec2::ZERO;
+            return;
         }
+        let speed = e.vel.length();
+        let heading = if spawn_like || e.vel.length_squared() <= 0.0001 {
+            e.heading
+        } else {
+            vector_to_heading(e.vel)
+        };
+        let angle = invert_angle(heading);
+        let threshold = st.max_speed as f32;
+        let margin = st.delta as f32;
+        let diff = (threshold - speed).abs();
+        let step = margin.min(diff);
+        let mag = if threshold > speed { speed + step } else { speed - step };
+        let tmp = vec_from_angle_speed(angle, mag);
+        e.vdelta = tmp - e.vel;
+        e.tvel = vec_from_angle_speed(angle, threshold);
+    }
+
+    /// `sub_01cbc0`: entities spawned into a cyclic-motion state get a
+    /// randomized initial velocity — scale 1.0 or 1.4, direction components
+    /// `RandomInt(1,4) + RandomInt(1,100)/100` sharing one fraction roll,
+    /// independent sign flips (the y-flip roll only happens when
+    /// `pf(0x37)/4 < locY`). Normalized dir * scale becomes the velocity;
+    /// the cyclic walk delta is dir * 0.2 (dat_4e34d0).
+    fn scatter_cyclic_spawn(&mut self, assets: &GameAssets, idx: usize) {
+        let loc_y = {
+            let e = &self.entities[idx];
+            let is_cyclic = assets
+                .units
+                .get(&e.unit)
+                .and_then(|d| d.states.get(e.state))
+                .map(|st| st.cyclic_motion)
+                .unwrap_or(false);
+            if !is_cyclic {
+                return;
+            }
+            e.pos.y
+        };
+        let scale = if rand_int(&mut self.rng, 0, 1) != 0 { 1.0f32 } else { 1.4 };
+        let div = rand_int(&mut self.rng, 1, 100) as f32 / 100.0;
+        let mut dx = rand_int(&mut self.rng, 1, 4) as f32 + div;
+        if rand_int(&mut self.rng, 0, 1) != 0 {
+            dx = -dx;
+        }
+        let mut dy = rand_int(&mut self.rng, 1, 4) as f32 + div;
+        if (((pf(assets, 0x37) as i64) / 4) as f32) < loc_y
+            && rand_int(&mut self.rng, 0, 1) != 0
+        {
+            dy = -dy;
+        }
+        let len = (dx * dx + dy * dy).sqrt();
+        let (ux, uy) = (dx / len, dy / len);
+        let e = &mut self.entities[idx];
+        e.vel = Vec2::new(ux * scale, uy * scale);
+        e.tvel = e.vel;
+        e.vdelta = Vec2::new(ux * 0.2, uy * 0.2);
     }
 
     /// `G_EG_CacheOwnerLocOffsetsAndAngles`: snapshot the owner-relative
@@ -2631,30 +2670,171 @@ impl Sim {
         None
     }
 
-    /// `G_Entity::Priv_DoCyclicMotion`: per-tick step is
-    /// `RandomInt(amp/2, amp) + RandomInt(1, 100) / 100`; the offset clamps
-    /// to ±step and its delta flips sign (reflected random walk).
+    /// `G_Entity::Priv_DoCyclicMotion`: the velocity itself random-walks —
+    /// per-tick step is `RandomInt(amp/2, amp) + RandomInt(1, 100) / 100`
+    /// with amp = stateMaxSpeed; vel clamps to ±step flipping the walk
+    /// delta sign, then vel += delta and tvel mirrors vel.
     fn step_cyclic(&mut self, idx: usize, state: &UnitState) {
         let amp = (state.max_speed as i64).abs().max(2);
         let step = rand_int(&mut self.rng, amp / 2, amp) as f32
             + rand_int(&mut self.rng, 1, 100) as f32 / 100.0;
         let e = &mut self.entities[idx];
-        for axis in 0..2 {
-            let (off, delta) = if axis == 0 {
-                (&mut e.cyc_off.x, &mut e.cyc_delta.x)
-            } else {
-                (&mut e.cyc_off.y, &mut e.cyc_delta.y)
-            };
-            if *off > step {
-                *off = step;
-                *delta = -*delta;
-            }
-            if *off < -step {
-                *off = -step;
-                *delta = -*delta;
-            }
-            *off += *delta;
+        if e.vel.x > step {
+            e.vel.x = step;
+            e.vdelta.x = -e.vdelta.x;
         }
+        if e.vel.x < -step {
+            e.vel.x = -step;
+            e.vdelta.x = -e.vdelta.x;
+        }
+        if e.vel.y > step {
+            e.vel.y = step;
+            e.vdelta.y = -e.vdelta.y;
+        }
+        if e.vel.y < -step {
+            e.vel.y = -step;
+            e.vdelta.y = -e.vdelta.y;
+        }
+        e.vel.x += e.vdelta.x;
+        e.vel.y += e.vdelta.y;
+        e.tvel = e.vel;
+    }
+
+    /// `G_Entity::Priv_MoveToTargetLoc`: accelerate vel toward `target_pt`
+    /// per-axis — vdelta = ±margin by position sign, vel += vdelta clamped
+    /// to ±target per axis. Fleeing entities use fleeSpeed/fleeDelta;
+    /// others maxSpeed/delta.
+    fn move_to_target_loc(&mut self, idx: usize, state: &UnitState, target_pt: Vec2) {
+        let fleeing = self.entities[idx].fleeing;
+        let (tmax, margin) = if fleeing {
+            (state.flee_speed as f32, state.flee_delta as f32)
+        } else {
+            (state.max_speed as f32, state.delta as f32)
+        };
+        let e = &mut self.entities[idx];
+        e.vdelta.x = if e.pos.x < target_pt.x { margin } else { -margin };
+        e.vdelta.y = if e.pos.y < target_pt.y { margin } else { -margin };
+        e.vel.x += e.vdelta.x;
+        e.vel.x = e.vel.x.clamp(-tmax, tmax);
+        e.vel.y += e.vdelta.y;
+        e.vel.y = e.vel.y.clamp(-tmax, tmax);
+    }
+
+    /// `G_Entity::Priv_AdjustToRequiredVelocity`: ease vel toward tvel by
+    /// vdelta per axis without overshoot. Stationary entities and
+    /// orbit-owner states get the original's degenerate paths.
+    fn adjust_to_required_velocity(&mut self, idx: usize, state: &UnitState) {
+        let e = &mut self.entities[idx];
+        if e.stationary {
+            e.vel = Vec2::ZERO;
+            e.tvel = Vec2::ZERO;
+            e.vdelta = Vec2::ZERO;
+            return;
+        }
+        if state.orbit_owner {
+            // Scalar path (stateOrbitOwner, 0x32c): ease vel.x toward
+            // maxSpeed at delta rate.
+            let target = state.max_speed as f32;
+            let margin = state.delta as f32;
+            if e.vel.x < target {
+                e.vel.x = (e.vel.x + margin).min(target);
+            } else if e.vel.x > target {
+                e.vel.x = (e.vel.x - margin).max(target);
+            }
+            return;
+        }
+        if e.vel.x < e.tvel.x {
+            e.vel.x += e.vdelta.x;
+            if e.vel.x > e.tvel.x {
+                e.vel.x = e.tvel.x;
+            }
+        } else if e.vel.x > e.tvel.x {
+            e.vel.x += e.vdelta.x;
+            if e.vel.x < e.tvel.x {
+                e.vel.x = e.tvel.x;
+            }
+        }
+        if e.vel.y < e.tvel.y {
+            e.vel.y += e.vdelta.y;
+            if e.vel.y > e.tvel.y {
+                e.vel.y = e.tvel.y;
+            }
+        } else if e.vel.y > e.tvel.y {
+            e.vel.y += e.vdelta.y;
+            if e.vel.y < e.tvel.y {
+                e.vel.y = e.tvel.y;
+            }
+        }
+    }
+
+    /// `G_Entity::Priv_HoldToTarget`: drift AWAY from the target point —
+    /// vdelta = ∓holdDelta per axis, vel += vdelta clamped ±holdMaxSpeed.
+    fn hold_to_target(&mut self, idx: usize, state: &UnitState, target_pt: Vec2) {
+        let cap = state.hold_max_speed as f32;
+        let margin = state.hold_delta as f32;
+        let e = &mut self.entities[idx];
+        e.vdelta.x = if e.pos.x < target_pt.x { -margin } else { margin };
+        e.vdelta.y = if e.pos.y < target_pt.y { -margin } else { margin };
+        e.vel.x = (e.vel.x + e.vdelta.x).clamp(-cap, cap);
+        e.vel.y = (e.vel.y + e.vdelta.y).clamp(-cap, cap);
+    }
+
+    /// `G_Entity::Priv_ReverseFromTarget`: retarget tvel to maxSpeed along
+    /// the direction AWAY from the target (used with
+    /// stateReverseDirectionOnReaction).
+    fn reverse_from_target(&mut self, idx: usize, state: &UnitState, target_pt: Vec2, dist: f32) {
+        let e = &mut self.entities[idx];
+        if dist > 0.001 {
+            let dx = (target_pt.x - e.pos.x) / dist;
+            let dy = (target_pt.y - e.pos.y) / dist;
+            let scale = state.max_speed as f32;
+            e.tvel = Vec2::new(-dx * scale, -dy * scale);
+        }
+    }
+
+    /// `G_Entity::Priv_ConstrainInGameArea`: bounce-clamp position to the
+    /// playfield, flipping vel, vdelta and tvel on each bounce. The
+    /// original bounds are screen-space (x ∈ [-32, pf36+32],
+    /// y ∈ [0, pf37]); expressed in world coords that is the visible band.
+    fn constrain_in_game_area(&mut self, idx: usize, assets: &GameAssets) {
+        let w = self.level_width();
+        let h = pf(assets, pf::VISIBLE_GAME_HEIGHT) as f32;
+        let e = &mut self.entities[idx];
+        let r = entity_radius(assets.units.get(&e.unit).unwrap()) * 0.5;
+        if e.pos.x < r {
+            e.pos.x = r;
+            e.vel.x = -e.vel.x;
+            e.vdelta.x = -e.vdelta.x;
+            e.tvel.x = -e.tvel.x;
+        } else if e.pos.x > w - r {
+            e.pos.x = w - r;
+            e.vel.x = -e.vel.x;
+            e.vdelta.x = -e.vdelta.x;
+            e.tvel.x = -e.tvel.x;
+        }
+        let min_y = self.scroll;
+        let max_y = self.scroll + h;
+        if e.pos.y < min_y {
+            e.pos.y = min_y;
+            e.vel.y = -e.vel.y;
+            e.vdelta.y = -e.vdelta.y;
+            e.tvel.y = -e.tvel.y;
+        } else if e.pos.y > max_y {
+            e.pos.y = max_y;
+            e.vel.y = -e.vel.y;
+            e.vdelta.y = -e.vdelta.y;
+            e.tvel.y = -e.tvel.y;
+        }
+    }
+
+    /// Begin a dynamic flee (no-active-players paths): sets m_field_0xc0
+    /// and computes the destination through the flee-id arm table.
+    fn begin_flee(&mut self, idx: usize, assets: &GameAssets, flee_id: ResId) {
+        let pos = self.entities[idx].pos;
+        let target = self.compute_flee_target(assets, flee_id, pos);
+        let e = &mut self.entities[idx];
+        e.fleeing = true;
+        e.flee_target = target;
     }
 
     /// Per-tick owner linkage (G_EG_Process tail): lock → link → orbit.
@@ -3689,6 +3869,23 @@ fn vector_to_heading(v: Vec2) -> f32 {
     }
     let deg = v.y.atan2(v.x).to_degrees();
     (90.0 - deg).rem_euclid(360.0)
+}
+
+/// `U_Math_GetVectorFromAngleAndSpeed`: heading degrees → velocity vector
+/// (x = sin, y = cos, matching the original's convention).
+fn vec_from_angle_speed(angle: f32, speed: f32) -> Vec2 {
+    let r = angle.to_radians();
+    Vec2::new(r.sin() * speed, r.cos() * speed)
+}
+
+/// `U_Math_InvertAngle`: reflect the heading (the original's spawn-heading
+/// → velocity-angle transform).
+fn invert_angle(a: f32) -> f32 {
+    if a <= 180.0 {
+        (a - 180.0).abs()
+    } else {
+        540.0 - a
+    }
 }
 
 // ---------------------------------------------------------------------------
