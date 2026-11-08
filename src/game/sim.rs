@@ -430,6 +430,13 @@ pub struct Sim {
     /// max_y] left by destroyed `destructCreateObstacle` units. Fixed in
     /// world space = scroll-locked like the original's screen rects.
     pub debris: Vec<[f32; 4]>,
+    /// Ground-accuracy counters (G_Game_GroundAccuracy_*): units flagged
+    /// `includeInGroundAccuracyCount` spawned / destroyed this level.
+    pub accuracy_targets: u32,
+    pub accuracy_destroyed: u32,
+    /// Latched when destroyed catches up to targets; consumed by the
+    /// RandomBonus_6 (rb06) substitution in the bonus roll.
+    pub accuracy_reward_pending: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -511,6 +518,9 @@ impl Sim {
             spawn_queue: Vec::new(),
             events: Vec::new(),
             debris: Vec::new(),
+            accuracy_targets: 0,
+            accuracy_destroyed: 0,
+            accuracy_reward_pending: false,
         }
     }
 
@@ -776,6 +786,10 @@ impl Sim {
         self.next_unique = self.next_unique.wrapping_add(1);
         if def.pickup_type != NONE_ID {
             self.stat_pickups += 1;
+        }
+        // G_Game_GroundAccuracy_AddTarget on entity creation.
+        if def.include_in_ground_accuracy {
+            self.accuracy_targets += 1;
         }
         let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
         self.cache_owner_link(idx, has_link, state.orbit_owner);
@@ -2662,6 +2676,18 @@ impl Sim {
             }
         }
 
+        // G_Game_GroundAccuracy_AddDestroyed + reward latch: once every
+        // spawned accuracy target is dead, the next bonus roll in the
+        // pf(0xd1) bucket can drop RandomBonus_6 instead of RandomBonus_1.
+        if def.include_in_ground_accuracy {
+            self.accuracy_destroyed += 1;
+            if self.accuracy_targets > 0
+                && self.accuracy_destroyed >= self.accuracy_targets
+            {
+                self.accuracy_reward_pending = true;
+            }
+        }
+
         // Random bonus drop (G_Entity::Destroy tail): weighted roll over
         // perm floats 0xd1..0xd9/0xda/0xdb → object_ids[0x19..0x22].
         if def.destruct_release_random_bonus {
@@ -2683,7 +2709,15 @@ impl Sim {
     fn roll_random_bonus(&mut self, assets: &GameAssets) -> Option<ResId> {
         let roll = rand_range(&mut self.rng, 0.0, 100.0) as i64;
         let slot = if roll < pf(assets, 0xd1) as i64 {
-            0x19
+            // CheckForRewardThisLevel: at 100% ground accuracy a
+            // pf(0xda)-weighted sub-roll swaps RandomBonus_1 for
+            // RandomBonus_6 and consumes the reward (SetRewardDone).
+            if self.accuracy_reward_pending && roll < pf(assets, 0xda) as i64 {
+                self.accuracy_reward_pending = false;
+                0x1e
+            } else {
+                0x19
+            }
         } else if roll < pf(assets, 0xd2) as i64 {
             0x1a
         } else if roll < pf(assets, 0xd3) as i64 {
