@@ -251,8 +251,13 @@ fn main() {
         pickups_probe();
         return;
     }
-    if args.iter().any(|a| a == "--players") {
+    if args.iter().any(|a| a == "--playerdefs") {
         player_probe();
+        return;
+    }
+    if args.iter().any(|a| a == "--states") {
+        let v: u32 = std::env::args().nth(2).unwrap().parse().unwrap();
+        state_probe(v);
         return;
     }
     if args.iter().any(|a| a == "--flags") {
@@ -852,4 +857,20 @@ fn dump_rules() {
         if u.pickup_type != pak::NONE_ID { pickups += 1; }
     }
     println!("=== units: coins={} bonus={} groupcoin={} pickups={}", coins, bonus, groupcoin, pickups);
+}
+
+fn state_probe(ridv: u32) {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    if let Some(u) = a.units.get(&ridv) {
+        for (i, st) in u.states.iter().enumerate() {
+            println!(
+                "state[{}] '{}' spr={:08x} timer={}..{} -> '{}' onrange={}.. changeto='{}' entrysnd={:08x}",
+                i, st.name, st.sprite_face, st.on_timer_min, st.on_timer_max,
+                st.on_timer_change_to, st.on_range, st.on_range_change_to,
+                st.entry_sound.id
+            );
+        }
+    }
 }
