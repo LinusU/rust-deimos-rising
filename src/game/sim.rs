@@ -12,7 +12,7 @@
 //!   Velocity: `vx = sin(a)*speed`, `vy = cos(a)*speed` (world space, +y north).
 
 use crate::assets::GameAssets;
-use crate::data::{LevelDef, PlayerDef, UnitDef, UnitState};
+use crate::data::{LevelDef, PlayerDef, StateRule, UnitDef, UnitState};
 use crate::pak::{id, ResId, NONE_ID};
 use glam::Vec2;
 use rand::Rng;
@@ -98,20 +98,29 @@ pub struct Entity {
     pub dir_index: i64,
     /// Remaining shield hit points.
     pub shields: f64,
-    /// Owning entity index (spawn sets / linkage), usize::MAX = none.
-    pub owner: usize,
+    /// Owning entity's `unique_num` (spawn sets / linkage), u32::MAX = none.
+    /// Stored as a serial rather than an index because `entities` is
+    /// compacted by `retain` every tick.
+    pub owner: u32,
     /// Which player slot spawned this (for kill credit / friendly checks), -1 = none.
     pub spawner_player: i32,
     /// Per-spawn-set runtime timers for the current state.
     pub spawn_timers: Vec<SpawnSetRt>,
-    /// Rule cooldowns for the current state.
-    pub rule_timers: Vec<u32>,
     /// Ticks remaining before this entity may be hit again.
     pub hit_cooldown: u32,
     /// Ticks of post-hit glow remaining.
     pub hit_flash: u32,
     /// Marks entities to be removed.
     pub dead: bool,
+    /// Removed via the Destroy (destruct) path rather than Delete —
+    /// distinguishes the two for owner-deletion propagation.
+    pub destroyed: bool,
+    /// Entity is homing/rotating toward a player target (rule condition
+    /// "Is Tracking Player" — the original's `m_field_0xb5`).
+    pub tracking: bool,
+    /// Non-looping animation reached its last frame (rule condition
+    /// "This Entity's Animation Has Stopped" — the original's `m_field_0xb6`).
+    pub anim_stopped: bool,
     /// Unique serial for weapon-powerup release targeting.
     pub unique_num: u32,
     /// For weapon-class pickup units (pickup_type "air "/"grnd"/"spec"):
@@ -225,6 +234,8 @@ pub struct Sim {
     pub cam_x: f32,
     /// Vertical scroll paused.
     pub scroll_paused: bool,
+    /// Set each tick when any live entity's state requests a scroll pause.
+    entity_scroll_pause: bool,
     /// Pixels per tick the world scrolls.
     pub scroll_speed: f32,
     /// Level finished scrolling.
@@ -232,6 +243,8 @@ pub struct Sim {
     /// Debug counters (hits landed / entities destroyed).
     pub stat_hits: u64,
     pub stat_kills: u64,
+    /// Pickup-type entities spawned (diagnostic).
+    pub stat_pickups: u64,
     /// Global game tick counter.
     pub game_time: u32,
     /// 1-based level number (weapon level-availability filtering).
@@ -283,10 +296,12 @@ impl Sim {
             scroll: 0.0,
             cam_x: 0.0,
             scroll_paused: false,
+            entity_scroll_pause: false,
             scroll_speed: 1.0,
             level_complete: false,
             stat_hits: 0,
             stat_kills: 0,
+            stat_pickups: 0,
             game_time: 0,
             level_number: 1,
             players: [None, None],
@@ -394,6 +409,12 @@ impl Sim {
             rand_range(&mut self.rng, state.on_timer_min as f64, state.on_timer_max.max(state.on_timer_min) as f64) as u32
         } else { 0 };
         let idx = self.entities.len();
+        // req.owner is an entity index; store the stable unique_num.
+        let owner_uid = if req.owner != usize::MAX && req.owner < self.entities.len() {
+            self.entities[req.owner].unique_num
+        } else {
+            u32::MAX
+        };
         self.entities.push(Entity {
             unit: req.unit,
             pos: req.pos,
@@ -407,17 +428,22 @@ impl Sim {
             frame_timer: 0,
             dir_index: -1,
             shields,
-            owner: req.owner,
+            owner: owner_uid,
             spawner_player: req.spawner_player,
             spawn_timers: vec![SpawnSetRt::default(); state.spawn_sets.len()],
-            rule_timers: vec![0; state.rules.len()],
             hit_cooldown: 0,
             hit_flash: 0,
             dead: false,
+            destroyed: false,
+            tracking: false,
+            anim_stopped: false,
             unique_num: self.next_unique,
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
         self.next_unique = self.next_unique.wrapping_add(1);
+        if def.pickup_type != NONE_ID {
+            self.stat_pickups += 1;
+        }
         Some(idx)
     }
 
@@ -463,7 +489,7 @@ impl Sim {
         self.game_time += 1;
 
         // --- scrolling ---
-        if !self.scroll_paused && self.phase == Phase::Playing {
+        if !self.scroll_paused && !self.entity_scroll_pause && self.phase == Phase::Playing {
             self.scroll += self.scroll_speed;
             if self.scroll >= self.max_scroll() {
                 self.scroll = self.max_scroll();
@@ -633,6 +659,7 @@ impl Sim {
     }
 
     fn step_entities(&mut self, assets: &GameAssets) {
+        self.entity_scroll_pause = false;
         for i in 0..self.entities.len() {
             if self.entities[i].dead {
                 continue;
@@ -671,19 +698,159 @@ impl Sim {
                 continue;
             }
 
-            // --- movement ---
+            // --- animation ---
+            self.step_animation(i, &state);
+
+            // --- rules (original runs ProcessRules right after Animate,
+            //     before movement; a fired rule changes state for this tick)
+            self.step_rules(i, &state, assets);
+            if self.entities[i].dead {
+                continue;
+            }
+            // State may have changed — refresh for movement/spawn sets.
+            let state = match assets.units.get(&self.entities[i].unit) {
+                Some(d) if !d.states.is_empty() => {
+                    d.states[self.entities[i].state.min(d.states.len() - 1)].clone()
+                }
+                _ => continue,
+            };
+
+            // --- tracking flag (m_field_0xb5): rotating to a live target ---
+            {
+                let epos = self.entities[i].pos;
+                let has_target = self.nearest_player_dist(epos) != f32::MAX;
+                self.entities[i].tracking = state.rotate_to_target && has_target;
+            }
+
+            // --- lifecycle flags ---
+            // pause_vertical_scrolling aggregates into entity_scroll_pause
+            // for the NEXT tick's scroll decision (G_EG_Process result).
+            if state.pause_vertical_scrolling {
+                self.entity_scroll_pause = true;
+            }
+            {
+                let any_active = self
+                    .players
+                    .iter()
+                    .flatten()
+                    .any(|p| p.phase == PlayerPhase::Active);
+                let owner_uid = self.entities[i].owner;
+                let owner_info = if owner_uid == u32::MAX {
+                    None
+                } else {
+                    self.entities
+                        .iter()
+                        .find(|o| o.unique_num == owner_uid)
+                        .map(|o| (o.dead, o.destroyed))
+                };
+                let mut do_destroy = false;
+                let mut do_delete = false;
+                if !any_active {
+                    if state.delete_on_no_active_players {
+                        self.entities[i].dead = true;
+                        continue;
+                    }
+                    if state.destruct_on_no_active_players {
+                        do_destroy = true;
+                    }
+                }
+                let scroll_hold = self.scroll_paused || self.entity_scroll_pause;
+                if state.destruct_if_scrolling_not_paused
+                    && owner_uid != u32::MAX
+                    && !scroll_hold
+                {
+                    do_destroy = true;
+                }
+                // Owner gone (dead or compacted away): propagate per flag.
+                let owner_gone = owner_uid != u32::MAX
+                    && owner_info.map(|(d, _)| d).unwrap_or(true);
+                if owner_gone {
+                    // Missing owner counts as destroyed (destruct path is
+                    // the common removal for owner entities).
+                    let owner_destroyed = owner_info.map(|(_, ds)| ds).unwrap_or(true);
+                    if owner_destroyed && state.destroy_on_owner_destruction {
+                        do_destroy = true;
+                    }
+                    if !owner_destroyed && state.delete_on_owner_deletion {
+                        do_delete = true;
+                    }
+                }
+                if do_destroy {
+                    let sp = self.entities[i].spawner_player;
+                    self.destroy_entity(assets, i, sp);
+                    continue;
+                }
+                if do_delete {
+                    self.entities[i].dead = true;
+                    continue;
+                }
+            }
+
+            // --- movement + hunt/on-range AI (DoMovementAI approximation) ---
+            let epos0 = self.entities[i].pos;
+            let target = self.nearest_player(epos0);
+            let mut pending_change: Option<String> = None;
+            let mut brake = false;
+            let mut flee_from: Option<Vec2> = None;
+            let mut hunt_to: Option<Vec2> = None;
+            if let Some((tp, td)) = target {
+                let in_range = state.on_range != 0.0 && td < state.on_range as f32;
+                if in_range {
+                    let oc = state.on_range_change_to.trim();
+                    if !oc.is_empty() && !oc.eq_ignore_ascii_case("none") {
+                        pending_change = Some(state.on_range_change_to.clone());
+                    }
+                    if state.hold_position_to_target {
+                        brake = true;
+                    }
+                }
+                if state.flee_id != NONE_ID {
+                    flee_from = Some(tp);
+                } else if state.hunts && !brake {
+                    hunt_to = Some(tp);
+                }
+            } else {
+                // No active players: unit-level flee flags pick a heading.
+                let udef = assets.units.get(&self.entities[i].unit);
+                if let Some(d) = udef {
+                    if d.flees_north_on_no_players {
+                        hunt_to = Some(epos0 + Vec2::new(0.0, 4096.0));
+                    } else if d.flees_south_on_no_players {
+                        hunt_to = Some(epos0 + Vec2::new(0.0, -4096.0));
+                    }
+                }
+            }
+            if let Some(name) = pending_change {
+                self.apply_state_change(i, &name, assets);
+                continue;
+            }
             {
                 let e = &mut self.entities[i];
                 let target_speed = state.max_speed as f32;
                 let cur_speed = e.vel.length();
-                if target_speed > 0.0 && cur_speed > 0.001 {
-                    let delta = state.delta as f32;
-                    let new_speed = if state.hold_max_speed > 0.0 {
-                        // hold_max_speed/hold_delta: speed oscillates? treat as cap
-                        (cur_speed + delta).min(target_speed)
+                if brake {
+                    e.vel *= 0.85;
+                } else if let Some(tp) = flee_from.or(hunt_to) {
+                    // Steer toward (hunt) or away from (flee) the target.
+                    let dir = if flee_from.is_some() {
+                        (epos0 - tp).normalize_or_zero()
                     } else {
-                        (cur_speed + delta).min(target_speed)
+                        (tp - epos0).normalize_or_zero()
                     };
+                    if dir.length_squared() > 0.0001 {
+                        let speed = if flee_from.is_some() {
+                            state.flee_speed.max(state.max_speed) as f32
+                        } else {
+                            target_speed
+                        };
+                        let delta = state.delta.max(state.flee_delta) as f32;
+                        let new_speed = (cur_speed + delta).min(speed.max(1.0));
+                        e.vel = dir * new_speed;
+                        e.heading = vector_to_heading(e.vel);
+                    }
+                } else if target_speed > 0.0 && cur_speed > 0.001 {
+                    let delta = state.delta as f32;
+                    let new_speed = (cur_speed + delta).min(target_speed);
                     e.vel = e.vel.normalize() * new_speed;
                 }
                 e.pos += e.vel;
@@ -692,14 +859,8 @@ impl Sim {
                 }
             }
 
-            // --- animation ---
-            self.step_animation(i, &state);
-
             // --- spawn sets ---
             self.step_spawn_sets(i, &state);
-
-            // --- rules ---
-            self.step_rules(i, &state, assets);
 
             // --- cull ---
             let e = &self.entities[i];
@@ -742,8 +903,9 @@ impl Sim {
             rand_range(&mut self.rng, st.on_timer_min as f64, st.on_timer_max.max(st.on_timer_min) as f64) as u32
         } else { 0 };
         e.spawn_timers = vec![SpawnSetRt::default(); st.spawn_sets.len()];
-        e.rule_timers = vec![0; st.rules.len()];
         e.frame = st.sprite_frame_min;
+        e.anim_stopped = false;
+        e.tracking = false;
     }
 
     fn step_animation(&mut self, idx: usize, state: &UnitState) {
@@ -752,31 +914,50 @@ impl Sim {
         let frame_min = state.sprite_frame_min;
         let frame_max = state.sprite_frame_max.max(frame_min);
         let span = (frame_max - frame_min + 1).max(1) as usize;
+        let per_dir = (span / num_dirs).max(1) as i64;
         let dir = heading_to_dir(e.heading, num_dirs);
         if dir != e.dir_index {
             e.dir_index = dir;
-            // Direction-major layout: each direction owns span/num_dirs frames.
-            let per_dir = (span / num_dirs).max(1);
-            e.frame = frame_min + dir as i64 * per_dir as i64;
+            // Direction-major layout: each direction owns per_dir frames.
+            e.frame = frame_min + dir as i64 * per_dir;
             e.frame_timer = 0;
+        }
+        // Original latches m_field_0xb6 until the next ChangeState.
+        if e.anim_stopped {
+            return;
         }
         let delay = state.frame_delay.max(1) as u32;
         e.frame_timer += 1;
-        if e.frame_timer >= delay {
-            e.frame_timer = 0;
-            let per_dir = (span / num_dirs).max(1) as i64;
-            let dir_base = frame_min + dir as i64 * per_dir;
-            let local = (e.frame - dir_base).clamp(0, per_dir - 1);
-            let step_dir = if state.animate_backwards { -1 } else { 1 } * state.frame_delta.signum() as i64;
-            let mut next = local + if step_dir == 0 { 1 } else { step_dir };
-            if next >= per_dir {
-                next = if state.loop_animation { 0 } else { per_dir - 1 };
-            }
-            if next < 0 {
-                next = if state.loop_animation { per_dir - 1 } else { 0 };
-            }
-            e.frame = dir_base + next;
+        if e.frame_timer < delay {
+            return;
         }
+        e.frame_timer = 0;
+        let dir_base = frame_min + dir as i64 * per_dir;
+        let local = (e.frame - dir_base).clamp(0, per_dir - 1);
+        if state.continuous_frame_randomisation {
+            let r = rand_range(&mut self.rng, 0.0, (per_dir - 1) as f64) as i64;
+            e.frame = dir_base + r;
+            return;
+        }
+        let step_dir = if state.animate_backwards { -1 } else { 1 } * state.frame_delta.signum() as i64;
+        let mut next = local + if step_dir == 0 { 1 } else { step_dir };
+        if next >= per_dir {
+            if state.loop_animation {
+                next = 0;
+            } else {
+                next = per_dir - 1;
+                e.anim_stopped = true;
+            }
+        }
+        if next < 0 {
+            if state.loop_animation {
+                next = per_dir - 1;
+            } else {
+                next = 0;
+                e.anim_stopped = true;
+            }
+        }
+        e.frame = dir_base + next;
     }
 
     fn step_spawn_sets(&mut self, idx: usize, state: &UnitState) {
@@ -851,69 +1032,162 @@ impl Sim {
         self.entities[idx].spawn_timers = timers;
     }
 
+    /// `G_Entity::ProcessRules` — evaluates up to 5 rules in order; the
+    /// first whose condition holds fires `ChangeState(rule.action)` and
+    /// processing stops. Rules with `unit_id == none` or an empty
+    /// condition are skipped entirely (matching the original).
     fn step_rules(&mut self, idx: usize, state: &UnitState, assets: &GameAssets) {
-        if state.rules.is_empty() {
+        for rule in state.rules.iter().take(5) {
+            if rule.unit_id == NONE_ID || rule.condition.trim().is_empty() {
+                continue;
+            }
+            if !self.rule_condition(rule, idx, state, assets) {
+                continue;
+            }
+            self.apply_rule_action(idx, &rule.action, assets);
             return;
-        }
-        let unit_id = self.entities[idx].unit;
-        let mut timers = self.entities[idx].rule_timers.clone();
-        let epos = self.entities[idx].pos;
-        let eheading = self.entities[idx].heading;
-        let mut new_state_name: Option<String> = None;
-        let mut delete = false;
-        for (ri, rule) in state.rules.iter().enumerate() {
-            if ri >= timers.len() {
-                break;
-            }
-            if timers[ri] > 0 {
-                timers[ri] -= 1;
-                continue;
-            }
-            if !self.rule_condition(rule.condition.as_str(), idx, epos) {
-                continue;
-            }
-            // Fire the rule.
-            if rule.unit_id != NONE_ID {
-                self.request_spawn(SpawnReq {
-                    unit: rule.unit_id,
-                    pos: epos,
-                    heading: Some(eheading),
-                    owner: idx,
-                    spawner_player: self.entities[idx].spawner_player,
-                    stationary: false,
-                    state: None,
-                });
-            }
-            let action = rule.action.to_lowercase();
-            if action.contains("delete") || action.contains("destruct") {
-                delete = true;
-            } else if !action.is_empty()
-                && action != "do nothing"
-                && action != "none"
-            {
-                // Actions that name a state transition.
-                new_state_name = Some(rule.action.clone());
-            }
-            timers[ri] = 20;
-        }
-        self.entities[idx].rule_timers = timers;
-        let _ = unit_id;
-        if delete {
-            self.entities[idx].dead = true;
-        } else if let Some(name) = new_state_name {
-            self.apply_state_change(idx, &name, assets);
         }
     }
 
-    fn rule_condition(&self, cond: &str, _idx: usize, _pos: Vec2) -> bool {
-        let c = cond.trim().to_lowercase();
-        match c.as_str() {
-            "" | "is active" | "always" => true,
-            "is tracking player" => false, // entities don't track unless hunts; conservative
-            "no players are active" => !self.players.iter().flatten().any(|p| p.phase == PlayerPhase::Active),
-            "is not active" => false,
-            _ => false, // unknown conditions: don't fire (safer than spam)
+    /// `G_Entity::ChangeState` as reached from a rule: "Delete" removes,
+    /// "Destroy" runs the destruct path, anything else is a state-name
+    /// lookup (unknown names are a no-op).
+    fn apply_rule_action(&mut self, idx: usize, action: &str, assets: &GameAssets) {
+        if action == "Delete" {
+            self.entities[idx].dead = true;
+            return;
         }
+        if action == "Destroy" {
+            let owner = self.entities[idx].spawner_player;
+            self.destroy_entity(assets, idx, owner);
+            return;
+        }
+        self.apply_state_change(idx, action, assets);
+    }
+
+    /// Entity-of-type query shared by the tracking/active conditions.
+    /// `param` is the rule's range: 0 = any distance, else the candidate
+    /// must be within `param` px of the rule-triggering entity.
+    fn any_entity_matching(&self, unit_id: ResId, from: Vec2, param: i64, tracking_only: bool) -> bool {
+        if unit_id == NONE_ID {
+            return false;
+        }
+        for e in &self.entities {
+            if e.dead || e.unit != unit_id {
+                continue;
+            }
+            if tracking_only && !e.tracking {
+                continue;
+            }
+            if param != 0 && e.pos.distance(from) > param as f32 {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn count_active_of_type(&self, unit_id: ResId) -> usize {
+        if unit_id == NONE_ID {
+            return 0;
+        }
+        self.entities.iter().filter(|e| !e.dead && e.unit == unit_id).count()
+    }
+
+    /// "Destroyable air/ground entities" map to the unit's
+    /// include-in-accuracy flags (the original reads the same bytes the
+    /// accuracy stats and debug labels use).
+    fn any_destroyable_air(&self, assets: &GameAssets) -> bool {
+        self.entities.iter().any(|e| {
+            !e.dead
+                && assets
+                    .units
+                    .get(&e.unit)
+                    .map(|d| d.include_in_air_accuracy)
+                    .unwrap_or(false)
+        })
+    }
+
+    fn any_destroyable_ground(&self, assets: &GameAssets) -> bool {
+        self.entities.iter().any(|e| {
+            if e.dead {
+                return false;
+            }
+            let Some(d) = assets.units.get(&e.unit) else { return false };
+            if !d.include_in_ground_accuracy {
+                return false;
+            }
+            self.is_within_game_area(e.pos, assets)
+        })
+    }
+
+    /// `G_Entity::IsWithinGameArea`: entity inside the visible playfield —
+    /// playfield x 0..416 (world x 32..448), height above the scroll
+    /// origin 0..480.
+    fn is_within_game_area(&self, pos: Vec2, assets: &GameAssets) -> bool {
+        let px = pos.x - PLAY_LEFT;
+        let py = pos.y - self.scroll;
+        px >= 0.0 && px <= pf(assets, pf::VISIBLE_GAME_WIDTH)
+            && py >= 0.0 && py <= pf(assets, pf::VISIBLE_GAME_HEIGHT)
+    }
+
+    fn rule_condition(&self, rule: &StateRule, idx: usize, state: &UnitState, assets: &GameAssets) -> bool {
+        let cond = rule.condition.trim().to_lowercase();
+        let param = rule.range;
+        let pos = self.entities[idx].pos;
+        match cond.as_str() {
+            "is tracking player" => self.any_entity_matching(rule.unit_id, pos, param, true),
+            "is not tracking player" => !self.any_entity_matching(rule.unit_id, pos, param, true),
+            "is active" => self.any_entity_matching(rule.unit_id, pos, param, false),
+            "is not active" => !self.any_entity_matching(rule.unit_id, pos, param, false),
+            "no destroyable air entities are active" => !self.any_destroyable_air(assets),
+            "no destroyable ground entities are active" => !self.any_destroyable_ground(assets),
+            "no destroyable air or ground entities are active" => {
+                !self.any_destroyable_air(assets) && !self.any_destroyable_ground(assets)
+            }
+            "no players are active" => {
+                !self.players.iter().flatten().any(|p| p.phase == PlayerPhase::Active)
+            }
+            "this entity is within range of a player" => {
+                param != 0 && self.nearest_player_dist(pos) < param as f32
+            }
+            "this entity is not within range of a player" => {
+                param != 0 && !(self.nearest_player_dist(pos) < param as f32)
+            }
+            "this entity's animation has stopped" => self.entities[idx].anim_stopped,
+            // Tween-at-target conditions: the original compares the live
+            // value against the state's required value. With no tween
+            // simulation, a zero delta means already at target.
+            "this entity's visibility is at required level" => state.visibility_delta_percent == 0,
+            "this entity's tint is at required level" => state.tint_delta_percent == 0,
+            "this entity's scale is at required level" => state.scale_delta_percent == 0,
+            "number of this type of entity active" => {
+                self.count_active_of_type(rule.unit_id) as i64 == param
+            }
+            "are fewer of these entities active" => {
+                (self.count_active_of_type(rule.unit_id) as i64) < param
+            }
+            "are more of these entities active" => {
+                (self.count_active_of_type(rule.unit_id) as i64) > param
+            }
+            _ => false,
+        }
+    }
+
+    /// Closest active player: (world pos, distance).
+    fn nearest_player(&self, pos: Vec2) -> Option<(Vec2, f32)> {
+        let mut best: Option<(Vec2, f32)> = None;
+        for p in self.players.iter().flatten() {
+            if p.phase != PlayerPhase::Active {
+                continue;
+            }
+            let pp = p.world_pos(self);
+            let d = pp.distance(pos);
+            if best.map(|(_, bd)| d < bd).unwrap_or(true) {
+                best = Some((pp, d));
+            }
+        }
+        best
     }
 
     fn nearest_player_dist(&self, pos: Vec2) -> f32 {
@@ -944,20 +1218,80 @@ impl Sim {
         e.hit_cooldown = 2;
         e.hit_flash = 4;
         let died = e.shields <= 0.0;
-        if died {
-            e.dead = true;
-            self.stat_kills += 1;
+        if died && from_player >= 0 {
+            if let Some(p) = self.players[from_player as usize].as_mut() {
+                p.score += def.score as i64 * p.multiplier;
+            }
         }
-        let epos = e.pos;
         if died {
-            if from_player >= 0 {
-                if let Some(p) = self.players[from_player as usize].as_mut() {
-                    p.score += def.score as i64 * p.multiplier;
+            // Full destruct path: spawn/sound/coins/bonus/children.
+            self.destroy_entity(assets, idx, from_player);
+        } else {
+            // Non-fatal hit: shield vs unshielded sound (hit particles
+            // aren't ported yet).
+            let shields_left = self.entities[idx].shields;
+            let snd = if shields_left > 0.0 { def.shield_sound } else { def.unshielded_sound };
+            if snd.id != NONE_ID {
+                self.events.push(SimEvent::Sound(snd.id));
+            }
+        }
+    }
+
+    /// `G_Entity::Destroy` — the destruct path: spawn/sound/particle
+    /// effects, coin release, random bonus drop, child handling. No score
+    /// (the original awards score in `Hit`, before `Destroy` is reached).
+    pub fn destroy_entity(&mut self, assets: &GameAssets, idx: usize, from_player: i32) {
+        if idx >= self.entities.len() || self.entities[idx].dead {
+            return;
+        }
+        let def = match assets.units.get(&self.entities[idx].unit) {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        let epos = self.entities[idx].pos;
+        let my_uid = self.entities[idx].unique_num;
+        let owner_uid = self.entities[idx].owner;
+
+        // Children first (destruct_destroy/delete_children).
+        if def.destruct_destroy_children || def.destruct_delete_children {
+            let kids: Vec<usize> = self
+                .entities
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| *i != idx && !e.dead && e.owner == my_uid)
+                .map(|(i, _)| i)
+                .collect();
+            for k in kids {
+                if def.destruct_destroy_children {
+                    self.destroy_entity(assets, k, from_player);
+                } else {
+                    self.entities[k].dead = true;
                 }
             }
-            if def.destruct_spawn != NONE_ID {
+        }
+
+        if def.destruct_spawn != NONE_ID {
+            self.request_spawn(SpawnReq {
+                unit: def.destruct_spawn,
+                pos: epos,
+                heading: None,
+                owner: usize::MAX,
+                spawner_player: from_player,
+                stationary: false,
+                state: None,
+            });
+        }
+        if def.destruct_sound.id != NONE_ID {
+            self.events.push(SimEvent::Sound(def.destruct_sound.id));
+        }
+        // destruct_particle / destruct_notice: particle & notice systems
+        // aren't ported yet.
+
+        // Coin release: N copies of destruct_coin at the kill location.
+        if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {
+            for _ in 0..def.destruct_num_coins.min(64) {
                 self.request_spawn(SpawnReq {
-                    unit: def.destruct_spawn,
+                    unit: def.destruct_coin,
                     pos: epos,
                     heading: None,
                     owner: usize::MAX,
@@ -966,10 +1300,81 @@ impl Sim {
                     state: None,
                 });
             }
-            if def.destruct_sound.id != NONE_ID {
-                self.events.push(SimEvent::Sound(def.destruct_sound.id));
+        }
+
+        self.entities[idx].dead = true;
+        self.entities[idx].destroyed = true;
+        self.stat_kills += 1;
+
+        // Group-kill bonus coin: when the last sibling under the same
+        // owner goes down, spawn destruct_coin_on_group_kill once.
+        if def.destruct_coin_on_group_kill != NONE_ID && owner_uid != u32::MAX {
+            let any_left = self
+                .entities
+                .iter()
+                .any(|e| !e.dead && e.owner == owner_uid);
+            if !any_left {
+                self.request_spawn(SpawnReq {
+                    unit: def.destruct_coin_on_group_kill,
+                    pos: epos,
+                    heading: None,
+                    owner: usize::MAX,
+                    spawner_player: from_player,
+                    stationary: false,
+                    state: None,
+                });
             }
         }
+
+        // Random bonus drop (G_Entity::Destroy tail): weighted roll over
+        // perm floats 0xd1..0xd9/0xda/0xdb → object_ids[0x19..0x22].
+        if def.destruct_release_random_bonus {
+            if let Some(bonus) = self.roll_random_bonus(assets) {
+                self.request_spawn(SpawnReq {
+                    unit: bonus,
+                    pos: epos,
+                    heading: None,
+                    owner: usize::MAX,
+                    spawner_player: from_player,
+                    stationary: false,
+                    state: None,
+                });
+            }
+        }
+    }
+
+    /// Weighted random-bonus pick, mirroring `G_Entity::Destroy`'s roll.
+    fn roll_random_bonus(&mut self, assets: &GameAssets) -> Option<ResId> {
+        let roll = rand_range(&mut self.rng, 0.0, 100.0) as i64;
+        let slot = if roll < pf(assets, 0xd1) as i64 {
+            0x19
+        } else if roll < pf(assets, 0xd2) as i64 {
+            0x1a
+        } else if roll < pf(assets, 0xd3) as i64 {
+            0x1b
+        } else if roll < pf(assets, 0xd4) as i64 {
+            0x1c
+        } else if roll < pf(assets, 0xd5) as i64 {
+            0x1d
+        } else if roll < pf(assets, 0xd6) as i64 {
+            0x1e
+        } else if roll < pf(assets, 0xd7) as i64 {
+            0x1f
+        } else if roll < pf(assets, 0xd8) as i64 {
+            0x20
+        } else if (self.level_number as f32) < pf(assets, 0xdb) {
+            0x20
+        } else if roll < pf(assets, 0xd9) as i64 {
+            0x21
+        } else {
+            0x22
+        };
+        assets
+            .object_ids
+            .entries
+            .get(slot)
+            .map(|(_, r)| *r)
+            .filter(|r| *r != NONE_ID)
     }
 
     /// Damage a player.
