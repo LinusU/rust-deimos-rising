@@ -901,42 +901,10 @@ impl Sim {
         }
         let state_idx = req.state.unwrap_or(0).min(def.states.len() - 1);
         let state = &def.states[state_idx];
-        let speed = rand_float(&mut self.rng, def.initial_speed_min as f64, def.initial_speed_max as f64) as f32;
-        let heading_base = req.heading.unwrap_or(def.initial_heading as f32);
-        let tol = def.initial_heading_tolerance;
-        // Priv spawn: tolerance roll is U_Utils_RandomInt(-half, +half) with
-        // half = (tol + 1) >> 1, and only when tolerance != 0.
-        let heading = if tol != 0 {
-            let half = ((tol + 1) >> 1) as i64;
-            heading_base + rand_int(&mut self.rng, -half, half) as f32
-        } else {
-            heading_base
-        };
-        // Spawn velocity uses the INVERTED heading (sub_01c840 calls
-        // U_Math_InvertAngle before GetVectorFromAngleAndSpeed); the stored
-        // heading (entity+0x130) keeps the uninverted facing.
-        let hr = invert_angle(heading).to_radians();
-        let vel = if req.stationary {
-            Vec2::ZERO
-        } else {
-            Vec2::new(hr.sin() * speed, hr.cos() * speed)
-        };
-        let shields = if def.shields_max > 0.0 { def.shields_max } else { def.shields_base };
-        // Roll the on_timer target once at spawn.
-        let timer_target = if state.on_timer_max > 0 || state.on_timer_min > 0 {
-            rand_int(&mut self.rng, state.on_timer_min as i64, state.on_timer_max.max(state.on_timer_min) as i64) as u32
-        } else { 0 };
-        let idx = self.entities.len();
-        // req.owner is an entity index; store the stable unique_num.
-        let owner_uid = if req.owner != usize::MAX && req.owner < self.entities.len() {
-            self.entities[req.owner].unique_num
-        } else {
-            u32::MAX
-        };
-        // Spawn scatter (sub_01c540): the unit def's xOffset/yOffset
-        // min/max jitter each spawned entity around the request point;
-        // equal bounds are a fixed offset, and the original's polar mode
-        // only applies when both axes carry a range.
+        // sub_01c540 runs before sub_01c840: the unit def's xOffset/yOffset
+        // min/max jitter each spawned entity around the request point; equal
+        // bounds are a fixed offset, and the original's polar mode only
+        // applies when both axes carry a range.
         let pos = if def.x_offset_min != def.x_offset_max
             || def.y_offset_min != def.y_offset_max
         {
@@ -963,6 +931,52 @@ impl Sim {
             req.pos + Vec2::new(jx, jy)
         } else {
             req.pos
+        };
+        // sub_01c840: stationary entities (request b1a -> m_field134) return
+        // before the initial-speed roll, so they consume no rand() here.
+        let speed = if req.stationary {
+            0.0
+        } else {
+            rand_float(&mut self.rng, def.initial_speed_min as f64, def.initial_speed_max as f64) as f32
+        };
+        let heading_base = req.heading.unwrap_or(def.initial_heading as f32);
+        let tol = def.initial_heading_tolerance;
+        // The tolerance roll only runs on the useOwnerHeading path
+        // (useRandomAngle in sub_01c840); no retail unit sets
+        // use_owner_heading, so the roll never fires.
+        let heading = if !req.stationary
+            && req.heading.is_none()
+            && def.use_owner_heading
+            && tol != 0
+        {
+            let half = ((tol + 1) >> 1) as i64;
+            heading_base + rand_int(&mut self.rng, -half, half) as f32
+        } else {
+            heading_base
+        };
+        // Spawn velocity uses the INVERTED heading (sub_01c840 calls
+        // U_Math_InvertAngle before GetVectorFromAngleAndSpeed); the stored
+        // heading (entity+0x130) keeps the uninverted facing. The
+        // initiallyHuntsClosestPlayer branch never writes the velocity
+        // fields, so those entities spawn with zero velocity and let
+        // DoMovementAI acquire a target.
+        let hr = invert_angle(heading).to_radians();
+        let vel = if req.stationary || def.initially_hunts_closest_player {
+            Vec2::ZERO
+        } else {
+            Vec2::new(hr.sin() * speed, hr.cos() * speed)
+        };
+        let shields = if def.shields_max > 0.0 { def.shields_max } else { def.shields_base };
+        // Roll the on_timer target once at spawn.
+        let timer_target = if state.on_timer_max > 0 || state.on_timer_min > 0 {
+            rand_int(&mut self.rng, state.on_timer_min as i64, state.on_timer_max.max(state.on_timer_min) as i64) as u32
+        } else { 0 };
+        let idx = self.entities.len();
+        // req.owner is an entity index; store the stable unique_num.
+        let owner_uid = if req.owner != usize::MAX && req.owner < self.entities.len() {
+            self.entities[req.owner].unique_num
+        } else {
+            u32::MAX
         };
         let flee_target = if state.flee_id != NONE_ID {
             self.compute_flee_target(assets, state.flee_id, pos)
