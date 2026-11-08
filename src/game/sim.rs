@@ -3730,8 +3730,18 @@ impl Sim {
                 self.events.push(SimEvent::PlayerEvent(slot, "hit"));
             }
         }
-        // Hit-effect spawn (active_SpawnOnHit), throttled by pf(0xa2).
-        if pdef.active_spawn_on_hit != NONE_ID
+        // Glow_Start(hitGlowColor, hitGlowSpeed) — ship flash on any
+        // non-lethal hit (the original fires it even for invulnerable
+        // hits). Sawtooth period ≈ 56/speed ticks.
+        if p.shields >= 0.0 {
+            let spd = pdef.hit_glow_speed.max(1) as u32;
+            p.glow_ticks = (56 / spd).clamp(1, 255) as u8;
+        }
+        // Hit-effect spawn (active_SpawnOnHit), throttled by pf(0xa2) —
+        // only on non-lethal hits with real damage, per G_Player::Hit.
+        if p.shields >= 0.0
+            && amount > 0.0
+            && pdef.active_spawn_on_hit != NONE_ID
             && self.game_time as i64
                 >= p.last_hit_fx as i64 + pf(assets, 0xa2) as i64
         {
