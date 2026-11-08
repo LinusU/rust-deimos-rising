@@ -230,6 +230,8 @@ fn film_test() {
         let map = [2usize, 3, 0, 1, 4, 5, 6];
         let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64).expect("level");
         let n = film.frames[0].min(20000);
+        let mut fire_frames = 0u32;
+        let mut bomb_frames = 0u32;
         for t in 0..n {
             let mk = |p: usize| -> SlotInput {
                 let b = film.inputs[p].get(t).copied().unwrap_or(0);
@@ -245,13 +247,31 @@ fn film_test() {
                 }
                 s
             };
-            sim.advance(&a, &PlayerInput { p1: mk(0), p2: mk(1) }, 1.0 / 60.0);
+            let inp = PlayerInput { p1: mk(0), p2: mk(1) };
+            if inp.p1.fire { fire_frames += 1; }
+            if inp.p1.bomb { bomb_frames += 1; }
+            sim.advance(&a, &inp, 1.0 / 60.0);
             if t % 600 == 599 {
                 let p = sim.players[0].as_ref().unwrap();
-                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} ent={}",
-                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.entities.len());
+                let mut projs = 0usize;
+                let mut pinfo = String::new();
+                for e in &sim.entities {
+                    if let Some(d) = a.units.get(&e.unit) {
+                        if d.player_projectile {
+                            projs += 1;
+                            if projs <= 3 {
+                                pinfo.push_str(&format!(" [{:.0},{:.0} v{:.1},{:.1} tv{:.1},{:.1} st{}]",
+                                    e.pos.x, e.pos.y, e.vel.x, e.vel.y, e.tvel.x, e.tvel.y, e.state));
+                            }
+                        }
+                    }
+                }
+                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={} proj={} ftmr={} bt={} ent={}",
+                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills, projs, p.fire_timer, p.bomb_burst, sim.entities.len());
+                println!("   proj{}", pinfo);
             }
         }
+        println!("fire_frames={fire_frames} bomb_frames={bomb_frames} / {n}");
         return;
     }
     let players = if film.frames[1] > 0 { 2 } else { 1 };

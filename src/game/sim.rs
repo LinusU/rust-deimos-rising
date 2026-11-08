@@ -443,8 +443,15 @@ pub struct Player {
     pub invuln: u32,
     /// Ticks in current phase.
     pub phase_time: u32,
-    /// Bombs available.
-    pub bombs: i64,
+    /// Ground-weapon auto-burst shots remaining (G_WeaponHandler
+    /// m_field_0x87). Armed by a bomb press after the recharge interval,
+    /// drained one shot per delayBetweenLoadLaunches ticks.
+    pub bomb_burst: i64,
+    /// Game time of last ground-weapon activity (m_field_0x7b/0x7f — the
+    /// original keeps two fields that are always written together).
+    pub bomb_last: u32,
+    /// Previous-tick bomb input for edge detection (pad1a).
+    pub prev_bomb: bool,
     /// Shield recharge delay after a hit.
     pub shield_recharge: u32,
     /// Score multiplier.
@@ -477,8 +484,6 @@ pub struct Player {
     pub air_power: PowerupRt,
     /// Ground-weapon charge/release power-up state.
     pub gnd_power: PowerupRt,
-    /// Ground-weapon fire cooldown.
-    pub gnd_timer: u32,
     /// Ground-weapon power meter 0..100.
     pub gpower: f64,
 }
@@ -729,8 +734,6 @@ impl Sim {
             (def.entry_solo_start_x as f32, def.entry_solo_start_y as f32)
         };
         let (sx, sy) = (PLAY_LEFT + ex, ey);
-        let max_bombs = pf(assets, pf::WEAPON_MAX_BOMBS) as i64;
-        let base_bombs = pf(assets, pf::WEAPON_BASE_BOMBS) as i64;
         self.players[slot] = Some(Player {
             slot,
             def_id,
@@ -748,7 +751,9 @@ impl Sim {
             fire_timer: 0,
             invuln: def.entry_invulnerability_time as u32,
             phase_time: 0,
-            bombs: base_bombs.max(1).min(max_bombs.max(1)),
+            bomb_burst: 0,
+            bomb_last: 0,
+            prev_bomb: false,
             shield_recharge: 0,
             multiplier: 1,
             next_life_score: def.life_initial_required_score,
@@ -764,7 +769,6 @@ impl Sim {
             entry_entity: usize::MAX,
             air_power: PowerupRt::default(),
             gnd_power: PowerupRt::default(),
-            gnd_timer: 0,
             gpower: 0.0,
         });
         // Spawn the entry effect unit ("plen").
@@ -1098,11 +1102,6 @@ impl Sim {
             _ => return,
         };
         self.fire_weapon_id(assets, slot, weapon_id);
-        if let Some(p) = self.players[slot].as_mut() {
-            if let Some(w) = assets.weapons.get(&weapon_id) {
-                p.gnd_timer = w.delay_between_launches.max(1) as u32;
-            }
-        }
     }
 
     fn fire_weapon_id(&mut self, assets: &GameAssets, slot: usize, weapon_id: ResId) {
@@ -1823,7 +1822,6 @@ impl Sim {
 
         if p.invuln > 0 { p.invuln -= 1; }
         if p.fire_timer > 0 { p.fire_timer -= 1; }
-        if p.gnd_timer > 0 { p.gnd_timer -= 1; }
         // Shields do not passively regenerate in the original — they
         // recover via "shie" pickups and respawn resets only. The power
         // meters are driven by the weapon power-up state machine.
@@ -1873,13 +1871,39 @@ impl Sim {
             p.vel.y = 0.0;
         }
 
-        // Ground weapon (plasma bomb): hold to keep firing, each shot
-        // consumes one bomb.
-        let fire_gnd = inp.bomb && p.bombs > 0 && p.gnd_timer == 0;
-        let fire_air = inp.fire && p.fire_timer == 0;
-        if fire_gnd {
-            p.bombs -= 1;
+        // Ground weapon (G_WeaponHandler Process, m_field_0x87/0x7b/0x7f):
+        // a fresh bomb press after the recharge interval arms an
+        // auto-burst of min(pf(0x97)+level-1, pf(0x98)) shots; while the
+        // burst counter is positive it fires one shot every
+        // delayBetweenLoadLaunches ticks, even after release. Blocked
+        // while the ground power-up machine is not idle (m_field_0x35).
+        let now = self.game_time;
+        let level_num = self.level_number;
+        let mut fire_gnd = false;
+        {
+            let gw = assets.weapons.get(&p.ground_weapon).cloned();
+            let recharge = gw.as_ref().map(|w| w.delay_between_launches).unwrap_or(0).max(0) as u32;
+            let spacing = gw.as_ref().map(|w| w.delay_between_load_launches).unwrap_or(0).max(0) as u32;
+            if p.bomb_burst > 0 {
+                if now > p.bomb_last.saturating_add(spacing) {
+                    p.bomb_burst -= 1;
+                    fire_gnd = true;
+                    p.bomb_last = now;
+                }
+            } else if inp.bomb && !p.prev_bomb && p.gnd_power.state == 0 {
+                // Priv_CheckSpawning_Ground.
+                if now > p.bomb_last.saturating_add(recharge) {
+                    let base = pf(assets, pf::WEAPON_BASE_BOMBS) as i64;
+                    let cap = pf(assets, pf::WEAPON_MAX_BOMBS) as i64;
+                    let burst = (base + (level_num - 1).max(0)).min(cap) - 1;
+                    p.bomb_burst = burst.max(0);
+                    p.bomb_last = now;
+                    fire_gnd = true;
+                }
+            }
+            p.prev_bomb = inp.bomb;
         }
+        let fire_air = inp.fire && p.fire_timer == 0;
         // Firing.
         if fire_gnd {
             self.fire_ground_weapon(assets, slot);
