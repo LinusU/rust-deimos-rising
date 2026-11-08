@@ -251,6 +251,10 @@ fn main() {
         pickups_probe();
         return;
     }
+    if args.iter().any(|a| a == "--players") {
+        player_probe();
+        return;
+    }
     if args.iter().any(|a| a == "--flags") {
         flag_census();
         return;
@@ -404,6 +408,9 @@ fn test_floats() {
         for i in 0xb0usize..0xd0 {
             println!("flli[0x{:02x}] = {}", i, fl.get(i));
         }
+        for i in 0xd0usize..0xe0 {
+            println!("flli[0x{:02x}] = {}", i, fl.get(i));
+        }
     }
     println!("object_ids: {} entries", a.object_ids.entries.len());
     for (i, (n, r)) in a.object_ids.entries.iter().enumerate().take(0x28) {
@@ -545,6 +552,22 @@ fn test_strings() {
                 }
             }
         }
+    }
+}
+
+fn player_probe() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut v: Vec<_> = a.players.iter().collect();
+    v.sort_by_key(|(r, _)| **r);
+    for (rid, p) in v {
+        println!(
+            "{:08x} lives_start={} lives_max={} shield_start={} defbonus={:08x} hitobj={:08x} warnobj={:08x} counterobj={:08x}",
+            rid, p.life_num_initial, p.life_max_num, p.default_shield_percentage,
+            p.active_defence_bonus_object, p.active_spawn_on_hit,
+            p.active_shield_warning_object, p.active_money_counter_spawn
+        );
     }
 }
 
@@ -731,8 +754,30 @@ fn test_sim() {
                 sim.level_complete,
             );
         }
-        if sim.level_complete {
-            println!("LEVEL COMPLETE at t={}s", tick / 60);
+        if sim.level_complete && tick % 60 == 0 {
+            let p = sim.players[0].as_ref().unwrap();
+            println!(
+                "  endseq={} pct={} bonus={}/{} rem={} tally(ph={} rem={} purse={}) score={} money={} perfect={} done={}",
+                sim.end_seq_state,
+                sim.end_bonus_percent,
+                sim.end_bonus_total,
+                sim.end_bonus_step,
+                sim.end_bonus_remaining,
+                p.money_tally.phase,
+                p.money_tally.remaining,
+                p.money_tally.purse,
+                p.score,
+                p.money,
+                sim.perfect_count,
+                sim.level_end_complete,
+            );
+        }
+        if sim.level_end_complete {
+            println!("LEVEL END COMPLETE at t={}s", tick / 60);
+            break;
+        }
+        if tick > 60 * 400 {
+            println!("TIMEOUT waiting for level end at t={}s state={}", tick / 60, sim.end_seq_state);
             break;
         }
     }

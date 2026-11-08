@@ -51,7 +51,6 @@ pub enum FlowState {
     Sectors,
     Briefing,
     Playing,
-    Cleared,
     GameOver,
     /// Enter initials for a qualifying hi-score.
     NameEntry,
@@ -81,6 +80,10 @@ pub struct Flow {
     pub restricted: bool,
     /// Sequentially completed level count; sectors 0..=progress are selectable.
     pub progress: u32,
+    /// Run-scoped state carried into the next level (score/lives/etc.).
+    pub carry: Option<crate::game::sim::RunCarry>,
+    /// Levels started this run (exe 0x4e482a equivalent).
+    pub levels_played: u32,
 }
 
 /// A run result waiting for a player name.
@@ -1192,6 +1195,10 @@ fn sim_system(
     sim.0.advance(&*assets, &input, time.delta_secs());
 }
 
+/// Centered level-end breakdown text (G_GameInterface's 0x4e487a buffer).
+#[derive(Component)]
+pub struct EndText;
+
 /// Menu/flow state machine. Drives title → sectors → briefing → play →
 /// cleared/game-over → credits using the retail `lgsp`/`cred` strings.
 pub fn flow_system(
@@ -1225,6 +1232,14 @@ pub fn flow_system(
                     sim.0 = new_sim;
                     demo.playback = Some(pb);
                     demo.frame = 0;
+                    // Sync flow to the recorded level so the post-level
+                    // transition advances to the next campaign sector.
+                    if let Some(idx) = flow.level_ids.iter().position(|&r| r == lid) {
+                        flow.sector = idx;
+                        flow.levels_played = idx as u32 + 1;
+                        sim.0.levels_played = flow.levels_played;
+                    }
+                    flow.carry = None;
                     if let Some(audio) = audio.as_deref_mut() {
                         let mr = sim.0.level.music;
                         if mr != crate::pak::NONE_ID {
@@ -1284,6 +1299,9 @@ pub fn flow_system(
                 }
             }
             if enter || space {
+                // New run: drop any carried state from a previous run.
+                flow.carry = None;
+                flow.levels_played = 0;
                 flow.state = FlowState::Briefing;
                 flow.ticks = 0;
             } else if esc {
@@ -1298,6 +1316,13 @@ pub fn flow_system(
                         start_level(&mut *assets, lid, flow.players, 0xC0FFEE)
                     {
                         sim.0 = new_sim;
+                        flow.levels_played += 1;
+                        sim.0.levels_played = flow.levels_played;
+                        // Carry run-scoped state (score/lives/perfect count/
+                        // accuracy reward) from the previous level.
+                        if let Some(carry) = flow.carry.take() {
+                            carry.apply(&mut sim.0);
+                        }
                         if let Some(audio) = audio.as_deref_mut() {
                             let mr = sim.0.level.music;
                             if mr != crate::pak::NONE_ID {
@@ -1350,17 +1375,29 @@ pub fn flow_system(
                 }
             }
             if sim.0.phase == crate::game::sim::Phase::LevelEnd {
-                // Campaign progress only counts for unrestricted runs that
-                // completed levels sequentially from sector 1.
-                if !flow.restricted
-                    && demo.playback.is_none()
-                    && flow.sector as u32 == flow.progress
-                {
-                    flow.progress += 1;
-                    save_progress(flow.progress);
+                // The original's level-end sequence (bonus breakdown +
+                // coin tally) plays out timed inside the sim; advance only
+                // once it fully completes.
+                if sim.0.level_end_complete {
+                    // Campaign progress only counts for unrestricted runs
+                    // that completed levels sequentially from sector 1.
+                    if !flow.restricted
+                        && demo.playback.is_none()
+                        && flow.sector as u32 == flow.progress
+                    {
+                        flow.progress += 1;
+                        save_progress(flow.progress);
+                    }
+                    // Stash run-scoped state for the next level.
+                    flow.carry = Some(crate::game::sim::RunCarry::capture(&sim.0));
+                    if flow.sector + 1 < flow.level_ids.len() {
+                        flow.sector += 1;
+                        flow.state = FlowState::Briefing;
+                    } else {
+                        flow.state = FlowState::Credits;
+                    }
+                    flow.ticks = 0;
                 }
-                flow.state = FlowState::Cleared;
-                flow.ticks = 0;
             } else {
                 let any_alive = sim
                     .0
@@ -1373,17 +1410,6 @@ pub fn flow_system(
                     flow.state = FlowState::GameOver;
                     flow.ticks = 0;
                 }
-            }
-        }
-        FlowState::Cleared => {
-            if any {
-                if flow.sector + 1 < flow.level_ids.len() {
-                    flow.sector += 1;
-                    flow.state = FlowState::Briefing;
-                } else {
-                    flow.state = FlowState::Credits;
-                }
-                flow.ticks = 0;
             }
         }
         FlowState::GameOver => {
@@ -1510,46 +1536,6 @@ fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets, scores: &HighScores) -
                 flow.sector + 1,
                 name_of(flow.sector).to_uppercase()
             )
-        }
-        FlowState::Cleared => {
-            {
-                // Level-end banner + bonus breakdown
-                // (G_GameInterface level-clear display).
-                let mut s = String::from("ALL MISSION TARGETS DESTROYED!!!\n\n");
-                let t = sim.accuracy_targets;
-                if t > 0 {
-                    let pct = sim.accuracy_destroyed as f32 / t as f32 * 100.0;
-                    s.push_str(&format!(
-                        "GROUND ACCURACY: {}/{} - {}%\n",
-                        sim.accuracy_destroyed, t, pct as i32
-                    ));
-                }
-                // Defence bonus = levelNumber * pf(0xb8) per active player.
-                let active = sim
-                    .players
-                    .iter()
-                    .flatten()
-                    .filter(|p| p.phase != PlayerPhase::Dead)
-                    .count() as i64;
-                let defence = sim.level_number * crate::game::sim::pf(assets, 0xb8) as i64 * active;
-                if defence > 0 {
-                    s.push_str(&format!("   Bonus: {}\n", defence));
-                } else {
-                    s.push_str("   Bonus: None!\n");
-                }
-                // Coin Bonus: purse x pf(0xab) factor = score.
-                let factor = crate::game::sim::pf(assets, 0xab) as i64;
-                if sim.level_end_money > 0 {
-                    s.push_str(&format!(
-                        "Coin Bonus: {} x {} = {}\n",
-                        sim.level_end_money,
-                        factor,
-                        sim.level_end_money * factor
-                    ));
-                }
-                s.push_str("\nPRESS ANY KEY");
-                s
-            }
         }
         FlowState::GameOver => {
             let score: i64 = sim.players.iter().flatten().map(|p| p.score).sum();
@@ -1773,6 +1759,8 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             name_idx: 0,
             restricted: false,
             progress: load_progress(),
+            carry: None,
+            levels_played: 0,
         })
         .insert_resource(HighScores::load())
         .insert_resource(Demo::default())
@@ -1792,6 +1780,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sim_system,
                 crate::game::audio::drain_events,
                 sync_menu,
+                endtext_system,
                 sync_terrain,
                 sync_particles,
                 sync_blurs,
@@ -1901,6 +1890,108 @@ pub fn setup_menu(mut commands: Commands) {
             },
             MenuText,
         ));
+    // Level-end bonus breakdown (hidden except during Phase::LevelEnd).
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(0.0),
+                right: Val::Px(0.0),
+                top: Val::Px(0.0),
+                bottom: Val::Px(0.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+        ))
+        .with_child((
+            Text::new(""),
+            TextFont {
+                font_size: bevy::text::FontSize::Px(18.0),
+                ..default()
+            },
+            TextColor(Color::srgb(0.9, 0.95, 1.0)),
+            TextLayout {
+                justify: bevy::text::Justify::Center,
+                ..default()
+            },
+            EndText,
+        ));
+}
+
+/// Fill the level-end breakdown text while the sim runs its end sequence
+/// (sub_020d90 states + MoneyCounter tally), matching the retail strings:
+/// "All Mission Targets Destroyed!!!", "Ground Accuracy:", "   Bonus:",
+/// "Coin Bonus:", "  x", "  =".
+pub fn endtext_system(
+    sim_res: Res<GameSim>,
+    flow: Res<Flow>,
+    assets: Res<GameAssets>,
+    mut q: Query<&mut Text, With<EndText>>,
+) {
+    let sim = &sim_res.0;
+    let active = flow.state == FlowState::Playing
+        && sim.phase == crate::game::sim::Phase::LevelEnd;
+    for mut text in q.iter_mut() {
+        if !active {
+            text.0 = String::new();
+            continue;
+        }
+        let mut s = String::new();
+        match sim.end_seq_state {
+            // Banner hold: only the destroyed banner (string 0xa).
+            1 => s.push_str("    All Mission Targets Destroyed!!!"),
+            // Perfect-campaign sequence: the original shows the banner on
+            // state 9 and blanks the buffer on state 10 (format 0x4e4de7
+            // is an empty string) — a blinking banner while awarding.
+            9 => s.push_str("    All Mission Targets Destroyed!!!"),
+            10 => {}
+            _ => {
+                s.push_str("    All Mission Targets Destroyed!!!\n\n");
+                s.push_str(&format!("Ground Accuracy: {}%\n", sim.end_bonus_percent));
+                if sim.end_seq_state >= 3 {
+                    if sim.end_bonus_total > 0 {
+                        // During the drain the original counts the bonus
+                        // down live; afterwards it shows the full amount.
+                        let shown = if sim.end_seq_state == 6 {
+                            sim.end_bonus_remaining
+                        } else {
+                            sim.end_bonus_total
+                        };
+                        s.push_str(&format!("   Bonus: {}\n", shown));
+                    } else {
+                        s.push_str("   Bonus:None!\n");
+                    }
+                } else {
+                    s.push_str("   Bonus:\n");
+                }
+                // Coin Bonus lines appear once the MoneyCounter tallies arm.
+                let factor = crate::game::sim::pf(&assets, 0xab) as i64;
+                for p in sim.players.iter().flatten() {
+                    let purse = if p.money_tally.purse > 0 {
+                        p.money_tally.purse
+                    } else {
+                        p.money
+                    };
+                    if purse <= 0 && p.money_tally.remaining <= 0 {
+                        continue;
+                    }
+                    // "= N" counts down live during the drain; before the
+                    // tally arms it shows the full purse x factor total.
+                    let remaining = if p.money_tally.phase != 0 {
+                        p.money_tally.remaining
+                    } else {
+                        purse * factor
+                    };
+                    s.push_str(&format!(
+                        "Coin Bonus: {}  x  {}  =  {}\n",
+                        purse, factor, remaining
+                    ));
+                }
+            }
+        }
+        text.0 = s;
+    }
 }
 
 // ---------------------------------------------------------------------------

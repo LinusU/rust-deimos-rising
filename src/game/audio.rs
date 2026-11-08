@@ -210,6 +210,19 @@ pub fn drain_events(
                     });
                 }
             }
+            // Perm sound by gaso-list index (end-sequence cues).
+            SimEvent::PermSound(idx) => {
+                let rid = assets.sound_ids.entries.get(idx as usize).map(|(_, r)| *r);
+                if let Some(rid) = rid {
+                    if let Some(sound) = assets.sound(rid) {
+                        audio.play_sfx(&Sound {
+                            samples: sound.samples.clone(),
+                            channels: sound.channels,
+                            sample_rate: sound.sample_rate,
+                        });
+                    }
+                }
+            }
             // MoneyCounter drain tick → perm sound 0x14 ("moco" money count).
             SimEvent::PlayerEvent(_, "money_tick") => {
                 let rid = assets

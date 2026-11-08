@@ -286,6 +286,82 @@ pub struct MoneyTally {
     pub remaining: i64,
     /// Score awarded per drain tick (m_moneyCounter6).
     pub chunk: i64,
+    /// Purse captured at tally start (m_moneyCounter4) — the displayed
+    /// "Coin Bonus: N" amount, constant while the purse drains.
+    pub purse: i64,
+    /// MoneyCounter_Start ran this level (m_moneyCounter != 0): the tally
+    /// is staged and will arm when the bonus sequence completes.
+    pub staged: bool,
+}
+
+/// Per-player state that survives a level transition (G_Player fields the
+/// original does NOT reset in ResetAtLevelStart: score, lives, multiplier,
+/// extra-life thresholds, and the pad7[0] damage latch).
+#[derive(Clone, Copy, Default)]
+pub struct PlayerCarry {
+    pub score: i64,
+    pub lives: i64,
+    pub multiplier: i64,
+    pub next_life_score: i64,
+    pub life_bonus_acc: i64,
+    pub damage_taken: bool,
+}
+
+impl PlayerCarry {
+    pub fn capture(p: &Player) -> PlayerCarry {
+        PlayerCarry {
+            score: p.score,
+            lives: p.lives,
+            multiplier: p.multiplier,
+            next_life_score: p.next_life_score,
+            life_bonus_acc: p.life_bonus_acc,
+            damage_taken: p.damage_taken,
+        }
+    }
+
+    pub fn apply(self, p: &mut Player) {
+        p.score = self.score;
+        p.lives = self.lives;
+        p.multiplier = self.multiplier;
+        p.next_life_score = self.next_life_score;
+        p.life_bonus_acc = self.life_bonus_acc;
+        p.damage_taken = self.damage_taken;
+    }
+}
+
+/// Run-scoped state carried between levels: per-player carries plus the
+/// campaign perfect counter and the pending accuracy reward.
+#[derive(Clone, Default)]
+pub struct RunCarry {
+    pub players: [Option<PlayerCarry>; 2],
+    pub perfect_count: u32,
+    /// exe 0x4e4827 → becomes `accuracy_reward_pending` next level.
+    pub accuracy_reward: bool,
+}
+
+impl RunCarry {
+    pub fn capture(sim: &Sim) -> RunCarry {
+        RunCarry {
+            players: [
+                sim.players[0].as_ref().map(PlayerCarry::capture),
+                sim.players[1].as_ref().map(PlayerCarry::capture),
+            ],
+            perfect_count: sim.perfect_count,
+            accuracy_reward: sim.accuracy_reward_carry,
+        }
+    }
+
+    pub fn apply(self, sim: &mut Sim) {
+        sim.perfect_count = self.perfect_count;
+        // exe level-start transfer: pending reward arms this level.
+        sim.accuracy_reward_pending = self.accuracy_reward;
+        sim.accuracy_reward_carry = false;
+        for slot in 0..2 {
+            if let (Some(c), Some(p)) = (self.players[slot], sim.players[slot].as_mut()) {
+                c.apply(p);
+            }
+        }
+    }
 }
 
 pub struct Player {
@@ -337,6 +413,10 @@ pub struct Player {
     pub weapon_popup: u32,
     /// Low-shield warning already shown (pad7[1] latch).
     pub shield_warned: bool,
+    /// Took-damage latch (pad7[0]): set on any shield damage and after the
+    /// once-per-run no-damage defence bonus is awarded. Persists across
+    /// levels for the whole run.
+    pub damage_taken: bool,
     /// Age in ticks.
     pub age: u32,
     /// Entry animation progress (spawn entity index if any).
@@ -408,9 +488,6 @@ pub struct Sim {
     pub scroll_speed: f32,
     /// Level finished scrolling.
     pub level_complete: bool,
-    /// Sum of player purses captured when the level ended, before the
-    /// MoneyCounter tally drains them (for the "Coin Bonus" display).
-    pub level_end_money: i64,
     /// Debug counters (hits landed / entities destroyed).
     pub stat_hits: u64,
     pub stat_kills: u64,
@@ -442,15 +519,45 @@ pub struct Sim {
     /// `includeInGroundAccuracyCount` spawned / destroyed this level.
     pub accuracy_targets: u32,
     pub accuracy_destroyed: u32,
-    /// Latched when destroyed catches up to targets; consumed by the
+    /// Active accuracy reward this level (exe 0x4e4828 /
+    /// `CheckForRewardThisLevel`): armed at level start when the previous
+    /// level finished at 100% ground accuracy; consumed by the
     /// RandomBonus_6 (rb06) substitution in the bonus roll.
     pub accuracy_reward_pending: bool,
+    /// Pending accuracy reward for the NEXT level (exe 0x4e4827): set at
+    /// level end when accuracy hits 100%, transferred at next level start.
+    pub accuracy_reward_carry: bool,
+    /// Level-end bonus breakdown (sub_020930 + sub_020d90 port): the
+    /// accuracy-tier bonus awarded to both players ahead of the coin tally.
+    pub end_bonus_percent: i64,
+    /// tier(0xbd..0xc2) x levelNumber.
+    pub end_bonus_total: i64,
+    /// Remaining bonus score left to award (counts down during drain).
+    pub end_bonus_remaining: i64,
+    /// Fixed per-drain-tick award = max(total*pf(0xc8), pf(0xc7)).
+    pub end_bonus_step: i64,
+    /// sub_020d90 state machine phase (1..=10, 0 = not started/done).
+    pub end_seq_state: u8,
+    end_seq_t0: u32,
+    end_seq_drain_t: u32,
+    /// Perfect-campaign bonus tick counter (state 10).
+    end_seq_counter: u32,
+    /// Levels at 100% accuracy this run (exe 0x4e485e).
+    pub perfect_count: u32,
+    /// Levels started this run (exe 0x4e482a) — gates the final-level
+    /// banner delay together with level_number == 12.
+    pub levels_played: u32,
+    /// Whole level-end sequence finished (bonus drain + coin tallies) —
+    /// the flow layer advances to the next sector on this.
+    pub level_end_complete: bool,
 }
 
 #[derive(Clone, Debug)]
 pub enum SimEvent {
     /// Play a sound (ResId of `soun`).
     Sound(ResId),
+    /// Play a perm sound by gaso-list index (level-end sequence cues).
+    PermSound(u8),
     /// A player died / extra life / etc. (slot, kind).
     PlayerEvent(usize, &'static str),
     /// Level finished.
@@ -509,7 +616,6 @@ impl Sim {
             entity_scroll_pause: false,
             scroll_speed: 1.0,
             level_complete: false,
-            level_end_money: 0,
             stat_hits: 0,
             stat_kills: 0,
             stat_pickups: 0,
@@ -530,6 +636,18 @@ impl Sim {
             accuracy_targets: 0,
             accuracy_destroyed: 0,
             accuracy_reward_pending: false,
+            accuracy_reward_carry: false,
+            end_bonus_percent: 0,
+            end_bonus_total: 0,
+            end_bonus_remaining: 0,
+            end_bonus_step: 0,
+            end_seq_state: 0,
+            end_seq_t0: 0,
+            end_seq_drain_t: 0,
+            end_seq_counter: 0,
+            perfect_count: 0,
+            levels_played: 0,
+            level_end_complete: false,
         }
     }
 
@@ -586,6 +704,7 @@ impl Sim {
             glow_ticks: 0,
             weapon_popup: 0,
             shield_warned: false,
+            damage_taken: false,
             age: 0,
             entry_entity: usize::MAX,
             air_power: PowerupRt::default(),
@@ -1083,12 +1202,12 @@ impl Sim {
                 self.scroll_paused = true;
                 self.phase = Phase::LevelEnd;
                 self.events.push(SimEvent::LevelComplete);
-                // Level-cleared bonuses (G_Game/G_Player level-end path):
-                // defence bonus = levelNumber * DefenceBonusBaseAmount plus
-                // the defence-bonus object spawn, then the money counter
-                // tally converts each purse to score (BonusFactorPerCoinHeld
-                // * multiplier via Score_Adjust) and zeroes it.
-                let mut purse_total = 0i64;
+                // Level-cleared sequence (sub_020930 + G_Player level-end):
+                // players go invulnerable, the no-damage defence bonus
+                // (levelNumber * pf(0xb8)) is awarded once per run per player,
+                // the accuracy-tier bonus is computed for the breakdown
+                // display, and the end-sequence state machine starts. The
+                // per-player MoneyCounter coin tallies arm when it finishes.
                 for slot in 0..2 {
                     let info = self.players[slot].as_ref().and_then(|p| {
                         if p.phase == PlayerPhase::Dead {
@@ -1102,54 +1221,111 @@ impl Sim {
                             p.money,
                             Vec2::new(wx, wy),
                             slot as i32,
+                            p.damage_taken,
                         ))
                     });
-                    let Some((def_obj, money, wpos, spawner)) = info else { continue };
-                    purse_total += money;
-                    if def_obj != NONE_ID {
-                        self.request_spawn(SpawnReq {
-                            unit: def_obj,
-                            pos: wpos,
-                            heading: None,
-                            owner: usize::MAX,
-                            spawner_player: spawner,
-                            stationary: true,
-                            state: None,
-                        });
-                    }
-                    self.add_score(
-                        slot,
-                        self.level_number * pf(assets, 0xb8) as i64,
-                        false,
-                        assets,
-                    );
-                    // MoneyCounter_Start: stage the tally — the purse drains
-                    // gradually in step_money_tallies (phase 6) so score and
-                    // extra-life thresholds accrue over ~100+ ticks.
-                    if money > 0 {
+                    let Some((def_obj, money, wpos, spawner, took_damage)) = info else { continue };
+                    // pad7[0]: the defence/shield bonus fires only while the
+                    // player has taken no damage this run; awarding latches
+                    // the flag so it can happen at most once per run. The
+                    // whole award (spawn + score) requires the player def's
+                    // defence-bonus object (field0xce) to be defined.
+                    if !took_damage {
                         if let Some(p) = self.players[slot].as_mut() {
-                            let factor = if pf(assets, 0xaa) != 0.0 {
-                                pf(assets, 0xab) * self.level_number as f32
-                            } else {
-                                pf(assets, 0xab)
-                            };
-                            let remaining = (money as f32 * factor) as i64;
-                            let mut chunk = (remaining as f32 * pf(assets, 0xc8)) as i64;
-                            let cap = pf(assets, 0xc7) as i64;
-                            if cap < chunk {
-                                chunk = cap;
-                            }
-                            p.money_tally = MoneyTally {
-                                phase: 1,
-                                t0: self.game_time,
-                                drain_t: self.game_time,
-                                remaining,
-                                chunk: chunk.max(1),
-                            };
+                            p.damage_taken = true;
+                            p.invuln = u32::MAX;
+                        }
+                        if def_obj != NONE_ID {
+                            self.request_spawn(SpawnReq {
+                                unit: def_obj,
+                                pos: wpos,
+                                heading: None,
+                                owner: usize::MAX,
+                                spawner_player: spawner,
+                                stationary: true,
+                                state: None,
+                            });
+                            self.add_score(
+                                slot,
+                                self.level_number * pf(assets, 0xb8) as i64,
+                                false,
+                                assets,
+                            );
                         }
                     }
+                    // MoneyCounter_Start: stage the tally inactive — it arms
+                    // when the bonus-breakdown sequence completes so the
+                    // purse drains after the "Bonus:" display, like the
+                    // original ordering. Every in-game player gets a counter,
+                    // even with an empty purse.
+                    if let Some(p) = self.players[slot].as_mut() {
+                        let factor = if pf(assets, 0xaa) != 0.0 {
+                            pf(assets, 0xab) * self.level_number as f32
+                        } else {
+                            pf(assets, 0xab)
+                        };
+                        let remaining = (money as f32 * factor) as i64;
+                        // moneyCounter6 = max(remaining * pf(0xc8),
+                        // pf(0xc7)) — a floor, not a cap.
+                        let mut chunk = (remaining as f32 * pf(assets, 0xc8)) as i64;
+                        let floor = pf(assets, 0xc7) as i64;
+                        if floor > chunk {
+                            chunk = floor;
+                        }
+                        p.money_tally = MoneyTally {
+                            phase: 0,
+                            t0: self.game_time,
+                            drain_t: self.game_time,
+                            remaining,
+                            chunk: chunk.max(1),
+                            purse: money,
+                            staged: true,
+                        };
+                    }
                 }
-                self.level_end_money = purse_total;
+                // sub_020930: accuracy percent + tiered bonus.
+                let pct = if self.accuracy_targets > 0 {
+                    self.accuracy_destroyed as f32 / self.accuracy_targets as f32 * 100.0
+                } else {
+                    0.0
+                };
+                self.end_bonus_percent = pct as i64;
+                let cutoff = pf(assets, 0xbc) as f32;
+                let tier = if pct >= 100.0 {
+                    pf(assets, 0xbd)
+                } else if pct >= 100.0 - cutoff {
+                    pf(assets, 0xbe)
+                } else if pct >= 100.0 - 2.0 * cutoff {
+                    pf(assets, 0xbf)
+                } else if pct >= 100.0 - 3.0 * cutoff {
+                    pf(assets, 0xc0)
+                } else if pct >= 100.0 - 4.0 * cutoff {
+                    pf(assets, 0xc1)
+                } else {
+                    pf(assets, 0xc2)
+                };
+                let total = (tier as i64) * self.level_number;
+                self.end_bonus_total = total;
+                self.end_bonus_remaining = total;
+                self.end_bonus_step = if total > 0 {
+                    ((total as f32) * pf(assets, 0xc8)).max(pf(assets, 0xc7) as f32) as i64
+                } else {
+                    0
+                };
+                // 100% accuracy arms the RandomBonus_6 reward for the NEXT
+                // level (exe 0x4e4827 → 0x4e4828 at level start).
+                self.accuracy_reward_carry = pct >= 100.0;
+                // Remaining players go invulnerable for the sequence.
+                for p in self.players.iter_mut().flatten() {
+                    if p.phase != PlayerPhase::Dead {
+                        p.invuln = u32::MAX;
+                    }
+                }
+                self.end_seq_state = 1;
+                self.end_seq_t0 = self.game_time;
+                self.end_seq_drain_t = self.game_time;
+                self.end_seq_counter = 0;
+                self.level_end_complete = false;
             }
         }
 
@@ -1211,7 +1387,153 @@ impl Sim {
 
         // --- level-end money tallies (G_Player::MoneyCounter_Process) ---
         if self.phase == Phase::LevelEnd {
+            self.step_end_sequence(assets);
             self.step_money_tallies(assets);
+            // Whole sequence done: bonus breakdown finished and every
+            // MoneyCounter tally drained (phase 0 = done or never staged).
+            if self.end_seq_state == 0 && !self.level_end_complete {
+                let all_done = self
+                    .players
+                    .iter()
+                    .flatten()
+                    .all(|p| p.money_tally.phase == 0);
+                if all_done {
+                    self.level_end_complete = true;
+                }
+            }
+        }
+    }
+
+    /// sub_020d90 — the level-end bonus-breakdown state machine. Times the
+    /// "All Mission Targets Destroyed" → "Ground Accuracy" → "Bonus"
+    /// display, drains the accuracy-tier bonus to both players, then runs
+    /// the perfect-campaign bonus when every level hit 100% accuracy. On
+    /// completion it arms each player's MoneyCounter tally.
+    fn step_end_sequence(&mut self, assets: &GameAssets) {
+        if self.phase != Phase::LevelEnd || self.end_seq_state == 0 {
+            return;
+        }
+        let now = self.game_time;
+        let elapsed = now.saturating_sub(self.end_seq_t0) as i64;
+        match self.end_seq_state {
+            // Banner delay: pf(0xc3), or pf(0xc4) on the finale of a full
+            // 12-level run (exe flag: levelNumber==12 && levelsPlayed==12).
+            1 => {
+                let is_last = self.level_number == 12 && self.levels_played == 12;
+                let delay = if is_last {
+                    pf(assets, 0xc4)
+                } else {
+                    pf(assets, 0xc3)
+                };
+                if elapsed > delay as i64 {
+                    self.end_seq_state = 2;
+                    self.end_seq_t0 = now;
+                }
+            }
+            // Accuracy% → Bonus label → sound/perfect latch → Bonus value.
+            // Leaving states 2/3 plays perm sound 0x14; leaving state 4
+            // plays 0x16 (perfect), 0x15 (bonus pending) or 0x14 (none).
+            2 | 3 | 4 | 5 => {
+                if elapsed > pf(assets, 0xc5) as i64 {
+                    let leaving = self.end_seq_state;
+                    if leaving == 4 && self.end_bonus_percent == 100 {
+                        self.perfect_count += 1;
+                    }
+                    self.end_seq_state += 1;
+                    self.end_seq_t0 = now;
+                    let snd = match leaving {
+                        2 | 3 => Some(0x14),
+                        4 => {
+                            if self.end_bonus_percent == 100 {
+                                Some(0x16)
+                            } else if self.end_bonus_total != 0 {
+                                Some(0x15)
+                            } else {
+                                Some(0x14)
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(s) = snd {
+                        self.events.push(SimEvent::PermSound(s));
+                    }
+                }
+            }
+            // Bonus drain: every pf(0xc6) ticks award end_bonus_step to each
+            // active player until the total is paid out.
+            6 => {
+                if self.end_bonus_remaining <= 0 {
+                    self.end_seq_state = 7;
+                    self.end_seq_t0 = now;
+                    return;
+                }
+                if now.saturating_sub(self.end_seq_drain_t) > pf(assets, 0xc6) as u32 {
+                    self.end_seq_drain_t = now;
+                    self.end_bonus_remaining -= self.end_bonus_step;
+                    if self.end_bonus_remaining < 0 {
+                        self.end_bonus_remaining = 0;
+                    }
+                    for slot in 0..2 {
+                        self.add_score(slot, self.end_bonus_step, false, assets);
+                    }
+                    self.events.push(SimEvent::PermSound(0x14));
+                }
+            }
+            7 => {
+                if elapsed > pf(assets, 0xc9) as i64 {
+                    self.end_seq_state = 8;
+                    self.end_seq_t0 = now;
+                }
+            }
+            // Campaign check: G_Level_GetNumInLevelList() is always 12 —
+            // the perfect bonus only runs when perfectCount == 12 exactly.
+            8 => {
+                if elapsed > pf(assets, 0xca) as i64 {
+                    if self.perfect_count != 12 {
+                        self.end_seq_state = 0;
+                    } else {
+                        self.end_seq_state = 9;
+                        self.end_seq_t0 = now;
+                        self.end_seq_counter = 0;
+                        self.events.push(SimEvent::PermSound(0x17));
+                    }
+                }
+            }
+            // Perfect-campaign bonus: pf(0xcd) raw score to both players,
+            // pf(0xd0) times, alternating 9/10 waits.
+            9 => {
+                if elapsed > pf(assets, 0xce) as i64 {
+                    self.end_seq_state = 10;
+                    self.end_seq_t0 = now;
+                }
+            }
+            10 => {
+                if elapsed > pf(assets, 0xcf) as i64 {
+                    self.end_seq_counter += 1;
+                    self.end_seq_t0 = now;
+                    for slot in 0..2 {
+                        self.add_score(slot, pf(assets, 0xcd) as i64, true, assets);
+                    }
+                    if self.end_seq_counter < pf(assets, 0xd0) as u32 {
+                        self.end_seq_state = 9;
+                    } else {
+                        self.end_seq_state = 0;
+                    }
+                }
+            }
+            _ => self.end_seq_state = 0,
+        }
+        // Sequence finished: arm the staged MoneyCounter tallies (every
+        // in-game player got one at level end, purse or not).
+        if self.end_seq_state == 0 {
+            let now = self.game_time;
+            for p in self.players.iter_mut().flatten() {
+                if p.money_tally.phase == 0 && p.money_tally.staged {
+                    p.money_tally.phase = 1;
+                    p.money_tally.t0 = now;
+                    p.money_tally.drain_t = now;
+                }
+            }
         }
     }
 
@@ -1227,20 +1549,29 @@ impl Sim {
             let now = self.game_time;
             let elapsed = now.saturating_sub(tally.t0) as i64;
             match tally.phase {
-                // Staged waits: 1→2 (10), 2→3 (20), 3→4 (20), 4→5 (20),
-                // 5→6 (30), then phase 6 drains, 7→8 (30), 8→done (20).
+                // Staged waits: 1→2 (pf 0xac), 2→5 (pf 0xad each), then
+                // phase 6 drains, 7→8 (pf 0xae), 8→done (pf 0xaf). The
+                // original plays perm sound 0x14 on each transition, or
+                // 0x15/0x14 at the 4→5 reveal depending on the remainder.
                 1 | 2 | 3 | 4 | 5 => {
-                    let need = match tally.phase {
-                        1 => pf(assets, 0xac) as i64,
-                        5 => pf(assets, 0xae) as i64,
-                        _ => pf(assets, 0xad) as i64,
+                    let need = if tally.phase == 1 {
+                        pf(assets, 0xac) as i64
+                    } else {
+                        pf(assets, 0xad) as i64
                     };
                     if elapsed > need {
+                        let leaving = tally.phase;
                         tally.phase += 1;
                         tally.t0 = now;
                         if tally.phase == 6 {
                             tally.drain_t = now;
                         }
+                        let snd = if leaving == 4 {
+                            if tally.remaining <= 0 { 0x15 } else { 0x14 }
+                        } else {
+                            0x14
+                        };
+                        self.events.push(SimEvent::PermSound(snd));
                     }
                 }
                 6 => {
@@ -2755,16 +3086,11 @@ impl Sim {
             }
         }
 
-        // G_Game_GroundAccuracy_AddDestroyed + reward latch: once every
-        // spawned accuracy target is dead, the next bonus roll in the
-        // pf(0xd1) bucket can drop RandomBonus_6 instead of RandomBonus_1.
+        // G_Game_GroundAccuracy_AddDestroyed. The rb06 reward is NOT armed
+        // here: the original arms it at the NEXT level's start when this
+        // level ends at 100% (exe 0x4e4827 → 0x4e4828 transfer).
         if def.include_in_ground_accuracy {
             self.accuracy_destroyed += 1;
-            if self.accuracy_targets > 0
-                && self.accuracy_destroyed >= self.accuracy_targets
-            {
-                self.accuracy_reward_pending = true;
-            }
         }
 
         // Random bonus drop (G_Entity::Destroy tail): weighted roll over
@@ -2851,6 +3177,9 @@ impl Sim {
             let dmg = pdef.shield_base_hit_percentage as f64 * amount;
             p.shields -= dmg;
             if dmg > 0.0 {
+                // pad7[0]: any real shield damage latches the no-damage
+                // defence bonus off for the rest of the run.
+                p.damage_taken = true;
                 self.events.push(SimEvent::PlayerEvent(slot, "hit"));
             }
         }
