@@ -2158,7 +2158,7 @@ pub struct ShotConfig {
     pub frames: Vec<u32>,
     /// Retail film to replay.
     pub film: Option<ResId>,
-    /// Input script to replay; with neither the level runs with fire held.
+    /// Input script to replay; with neither the ship sits still tapping fire.
     pub script: Option<DemoRec>,
     /// Capture the title screen instead of gameplay.
     pub title: bool,
@@ -2228,11 +2228,13 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
             }
             (None, Some(rid)) => DemoRec::from_film(&assets.film(rid).expect("film not found")),
             (None, None) => {
+                // Tap fire: holding it charges the weapon until it overloads.
                 let fire = DemoRec::pack(&SlotInput { fire: true, ..default() });
+                let len = last + SHOT_EXIT_DELAY as usize + 60;
                 DemoRec {
                     level: Some(level_id),
                     seed: 0xC0FFEE,
-                    p1: vec![fire; last + SHOT_EXIT_DELAY as usize + 60],
+                    p1: (0..len).map(|f| if f % 12 < 4 { fire } else { 0 }).collect(),
                     p2: Vec::new(),
                 }
             }
