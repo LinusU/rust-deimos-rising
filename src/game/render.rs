@@ -19,15 +19,16 @@ use std::collections::HashMap;
 pub struct TextureBook {
     /// (sprite rid, frame index) → image handle.
     frames: HashMap<(ResId, i64), Handle<Image>>,
-    /// (sprite rid, frame index, blend amount, flat) → image with the
+    /// (sprite rid, frame index, blend amount, blit) → image with the
     /// blend baked into its alpha (see `frame_image_blend`).
-    blends: HashMap<(ResId, i64, u32, bool), Handle<Image>>,
+    blends: HashMap<(ResId, i64, u32, Blit), Handle<Image>>,
     /// im16 rid → handle.
     images16: HashMap<ResId, Handle<Image>>,
 }
 
 /// Marks a Bevy sprite as one drawn part of a sim entity (keyed by
-/// unique_num): the base sprite, its tint overlay or its glow overlay.
+/// unique_num): the base sprite, its tint overlay, its glow overlay or
+/// its shadow.
 #[derive(Component)]
 pub struct SimSprite {
     pub key: u32,
@@ -38,10 +39,11 @@ pub struct SimSprite {
 #[derive(Component)]
 pub struct TerrainSprite;
 
-/// Marks a player ship sprite.
+/// Marks a player ship sprite, or its shadow.
 #[derive(Component)]
 pub struct PlayerSprite {
     pub slot: usize,
+    pub shadow: bool,
 }
 
 /// The running game sim.
@@ -974,11 +976,20 @@ fn frame_image(
     Some(handle)
 }
 
-/// Sprite frame as the original's translucent and colourised blits draw it
-/// (`U_SpriteBlit_DrawTranslucent` / `DrawColorised`): `blend` (0..=32) is
-/// added to each pixel's own transparency level, and anything reaching 32
-/// vanishes. `flat` replaces the colour with white so `Sprite::color` can
-/// supply the colourise tint.
+/// Which of the original's sprite blits a baked texture stands in for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Blit {
+    /// `DrawNormal` / `DrawTranslucent`: the sprite's own colours.
+    Sprite,
+    /// `DrawColorised`: white, for `Sprite::color` to supply the tint.
+    Flat,
+    /// `DrawShadow`: black.
+    Shadow,
+}
+
+/// Sprite frame as the original's translucent, colourised and shadow blits
+/// draw it: `blend` (0..=32) is added to each pixel's own transparency
+/// level, and anything reaching 32 vanishes.
 fn frame_image_blend(
     assets: &mut GameAssets,
     images: &mut Assets<Image>,
@@ -986,12 +997,12 @@ fn frame_image_blend(
     rid: ResId,
     frame: i64,
     blend: u32,
-    flat: bool,
+    blit: Blit,
 ) -> Option<Handle<Image>> {
-    if blend == 0 && !flat {
+    if blend == 0 && blit == Blit::Sprite {
         return frame_image(assets, images, book, rid, frame);
     }
-    let key = (rid, frame, blend, flat);
+    let key = (rid, frame, blend, blit);
     if let Some(h) = book.blends.get(&key) {
         return Some(h.clone());
     }
@@ -1002,17 +1013,66 @@ fn frame_image_blend(
         // Alpha was stored as (32 - level) * 255 / 32; recover the level.
         let level = 32 - (px[3] as u32 * 32 + 127) / 255;
         let weight = if level >= 32 { 32 } else { (level + blend).min(32) };
-        px[3] = ((32 - weight) * 255 / 32) as u8;
-        if flat {
-            px[0] = 255;
-            px[1] = 255;
-            px[2] = 255;
+        let opacity = (32 - weight) as f32 / 32.0;
+        match blit {
+            Blit::Sprite => {}
+            Blit::Flat => px[..3].fill(255),
+            Blit::Shadow => px[..3].fill(0),
         }
+        px[3] = if blit == Blit::Shadow {
+            // The original darkens the stored (gamma-encoded) pixel values;
+            // the GPU blends in linear light. For black the two agree when
+            // the opacity is raised to match: 1 - (1 - a)^2.2.
+            ((1.0 - (1.0 - opacity).powf(2.2)) * 255.0).round() as u8
+        } else {
+            (opacity * 255.0) as u8
+        };
     }
     let handle = images.add(rgba_image(f.width, f.height, &rgba));
     book.blends.insert(key, handle.clone());
     Some(handle)
 }
+
+/// A shadow as `G_GameObject::Priv_DrawShadow` (VA 0x424c40) draws it.
+struct Shadow {
+    /// Render layer: 6 for airborne objects, 4 or 2 for ground ones.
+    layer: u32,
+    /// Offset from the object, in screen pixels (+y down).
+    offset: Vec2,
+    /// Scale relative to the object: airborne shadows are half size.
+    scale: f32,
+}
+
+fn shadow_for(assets: &GameAssets, layer_id: ResId, air: bool, obj_scale: f32) -> Shadow {
+    use crate::game::sim::pf;
+    let airborne = match &layer_id.to_le_bytes() {
+        b"grhi" | b"grou" => false,
+        b"hud " | b"plwe" | b"plef" | b"plsh" | b"aihi" | b"plui" | b"ailo" | b"atmo"
+        | b"play" => true,
+        _ => air,
+    };
+    if airborne {
+        // Shadow_XOffset/YOffset (pf 0x30/0x31) at the fixed 0.5 factor.
+        Shadow {
+            layer: 6,
+            offset: Vec2::new((pf(assets, 0x30) * 0.5).round(), (pf(assets, 0x31) * 0.5).round()),
+            scale: 0.5,
+        }
+    } else {
+        // Shadow_GroundXOffset/YOffset (pf 0x32/0x33) times the object's scale.
+        Shadow {
+            layer: if &layer_id.to_le_bytes() == b"grhi" { 4 } else { 2 },
+            offset: Vec2::new(
+                (pf(assets, 0x32) * obj_scale).round(),
+                (pf(assets, 0x33) * obj_scale).round(),
+            ),
+            scale: 1.0,
+        }
+    }
+}
+
+/// Blend amount of a shadow: 20 of 32, or more for a faded object.
+const SHADOW_BLEND: u32 = 20;
 
 /// `U_Pixel16_ConvertVisibilityPercentToBlendAmount`: 100% → 0, 0% → 32.
 fn visibility_blend(vis: f32) -> u32 {
@@ -1141,9 +1201,26 @@ pub fn sync_entities(
             // same frame: the base (hidden by stateDoColorise), a flat
             // overlay in the state's tint colour, then the glow overlay.
             let vis_blend = visibility_blend(e.vis);
-            let mut parts: Vec<(u8, u32, bool, Color)> = Vec::new();
+            // castsShadows: the sprite's shape in black on a shadow layer.
+            if !terrain && udef.map(|d| d.casts_shadows).unwrap_or(false) {
+                let d = udef.unwrap();
+                let sh = shadow_for(&assets, d.draw_layer, !d.is_ground_based, e.scale);
+                if let Some(handle) = frame_image_blend(
+                    &mut *assets, &mut *images, &mut *book, rid, frame,
+                    vis_blend.max(SHADOW_BLEND), Blit::Shadow,
+                ) {
+                    draws.push(Draw {
+                        key: (e.unique_num, 3),
+                        handle,
+                        pos: to_world_z(sp.x + sh.offset.x, sp.y + sh.offset.y, layer_z(sh.layer) + order),
+                        scale: e.scale * sh.scale,
+                        color: Color::WHITE,
+                    });
+                }
+            }
+            let mut parts: Vec<(u8, u32, Blit, Color)> = Vec::new();
             if !colorise {
-                parts.push((0, vis_blend, false, Color::WHITE));
+                parts.push((0, vis_blend, Blit::Sprite, Color::WHITE));
             }
             if e.tint > 0.0 {
                 let t = (e.tint / 100.0) * 32.0 * (1.0 - vis_blend as f32 / 32.0);
@@ -1153,18 +1230,18 @@ pub fn sync_entities(
                     (tint_color >> 8) as u8,
                     tint_color as u8,
                 );
-                parts.push((1, blend, true, c));
+                parts.push((1, blend, Blit::Flat, c));
             }
             if e.glow.active {
                 // Hit glows are white (Glow_Start is passed 0x7fff).
-                parts.push((2, (e.glow.timer.clamp(0, 32)) as u32, true, Color::WHITE));
+                parts.push((2, (e.glow.timer.clamp(0, 32)) as u32, Blit::Flat, Color::WHITE));
             }
-            for (part, blend, flat, color) in parts {
+            for (part, blend, blit, color) in parts {
                 if blend >= 32 {
                     continue;
                 }
                 let Some(handle) = frame_image_blend(
-                    &mut *assets, &mut *images, &mut *book, rid, frame, blend, flat,
+                    &mut *assets, &mut *images, &mut *book, rid, frame, blend, blit,
                 ) else {
                     continue;
                 };
@@ -1327,59 +1404,75 @@ pub fn sync_players(
     mut q: Query<(Entity, &PlayerSprite, &mut Sprite, &mut Transform)>,
 ) {
     let sim = &sim_res.0;
-    let mut seen = [false; 2];
+    // (slot, is shadow) → image, position, scale, colour.
+    let mut draws: Vec<((usize, bool), Handle<Image>, Vec3, f32, Color)> = Vec::new();
     if flow.state == FlowState::Playing {
-    for slot in 0..2 {
-        let p = match sim.players[slot].as_ref() {
-            Some(p) if p.phase != PlayerPhase::Dead => p,
-            _ => continue,
-        };
-        seen[slot] = true;
-        // Ship sprite = current air weapon's appearance face for this player.
-        let wdef = assets.weapons.get(&p.air_weapon);
-        let face = wdef.map(|w| {
-            if slot == 0 { w.player1_appearance_face } else { w.player2_appearance_face }
-        }).unwrap_or_else(|| crate::pak::id("pl1o"));
-        let frame_idx = p.tilt_frame as i64;
-        let Some(handle) = frame_image(&mut *assets, &mut *images, &mut *book, face, frame_idx) else {
-            continue;
-        };
-        let wpos = to_world_z(p.screen.x, p.screen.y, layer_z(10) + slot as f32);
-        // Blink while invulnerable.
-        let blink = p.invuln > 0 && (sim.game_time / 4) % 2 == 0;
-        let mut found = None;
-        for (bevy_e, ps, sprite, transform) in q.iter_mut() {
-            if ps.slot == slot {
-                found = Some((bevy_e, sprite, transform));
-                break;
+        for slot in 0..2 {
+            let p = match sim.players[slot].as_ref() {
+                Some(p) if p.phase != PlayerPhase::Dead => p,
+                _ => continue,
+            };
+            // Ship sprite = current air weapon's appearance face for this player.
+            let wdef = assets.weapons.get(&p.air_weapon);
+            let face = wdef.map(|w| {
+                if slot == 0 { w.player1_appearance_face } else { w.player2_appearance_face }
+            }).unwrap_or_else(|| crate::pak::id("pl1o"));
+            let frame_idx = p.tilt_frame as i64;
+            // The ship is on the "play" layer, so its shadow is an airborne one.
+            let sh = shadow_for(&assets, crate::pak::id("play"), true, 1.0);
+            if let Some(handle) = frame_image_blend(
+                &mut *assets, &mut *images, &mut *book, face, frame_idx, SHADOW_BLEND, Blit::Shadow,
+            ) {
+                let pos = to_world_z(
+                    p.screen.x + sh.offset.x,
+                    p.screen.y + sh.offset.y,
+                    layer_z(sh.layer) + 4.5 + slot as f32 * 0.1,
+                );
+                draws.push(((slot, true), handle, pos, sh.scale, Color::WHITE));
             }
-        }
-        if let Some((_, mut sprite, mut transform)) = found {
-            sprite.image = handle;
-            transform.translation = wpos;
-            // Pickup glow flash (G_Player::Glow_Start) — brief overbright
-            // tint while glow_ticks counts down; invuln blink takes priority.
-            sprite.color = if blink {
+            let Some(handle) = frame_image(&mut *assets, &mut *images, &mut *book, face, frame_idx) else {
+                continue;
+            };
+            let wpos = to_world_z(p.screen.x, p.screen.y, layer_z(10) + slot as f32);
+            // Blink while invulnerable. Pickup glow flash
+            // (G_Player::Glow_Start) is a brief overbright tint while
+            // glow_ticks counts down; the blink takes priority.
+            let blink = p.invuln > 0 && (sim.game_time / 4) % 2 == 0;
+            let color = if blink {
                 Color::srgba(1.0, 1.0, 1.0, 0.4)
             } else if p.glow_ticks > 0 {
                 Color::srgba(2.5, 2.5, 2.5, 1.0)
             } else {
                 Color::WHITE
             };
-        } else {
-            commands.spawn((
-                Sprite::from_image(handle),
-                Transform::from_translation(wpos),
-                PlayerSprite { slot },
-            ));
+            draws.push(((slot, false), handle, wpos, 1.0, color));
         }
     }
+    let mut existing: HashMap<(usize, bool), Entity> =
+        q.iter().map(|(be, ps, _, _)| ((ps.slot, ps.shadow), be)).collect();
+    for (key, handle, pos, scale, color) in draws {
+        let scl = Vec3::splat(scale);
+        match existing.remove(&key).and_then(|be| q.get_mut(be).ok()) {
+            Some((_, _, mut sprite, mut transform)) => {
+                sprite.image = handle;
+                sprite.color = color;
+                transform.translation = pos;
+                transform.scale = scl;
+            }
+            None => {
+                let mut sprite = Sprite::from_image(handle);
+                sprite.color = color;
+                commands.spawn((
+                    sprite,
+                    Transform::from_translation(pos).with_scale(scl),
+                    PlayerSprite { slot: key.0, shadow: key.1 },
+                ));
+            }
+        }
     }
     // Despawn dead/absent players.
-    for (bevy_e, ps, _, _) in q.iter() {
-        if !seen[ps.slot] {
-            commands.entity(bevy_e).despawn();
-        }
+    for (_, be) in existing {
+        commands.entity(be).despawn();
     }
 }
 
