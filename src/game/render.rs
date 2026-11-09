@@ -1483,29 +1483,23 @@ use crate::game::sim::{PlayerInput, SlotInput};
 use bevy::window::{Window, WindowPlugin, WindowResolution};
 
 /// Build the input state from keyboard state.
-fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut fi: ResMut<FrameInput>) {
-    // The exe's built-in defaults (key-code table written at VA 0x408f12):
-    // P1 = Arrows, LCtrl fire air, LAlt fire ground, LShift select weapon;
-    // P2 = Numpad 8/4/6/5, End fire air, Delete fire ground, PageDown select.
-    // Space also fires P1's air weapon: Ctrl+Arrow is taken by macOS.
-    fi.p1 = SlotInput {
-        up: keys.pressed(KeyCode::ArrowUp),
-        down: keys.pressed(KeyCode::ArrowDown),
-        left: keys.pressed(KeyCode::ArrowLeft),
-        right: keys.pressed(KeyCode::ArrowRight),
-        fire: keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::Space),
-        bomb: keys.pressed(KeyCode::AltLeft),
-        cycle: keys.just_pressed(KeyCode::ShiftLeft),
+fn gather_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    bindings: Res<crate::game::input::KeyBindings>,
+    mut fi: ResMut<FrameInput>,
+) {
+    use crate::game::input::{BOMB, CYCLE, DOWN, FIRE, LEFT, RIGHT, UP};
+    let slot = |k: &[KeyCode; 7]| SlotInput {
+        up: keys.pressed(k[UP]),
+        down: keys.pressed(k[DOWN]),
+        left: keys.pressed(k[LEFT]),
+        right: keys.pressed(k[RIGHT]),
+        fire: keys.pressed(k[FIRE]),
+        bomb: keys.pressed(k[BOMB]),
+        cycle: keys.just_pressed(k[CYCLE]),
     };
-    fi.p2 = SlotInput {
-        up: keys.pressed(KeyCode::Numpad8),
-        down: keys.pressed(KeyCode::Numpad5),
-        left: keys.pressed(KeyCode::Numpad4),
-        right: keys.pressed(KeyCode::Numpad6),
-        fire: keys.pressed(KeyCode::End),
-        bomb: keys.pressed(KeyCode::Delete),
-        cycle: keys.just_pressed(KeyCode::PageDown),
-    };
+    fi.p1 = slot(&bindings.keys[0]);
+    fi.p2 = slot(&bindings.keys[1]);
 }
 
 fn sim_system(
@@ -2324,6 +2318,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
             levels_played: 0,
         })
         .insert_resource(HighScores::load())
+        .insert_resource(crate::game::input::KeyBindings::load())
         .insert_resource(demo)
         .insert_resource(ScoreBars::default())
         .insert_resource(Particles::default())
