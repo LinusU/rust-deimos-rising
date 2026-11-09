@@ -19,14 +19,19 @@ use std::collections::HashMap;
 pub struct TextureBook {
     /// (sprite rid, frame index) → image handle.
     frames: HashMap<(ResId, i64), Handle<Image>>,
+    /// (sprite rid, frame index, blend amount, flat) → image with the
+    /// blend baked into its alpha (see `frame_image_blend`).
+    blends: HashMap<(ResId, i64, u32, bool), Handle<Image>>,
     /// im16 rid → handle.
     images16: HashMap<ResId, Handle<Image>>,
 }
 
-/// Marks a Bevy entity as representing a sim entity (keyed by unique_num).
+/// Marks a Bevy sprite as one drawn part of a sim entity (keyed by
+/// unique_num): the base sprite, its tint overlay or its glow overlay.
 #[derive(Component)]
 pub struct SimSprite {
     pub key: u32,
+    pub part: u8,
 }
 
 /// Marks the terrain background sprite.
@@ -917,6 +922,51 @@ fn frame_image(
     Some(handle)
 }
 
+/// Sprite frame as the original's translucent and colourised blits draw it
+/// (`U_SpriteBlit_DrawTranslucent` / `DrawColorised`): `blend` (0..=32) is
+/// added to each pixel's own transparency level, and anything reaching 32
+/// vanishes. `flat` replaces the colour with white so `Sprite::color` can
+/// supply the colourise tint.
+fn frame_image_blend(
+    assets: &mut GameAssets,
+    images: &mut Assets<Image>,
+    book: &mut TextureBook,
+    rid: ResId,
+    frame: i64,
+    blend: u32,
+    flat: bool,
+) -> Option<Handle<Image>> {
+    if blend == 0 && !flat {
+        return frame_image(assets, images, book, rid, frame);
+    }
+    let key = (rid, frame, blend, flat);
+    if let Some(h) = book.blends.get(&key) {
+        return Some(h.clone());
+    }
+    let sprite = assets.sprite(rid)?;
+    let f = sprite.frames.get(frame.max(0) as usize).or_else(|| sprite.frames.first())?;
+    let mut rgba = f.rgba.clone();
+    for px in rgba.chunks_exact_mut(4) {
+        // Alpha was stored as (32 - level) * 255 / 32; recover the level.
+        let level = 32 - (px[3] as u32 * 32 + 127) / 255;
+        let weight = if level >= 32 { 32 } else { (level + blend).min(32) };
+        px[3] = ((32 - weight) * 255 / 32) as u8;
+        if flat {
+            px[0] = 255;
+            px[1] = 255;
+            px[2] = 255;
+        }
+    }
+    let handle = images.add(rgba_image(f.width, f.height, &rgba));
+    book.blends.insert(key, handle.clone());
+    Some(handle)
+}
+
+/// `U_Pixel16_ConvertVisibilityPercentToBlendAmount`: 100% → 0, 0% → 32.
+fn visibility_blend(vis: f32) -> u32 {
+    ((vis / 100.0 * 32.0 - 32.0).abs() as u32).min(32)
+}
+
 fn image16_handle(
     assets: &mut GameAssets,
     images: &mut Assets<Image>,
@@ -998,120 +1048,110 @@ pub fn sync_entities(
 ) {
     let sim = &sim_res.0;
 
-    // Desired set: unique_num -> (sprite rid, frame, screen pos, fx).
-    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32, f32, f32, f32, u32, bool, u32)> = HashMap::new();
+    // One entry per sprite to draw: (key, part) → image, position, tint.
+    struct Draw {
+        key: (u32, u8),
+        handle: Handle<Image>,
+        pos: Vec3,
+        scale: f32,
+        color: Color,
+    }
+    let mut draws: Vec<Draw> = Vec::new();
     if flow.state == FlowState::Playing {
         for e in &sim.entities {
-        if e.dead || e.activate_in > 0 || e.vis <= 0.0 {
-            continue;
-        }
-        let (rid, frame) = entity_sprite(&*assets, e);
-        let sp = e.screen_pos(sim);
-        let udef = assets.units.get(&e.unit);
-        let state_idx = e.state.min(
-            udef.map(|d| d.states.len().saturating_sub(1))
-                .unwrap_or(0),
-        );
-        let state_def = udef.and_then(|d| d.states.get(state_idx));
-        let tint_color = state_def.map(|s| s.tint_color).unwrap_or(0);
-        let terrain = state_def.map(|s| s.draw_to_terrain).unwrap_or(false);
-        let layer = udef
-            .map(|d| draw_layer(d.draw_layer, !d.is_ground_based))
-            .unwrap_or(7);
-        // stateDoColorise: the base sprite is never drawn — the entity is
-        // only visible through its glow/hit-flash overlay.
-        if state_def.map(|s| s.do_colorise).unwrap_or(false) && !e.glow.active {
-            continue;
-        }
-        desired.insert(
-            e.unique_num,
-            (
-                rid,
-                frame,
-                sp,
-                if e.glow.active { e.glow.timer as f32 / 32.0 } else { 0.0 },
-                e.vis,
-                e.tint,
-                e.scale,
-                tint_color,
-                terrain,
-                layer,
-            ),
-        );
-        }
-    }
+            if e.dead || e.activate_in > 0 || e.vis <= 0.0 {
+                continue;
+            }
+            let (rid, frame) = entity_sprite(&*assets, e);
+            let sp = e.screen_pos(sim);
+            let udef = assets.units.get(&e.unit);
+            let state_idx = e.state.min(
+                udef.map(|d| d.states.len().saturating_sub(1))
+                    .unwrap_or(0),
+            );
+            let state_def = udef.and_then(|d| d.states.get(state_idx));
+            let tint_color = state_def.map(|s| s.tint_color).unwrap_or(0);
+            let terrain = state_def.map(|s| s.draw_to_terrain).unwrap_or(false);
+            let colorise = state_def.map(|s| s.do_colorise).unwrap_or(false);
+            let layer = udef
+                .map(|d| draw_layer(d.draw_layer, !d.is_ground_based))
+                .unwrap_or(7);
+            // Within a layer, later-spawned entities draw on top.
+            let order = (e.unique_num % 4096) as f32 / 4096.0 * 4.0;
+            let z = if terrain {
+                // stateDrawToTerrain: painted onto the background.
+                Z_TERRAIN_PASS + order
+            } else {
+                layer_z(layer) + order
+            };
 
-    // Despawn removed.
-    let mut alive_keys = Vec::new();
-    for (bevy_e, ss, _, _) in q.iter() {
-        if desired.contains_key(&ss.key) {
-            alive_keys.push(ss.key);
-        } else {
-            commands.entity(bevy_e).despawn();
-        }
-    }
-
-    // Spawn/update.
-    for (key, (rid, frame, sp, flash, vis, tint, scale, tint_color, terrain, layer)) in &desired {
-        let handle = match frame_image(&mut *assets, &mut *images, &mut *book, *rid, *frame) {
-            Some(h) => h,
-            None => continue,
-        };
-        // Find existing bevy entity for this key.
-        let mut found = None;
-        for (bevy_e, ss, sprite, transform) in q.iter_mut() {
-            if ss.key == *key {
-                found = Some((bevy_e, sprite, transform));
-                break;
+            // G_GameObject::Priv_Draw draws up to three sprites with the
+            // same frame: the base (hidden by stateDoColorise), a flat
+            // overlay in the state's tint colour, then the glow overlay.
+            let vis_blend = visibility_blend(e.vis);
+            let mut parts: Vec<(u8, u32, bool, Color)> = Vec::new();
+            if !colorise {
+                parts.push((0, vis_blend, false, Color::WHITE));
+            }
+            if e.tint > 0.0 {
+                let t = (e.tint / 100.0) * 32.0 * (1.0 - vis_blend as f32 / 32.0);
+                let blend = ((t - 32.0).abs() as u32).min(32);
+                let c = Color::srgb_u8(
+                    (tint_color >> 16) as u8,
+                    (tint_color >> 8) as u8,
+                    tint_color as u8,
+                );
+                parts.push((1, blend, true, c));
+            }
+            if e.glow.active {
+                // Hit glows are white (Glow_Start is passed 0x7fff).
+                parts.push((2, (e.glow.timer.clamp(0, 32)) as u32, true, Color::WHITE));
+            }
+            for (part, blend, flat, color) in parts {
+                if blend >= 32 {
+                    continue;
+                }
+                let Some(handle) = frame_image_blend(
+                    &mut *assets, &mut *images, &mut *book, rid, frame, blend, flat,
+                ) else {
+                    continue;
+                };
+                draws.push(Draw {
+                    key: (e.unique_num, part),
+                    handle,
+                    pos: to_world_z(sp.x, sp.y, z + part as f32 * 0.0003),
+                    scale: e.scale,
+                    color,
+                });
             }
         }
-        // Within a layer, later-spawned entities draw on top.
-        let order = (*key % 4096) as f32 / 4096.0 * 4.0;
-        let z = if *terrain {
-            // stateDrawToTerrain: painted onto the background.
-            Z_TERRAIN_PASS + order
-        } else {
-            layer_z(*layer) + order
-        };
-        let wpos = to_world_z(sp.x, sp.y, z);
-        // Visibility fade → alpha; tint% blends toward tint_color.
-        let alpha = (*vis / 100.0).clamp(0.0, 1.0);
-        let t = (*tint / 100.0).clamp(0.0, 1.0);
-        let (tr, tg, tb) = if *tint_color != 0 {
-            (
-                (((*tint_color >> 16) & 0xff) as f32) / 255.0,
-                (((*tint_color >> 8) & 0xff) as f32) / 255.0,
-                ((*tint_color & 0xff) as f32) / 255.0,
-            )
-        } else {
-            (1.0, 1.0, 1.0)
-        };
-        let mut col = Color::srgba(
-            1.0 + (tr - 1.0) * t,
-            1.0 + (tg - 1.0) * t,
-            1.0 + (tb - 1.0) * t,
-            alpha,
-        );
-        if *flash > 0.0 {
-            // Glow pulse: brightness 1.125..2.0 following the sawtooth.
-            let b = 1.0 + flash;
-            col = Color::srgba(b, b, b, alpha);
+    }
+
+    // Reconcile with the existing sprites.
+    let mut existing: HashMap<(u32, u8), Entity> =
+        q.iter().map(|(be, ss, _, _)| ((ss.key, ss.part), be)).collect();
+    for d in draws {
+        let scl = Vec3::splat(d.scale);
+        match existing.remove(&d.key).and_then(|be| q.get_mut(be).ok()) {
+            Some((_, _, mut sprite, mut transform)) => {
+                sprite.image = d.handle;
+                sprite.color = d.color;
+                transform.translation = d.pos;
+                transform.scale = scl;
+            }
+            None => {
+                let mut sprite = Sprite::from_image(d.handle);
+                sprite.color = d.color;
+                commands.spawn((
+                    sprite,
+                    Transform::from_translation(d.pos).with_scale(scl),
+                    SimSprite { key: d.key.0, part: d.key.1 },
+                ));
+            }
         }
-        let scl = Vec3::splat(*scale);
-        if let Some((_, mut sprite, mut transform)) = found {
-            sprite.image = handle;
-            transform.translation = wpos;
-            transform.scale = scl;
-            sprite.color = col;
-        } else {
-            let mut sprite = Sprite::from_image(handle);
-            sprite.color = col;
-            commands.spawn((
-                sprite,
-                Transform::from_translation(wpos).with_scale(scl),
-                SimSprite { key: *key },
-            ));
-        }
+    }
+    for (_, be) in existing {
+        commands.entity(be).despawn();
     }
 }
 
