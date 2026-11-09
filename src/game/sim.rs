@@ -2861,14 +2861,9 @@ impl Sim {
                 if self.game_time > self.entities[i].blur_last + interval {
                     let (unit, state_i, frame, sx, sy, scale) = {
                         let e = &self.entities[i];
-                        (
-                            e.unit,
-                            e.state,
-                            e.frame,
-                            e.pos.x - self.cam_x + WORLD_TO_SCREEN_X,
-                            self.scroll + SCREEN_H - e.pos.y,
-                            e.scale,
-                        )
+                        // Where the entity is drawn, screen-locked or not.
+                        let sp = e.screen_pos(self);
+                        (e.unit, e.state, e.frame, sp.x, sp.y, e.scale)
                     };
                     self.events.push(SimEvent::MotionBlur {
                         unit,
