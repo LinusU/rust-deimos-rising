@@ -945,6 +945,22 @@ fn test_defs() {
     let ncoin = a.units.values().filter(|u| u.destruct_coin != pak::NONE_ID).count();
     let ngoins = a.units.values().filter(|u| u.destruct_coin_on_group_kill != pak::NONE_ID).count();
     println!("destructCoin units={} groupKillCoin={}", ncoin, ngoins);
+    // Owner-cascade census: destructDestroy/DeleteChildren on defs plus
+    // the per-state canBe*OnOwner* flags that gate which children join.
+    let (mut nddc, mut nddel, mut nst_destroy, mut nst_delete) = (0, 0, 0, 0);
+    for u in a.units.values() {
+        if u.destruct_destroy_children { nddc += 1; }
+        if u.destruct_delete_children { nddel += 1; }
+        for s in &u.states {
+            if s.destroy_on_owner_destruction { nst_destroy += 1; }
+            if s.delete_on_owner_deletion { nst_delete += 1; }
+        }
+    }
+    println!("cascade: destructDestroyChildren={} destructDeleteChildren={} stateCanDestroy={} stateCanDelete={}",
+        nddc, nddel, nst_destroy, nst_delete);
+    for (rid,u) in a.units.iter().filter(|(_,u)| u.destruct_destroy_children || u.destruct_delete_children).take(10) {
+        println!("  CASC {:08x} {} ddc={} ddel={}", rid, u.name, u.destruct_destroy_children, u.destruct_delete_children);
+    }
     for (rid,u) in a.units.iter().filter(|(_,u)| u.destruct_coin != pak::NONE_ID).take(4) {
         println!("  COIN {:08x} {} coin={:08x} n={} gid-kill={:08x}", rid, u.name, u.destruct_coin, u.destruct_num_coins, u.destruct_coin_on_group_kill);
     }
