@@ -2472,6 +2472,13 @@ impl Sim {
         // full update this tick — required for one-shot spawn-then-delete
         // states (rb## bonus pods) whose on_timer would otherwise fire
         // before their spawn-set volley runs.
+        //
+        // KNOWN DIVERGENCE (film/RNG parity): retail iterates
+        // g_entityGroupList outer / m_childList inner — entities process
+        // GROUP-BY-GROUP, not in flat spawn order. This Vec processes in
+        // index order, so interleaved spawns across groups reorder rand()
+        // draws and desync the stream from retail's. Mechanics are faithful;
+        // only deterministic replay ordering differs.
         let mut start = 0usize;
         loop {
             let end = self.entities.len();
