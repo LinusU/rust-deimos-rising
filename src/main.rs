@@ -230,6 +230,11 @@ fn film_test() {
         let map = [2usize, 3, 0, 1, 5, 4, 6];
         let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64).expect("level");
         let n = film.frames[0].min(20000);
+        let ent_at = args
+            .iter()
+            .position(|x| x == "--entities-at")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.parse::<usize>().ok());
         let mut fire_frames = 0u32;
         let mut bomb_frames = 0u32;
         for t in 0..n {
@@ -264,6 +269,29 @@ fn film_test() {
                         sim.players[0].as_ref().unwrap().screen.x,
                         sim.players[0].as_ref().unwrap().screen.y,
                         near.join(" "));
+                }
+            }
+            // --entities-at <tick>: list the live on-screen entities.
+            if ent_at == Some(t) {
+                for e in sim.entities.iter().filter(|e| !e.dead) {
+                    let sp = e.screen_pos(&sim);
+                    if sp.y < -50.0 || sp.y > 530.0 {
+                        continue;
+                    }
+                    let d = a.units.get(&e.unit);
+                    let st = d.and_then(|d| d.states.get(e.state));
+                    println!(
+                        "ENT #{} {} '{}' scr=({:.0},{:.0}) owner={} state={}:{} face={} frame={} dir={} hdg={:.0} vis={} scale={:.2} layer={} ground={}",
+                        e.unique_num,
+                        game::sim::rid_str(e.unit),
+                        d.map(|d| d.name.as_str()).unwrap_or("?"),
+                        sp.x, sp.y, e.owner, e.state,
+                        st.map(|s| s.name.as_str()).unwrap_or("?"),
+                        st.map(|s| game::sim::rid_str(s.sprite_face)).unwrap_or_default(),
+                        e.frame, e.dir_index, e.heading, e.vis, e.scale,
+                        d.map(|d| game::sim::rid_str(d.draw_layer)).unwrap_or_default(),
+                        d.map(|d| d.is_ground_based).unwrap_or(false),
+                    );
                 }
             }
             if t % 600 == 599 {
