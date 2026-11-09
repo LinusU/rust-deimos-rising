@@ -581,9 +581,6 @@ pub struct Sim {
     next_group_id: u32,
     limit_message_shown: bool,
     pub rng: Crand,
-    spawn_queue: Vec<SpawnReq>,
-    /// Parallel to spawn_queue: pinned screen pos for UI entities.
-    spawn_locks: Vec<Option<Vec2>>,
     /// Level-start notice banner deferred until the initial level objects
     /// have been queued, matching sub_41fc80's order (G_Bgnd_
     /// DoInitialMapSpawns runs before the Notice_Level_XX RequestSpawn).
@@ -730,8 +727,6 @@ impl Sim {
             next_group_id: 1,
             limit_message_shown: false,
             rng: Crand::new(seed as u32),
-            spawn_queue: Vec::new(),
-            spawn_locks: Vec::new(),
             events: Vec::new(),
             debris: Vec::new(),
             accuracy_targets: 0,
@@ -751,13 +746,6 @@ impl Sim {
             level_end_complete: false,
             pending_notice: None,
         };
-        // G_Player::ResetAtLevelStart runs for both player objects at every
-        // level start (sub_41fc80 loops i < 2 regardless of active players)
-        // and unconditionally rolls U_Utils_RandomInt(400, 2000) for the
-        // license field — two rand() calls between srand() and the first
-        // spawn. Required for retail film replay rand-stream parity.
-        rand_int(&mut sim.rng, 400, 2000);
-        rand_int(&mut sim.rng, 400, 2000);
         sim
     }
 
@@ -775,6 +763,11 @@ impl Sim {
 
     /// Add a player slot at level start.
     pub fn add_player(&mut self, assets: &GameAssets, slot: usize, two_player: bool) {
+        // G_Player::ResetAtLevelStart rolls U_Utils_RandomInt(400, 2000)
+        // once per in-game player for the license field — consumed between
+        // srand() and the first spawn, in slot order. gameType==1 keeps
+        // only player 1 in game, so 1P films/levels draw exactly once.
+        rand_int(&mut self.rng, 400, 2000);
         let def_id = if slot == 0 { id("pl01") } else { id("pl02") };
         let def = assets.players.get(&def_id).cloned().unwrap_or_default();
         // Entry coords are play-area relative (0..416) → screen space.
@@ -824,45 +817,68 @@ impl Sim {
             gnd_power: PowerupRt::default(),
             gpower: 0.0,
         });
-        // Spawn the entry effect unit ("plen").
-        if def.entry_spawn != NONE_ID {
-            let p = self.players[slot].as_ref().unwrap();
-            let w = p.world_pos(self);
-            self.request_spawn(SpawnReq {
-                unit: def.entry_spawn,
-                pos: w,
-                heading: None,
-                heading_forced: false,
-                owner: usize::MAX,
-                spawner_player: slot as i32,
-                stationary: false,
-                state: None,
-            });
-        }
     }
 
-    /// Queue a unit spawn (processed during step).
-    pub fn request_spawn(&mut self, req: SpawnReq) {
-        if self.entities.len() + self.spawn_queue.len() >= MAX_ENTITIES {
+    /// `sub_41b650`: spawn-count roll + per-member appearsPercent cull.
+    /// Runs at G_EG_RequestSpawn time — before any gates — so the rand
+    /// draws happen in request order ahead of the spawn_one chains.
+    fn roll_spawn_count(&mut self, assets: &GameAssets, unit: ResId) -> i64 {
+        let Some(def) = assets.units.get(&unit) else {
+            return 0;
+        };
+        let mut lo = def.num_in_group_min.max(1);
+        let hi = def.num_in_group_max;
+        if lo > hi {
+            lo = hi;
+        }
+        let mut count = if lo != hi {
+            rand_int(&mut self.rng, lo, hi.max(lo))
+        } else {
+            lo
+        };
+        if count > 0 {
+            let mut culled = 0i64;
+            for _ in 0..count {
+                let chance = def.appears_percent;
+                if chance != 100
+                    && (chance == 0 || rand_int(&mut self.rng, 0, 100) > chance)
+                {
+                    culled += 1;
+                }
+            }
+            count -= culled;
+        }
+        count
+    }
+
+    /// Queue a unit spawn — G_EG_RequestSpawn is synchronous: count/cull
+    /// rolls, gates, and the spawn_one chain all happen inline, in
+    /// request order.
+    pub fn request_spawn(&mut self, assets: &GameAssets, req: SpawnReq) {
+        let count = self.roll_spawn_count(assets, req.unit);
+        if count <= 0 {
             return;
         }
-        self.spawn_queue.push(req);
-        self.spawn_locks.push(None);
+        self.spawn_group(assets, &req, count);
     }
 
-    /// Queue a spawn pinned to a fixed screen position (notice banners).
-    pub fn request_spawn_screen(&mut self, req: SpawnReq, screen: Vec2) {
-        if self.entities.len() + self.spawn_queue.len() >= MAX_ENTITIES {
+    /// Spawn pinned to a fixed screen position (notice banners).
+    pub fn request_spawn_screen(&mut self, assets: &GameAssets, req: SpawnReq, screen: Vec2) {
+        let count = self.roll_spawn_count(assets, req.unit);
+        if count <= 0 {
             return;
         }
-        self.spawn_queue.push(req);
-        self.spawn_locks.push(Some(screen));
+        let before = self.entities.len();
+        self.spawn_group(assets, &req, count);
+        for e in &mut self.entities[before..] {
+            e.screen_lock = Some(screen);
+        }
     }
 
-    /// `G_EG_RequestSpawn` group path (`sub_41b650` + spawn loop): rolls
-    /// num_in_group count, culls per-member by appearsPercent, then
-    /// spawns each member with cumulative groupDelay activation delay.
-    fn spawn_group(&mut self, assets: &GameAssets, req: &SpawnReq) {
+    /// `G_EG_RequestSpawn` group path: gates then spawns `count` members
+    /// (count/appears rolls already consumed at request time) with
+    /// cumulative groupDelay activation delay.
+    fn spawn_group(&mut self, assets: &GameAssets, req: &SpawnReq, count: i64) {
         let Some(def) = assets.units.get(&req.unit).cloned() else {
             return;
         };
@@ -887,41 +903,6 @@ impl Sim {
         {
             return;
         }
-        // deleteExistingEntitiesOfThisTypeOwnedByPlayer gate.
-        if def.delete_existing_owned_by_player && req.spawner_player >= 0 {
-            for e in self.entities.iter_mut() {
-                if !e.dead && e.unit == req.unit && e.spawner_player == req.spawner_player {
-                    e.dead = true;
-                }
-            }
-        }
-        // Count roll: clamp(min,1)..=max, min>max → max.
-        let mut lo = def.num_in_group_min.max(1);
-        let hi = def.num_in_group_max;
-        if lo > hi {
-            lo = hi;
-        }
-        let mut count = if lo != hi {
-            rand_int(&mut self.rng, lo, hi.max(lo))
-        } else {
-            lo
-        };
-        // appearsPercent per-member cull.
-        if count > 0 {
-            let mut culled = 0i64;
-            for _ in 0..count {
-                let chance = def.appears_percent;
-                if chance != 100
-                    && (chance == 0 || rand_int(&mut self.rng, 0, 100) > chance)
-                {
-                    culled += 1;
-                }
-            }
-            count -= culled;
-        }
-        if count <= 0 {
-            return;
-        }
         // Original entity cap: active + requested > 1000 → reject once.
         let active = self
             .entities
@@ -933,6 +914,17 @@ impl Sim {
                 self.limit_message_shown = true;
                 self.events.push(SimEvent::EntityLimit);
             }
+            return;
+        }
+        // deleteExistingEntitiesOfThisTypeOwnedByPlayer gate.
+        if def.delete_existing_owned_by_player && req.spawner_player >= 0 {
+            for e in self.entities.iter_mut() {
+                if !e.dead && e.unit == req.unit && e.spawner_player == req.spawner_player {
+                    e.dead = true;
+                }
+            }
+        }
+        if count <= 0 {
             return;
         }
         let gid = self.next_group_id;
@@ -1257,7 +1249,7 @@ impl Sim {
             pos.x += sp.x_loc as f32;
             pos.y += (-sp.y_loc) as f32;
             let heading = if sp.set_heading { Some(sp.angle as f32) } else { None };
-            self.request_spawn(SpawnReq {
+            self.request_spawn(assets, SpawnReq {
                 unit: sp.unit_id,
                 pos,
                 heading,
@@ -1331,7 +1323,7 @@ impl Sim {
                 if rt.hold as i64 >= until_act {
                     rt.hold = 0;
                     let pos = self.players[slot].as_ref().unwrap().world_pos(self);
-                    self.request_spawn(SpawnReq {
+                    self.request_spawn(assets, SpawnReq {
                         unit: act_spawn,
                         pos,
                         heading: None,
@@ -1446,7 +1438,7 @@ impl Sim {
             3 => {
                 if rt.level > 0 && now as i64 > rt.next_release as i64 + tbr {
                     let pos = self.players[slot].as_ref().unwrap().world_pos(self);
-                    self.request_spawn(SpawnReq {
+                    self.request_spawn(assets, SpawnReq {
                         unit: rel_spawn,
                         pos,
                         heading: None,
@@ -1534,7 +1526,7 @@ impl Sim {
             obj.x as f32 - if ground { 32.0 } else { 0.0 },
             self.level_height() - obj.y as f32,
         );
-        self.request_spawn(SpawnReq {
+        self.request_spawn(assets, SpawnReq {
             unit: obj.unit_id,
             pos,
             heading: Some(obj.heading_degrees as f32),
@@ -1593,7 +1585,7 @@ impl Sim {
                             p.invuln = u32::MAX;
                         }
                         if def_obj != NONE_ID {
-                            self.request_spawn(SpawnReq {
+                            self.request_spawn(assets, SpawnReq {
                                 unit: def_obj,
                                 pos: wpos,
                                 heading: None,
@@ -1692,7 +1684,7 @@ impl Sim {
                 if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
                     if rid != NONE_ID {
                         let pos = Vec2::new(self.cam_x + 240.0, self.scroll + 240.0);
-                        self.request_spawn_screen(SpawnReq {
+                        self.request_spawn_screen(assets, SpawnReq {
                             unit: rid,
                             pos,
                             heading: None,
@@ -1718,7 +1710,7 @@ impl Sim {
         // check — so it queues after the initial batch but before any
         // scroll-gated object.
         if let Some((unit, pos, screen)) = self.pending_notice.take() {
-            self.request_spawn_screen(SpawnReq {
+            self.request_spawn_screen(assets, SpawnReq {
                 unit,
                 pos,
                 heading: None,
@@ -1742,19 +1734,6 @@ impl Sim {
                 self.queue_level_object(assets, oi);
             } else {
                 break;
-            }
-        }
-
-        // --- process queued spawns ---
-        let queue = std::mem::take(&mut self.spawn_queue);
-        let locks = std::mem::take(&mut self.spawn_locks);
-        for (i, req) in queue.iter().enumerate() {
-            let before = self.entities.len();
-            self.spawn_group(assets, req);
-            if let Some(sp) = locks.get(i).copied().flatten() {
-                for e in &mut self.entities[before..] {
-                    e.screen_lock = Some(sp);
-                }
             }
         }
 
@@ -2022,6 +2001,25 @@ impl Sim {
                 if p.phase_time >= def.entry_initial_delay as u32 {
                     p.phase = PlayerPhase::Active;
                     p.phase_time = 0;
+                    // Entry effect ("plen") is requested when the player
+                    // appears — after the initial object batch, like the
+                    // original's first-frame Priv_Appear.
+                    if def.entry_spawn != NONE_ID {
+                        let w = Vec2::new(
+                            p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
+                            self.scroll + SCREEN_H - p.screen.y,
+                        );
+                        self.request_spawn(assets, SpawnReq {
+                            unit: def.entry_spawn,
+                            pos: w,
+                            heading: None,
+                            heading_forced: false,
+                            owner: usize::MAX,
+                            spawner_player: slot as i32,
+                            stationary: false,
+                            state: None,
+                        });
+                    }
                 }
                 return;
             }
@@ -2062,7 +2060,7 @@ impl Sim {
                                 p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
                                 self.scroll + SCREEN_H - p.screen.y,
                             );
-                            self.request_spawn(SpawnReq {
+                            self.request_spawn(assets, SpawnReq {
                                 unit: def.entry_spawn,
                                 pos: w,
                                 heading: None,
@@ -2497,13 +2495,11 @@ impl Sim {
             self.step_owner_link(i, assets);
 
             // --- state repeat particles (G_EntityGroup stateParticles_*) ---
-            if state.particles_id != NONE_ID {
-                let max_bursts = if state.particles_repeat {
-                    state.particles_max_bursts.max(0) as u32
-                } else {
-                    1
-                };
-                let under_cap = max_bursts == 0 || self.entities[i].particle_bursts < max_bursts;
+            // Original gate: MaxNumBursts != 0 && bursts < MaxNumBursts,
+            // throttled to one burst per RepeatDelay ticks.
+            if state.particles_id != NONE_ID && state.particles_max_bursts > 0 {
+                let under_cap =
+                    self.entities[i].particle_bursts < state.particles_max_bursts as u32;
                 let due = self.game_time
                     >= self.entities[i].particle_last
                         + state.particles_repeat_delay.max(0) as u32;
@@ -2511,7 +2507,7 @@ impl Sim {
                     let unit_scroll = assets
                         .units
                         .get(&self.entities[i].unit)
-                        .map(|d| d.terrain_effect)
+                        .map(|d| d.is_ground_based)
                         .unwrap_or(false);
                     self.emit_particles(
                         i,
@@ -2603,7 +2599,7 @@ impl Sim {
             self.step_debris(i, assets);
 
             // --- spawn sets ---
-            self.step_spawn_sets(i, &state);
+            self.step_spawn_sets(i, &state, assets);
 
             // --- cull ---
             let e = &self.entities[i];
@@ -2745,8 +2741,8 @@ impl Sim {
         e.anim_stopped = false;
         e.tracking = false;
         e.rot_dir = -1;
-        e.particle_bursts = 0;
-        e.particle_last = 0;
+        // particle_bursts/particle_last are entity-lifetime counters
+        // (m_field_ec/m_field_e8) — they persist across state changes.
         e.sound_play_count = 0;
         e.sound_last_play = 0;
         if e.state_sound_played.len() < def.states.len() {
@@ -2872,6 +2868,18 @@ impl Sim {
     fn emit_particles(&mut self, idx: usize, kind: ResId, color: u32, scroll: bool, circular: bool) {
         if kind == NONE_ID {
             return;
+        }
+        // G_Particle_NewGroup consumes one U_Utils_RandomInt(0,4) per
+        // active particle — the draw count is fixed per type fourcc.
+        let draws = match kind {
+            k if k == id("med ") || k == id("laci") => 20,
+            k if k == id("larg") || k == id("meci") => 40,
+            k if k == id("tici") || k == id("tiny") => 5,
+            k if k == id("smci") || k == id("smal") => 10,
+            _ => 0,
+        };
+        for _ in 0..draws {
+            rand_int(&mut self.rng, 0, 4);
         }
         let e = &self.entities[idx];
         let sx = e.pos.x - self.cam_x + WORLD_TO_SCREEN_X;
@@ -3382,7 +3390,7 @@ impl Sim {
     /// period. remaining == 0 → repeat sets re-arm once
     /// game_time >= last_arm + delay, re-rolling period/total/delay in
     /// that order; non-repeat sets stay inert until the next ChangeState.
-    fn step_spawn_sets(&mut self, idx: usize, state: &UnitState) {
+    fn step_spawn_sets(&mut self, idx: usize, state: &UnitState, assets: &GameAssets) {
         if state.spawn_sets.is_empty() {
             return;
         }
@@ -3460,7 +3468,7 @@ impl Sim {
             } else {
                 pos + local
             };
-            self.request_spawn(SpawnReq {
+            self.request_spawn(assets, SpawnReq {
                 unit: ss.spawn_id,
                 pos: sp,
                 // Spawn-set requests only carry a heading when setHeading
@@ -3740,7 +3748,7 @@ impl Sim {
             idx,
             def.hit_particles,
             def.hit_particles_color,
-            def.terrain_effect,
+            def.is_ground_based,
             def.hit_particle_circular_burst,
         );
         // Collision spawn (state+0x2e0): throttled, repeat-gated, owned
@@ -3760,7 +3768,7 @@ impl Sim {
                 let pos = self.entities[idx].pos;
                 let owner_idx = idx;
                 self.entities[idx].hit_fx_time = self.game_time;
-                self.request_spawn(SpawnReq {
+                self.request_spawn(assets, SpawnReq {
                     unit: cur_state.collision_spawn_id,
                     pos,
                     heading: None,
@@ -3826,7 +3834,7 @@ impl Sim {
             p.life_bonus_acc += pf(assets, 0xb6) as i64;
         }
         if let Some(req) = life_spawn_req {
-            self.request_spawn(req);
+            self.request_spawn(assets, req);
         }
     }
 
@@ -3863,13 +3871,64 @@ impl Sim {
             }
         }
 
+        // Reap-order spawns (sub_01ae10 runs these before child->Destroy):
+        // destructNumCoinsToRelease copies of destructCoin, then the
+        // group-kill coin once when this was the group's last member.
+        if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {
+            for _ in 0..def.destruct_num_coins.min(64) {
+                self.request_spawn(assets, SpawnReq {
+                    unit: def.destruct_coin,
+                    pos: epos,
+                    heading: None,
+                    heading_forced: false,
+                    owner: idx,
+                    spawner_player: from_player,
+                    stationary: false,
+                    state: None,
+                });
+            }
+        }
+        if def.destruct_coin_on_group_kill != NONE_ID && my_gid != 0 {
+            let any_left = self
+                .entities
+                .iter()
+                .any(|e| !e.dead && e.group_id == my_gid);
+            if !any_left {
+                self.request_spawn(assets, SpawnReq {
+                    unit: def.destruct_coin_on_group_kill,
+                    pos: epos,
+                    heading: None,
+                    heading_forced: false,
+                    owner: idx,
+                    spawner_player: from_player,
+                    stationary: false,
+                    state: None,
+                });
+            }
+        }
+
+        // --- G_Entity::Destroy body ---
+        // G_Debris_New on the entity bounds, then the destructParticle
+        // burst (its rand draws land before destructSpawn's rolls).
+        self.maybe_debris_on_destroy(idx, assets);
+        self.emit_particles(
+            idx,
+            def.destruct_particle,
+            def.destruct_particle_color,
+            def.is_ground_based,
+            false,
+        );
+        // destructSpawn (0x45e): CanSpawnOnMedia-gated in the original —
+        // approximated unconditional until the media mask is ported.
+        // destruct_notice: floating text — TODO notice system (unused in
+        // retail data).
         if def.destruct_spawn != NONE_ID {
-            self.request_spawn(SpawnReq {
+            self.request_spawn(assets, SpawnReq {
                 unit: def.destruct_spawn,
                 pos: epos,
                 heading: None,
                 heading_forced: false,
-                owner: usize::MAX,
+                owner: idx,
                 spawner_player: from_player,
                 stationary: false,
                 state: None,
@@ -3878,59 +3937,10 @@ impl Sim {
         if def.destruct_sound.id != NONE_ID {
             self.events.push(SimEvent::Sound(def.destruct_sound.id));
         }
-        // destructParticle burst (G_Entity::Destroy); ground-class units
-        // scroll with the terrain ("grnd" check → terrain_effect proxy).
-        self.emit_particles(
-            idx,
-            def.destruct_particle,
-            def.destruct_particle_color,
-            def.terrain_effect,
-            false,
-        );
-        // destruct_notice: floating text — TODO notice system (unused in
-        // retail data).
-        self.maybe_debris_on_destroy(idx, assets);
-
-        // Coin release: N copies of destruct_coin at the kill location.
-        if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {
-            for _ in 0..def.destruct_num_coins.min(64) {
-                self.request_spawn(SpawnReq {
-                    unit: def.destruct_coin,
-                    pos: epos,
-                    heading: None,
-                    heading_forced: false,
-                    owner: usize::MAX,
-                    spawner_player: from_player,
-                    stationary: false,
-                    state: None,
-                });
-            }
-        }
 
         self.entities[idx].dead = true;
         self.entities[idx].destroyed = true;
         self.stat_kills += 1;
-
-        // Group-kill bonus coin: when the last member of this spawn
-        // group goes down, spawn destruct_coin_on_group_kill once.
-        if def.destruct_coin_on_group_kill != NONE_ID && my_gid != 0 {
-            let any_left = self
-                .entities
-                .iter()
-                .any(|e| !e.dead && e.group_id == my_gid);
-            if !any_left {
-                self.request_spawn(SpawnReq {
-                    unit: def.destruct_coin_on_group_kill,
-                    pos: epos,
-                    heading: None,
-                    heading_forced: false,
-                    owner: usize::MAX,
-                    spawner_player: from_player,
-                    stationary: false,
-                    state: None,
-                });
-            }
-        }
 
         // G_Game_GroundAccuracy_AddDestroyed. The rb06 reward is NOT armed
         // here: the original arms it at the NEXT level's start when this
@@ -3943,7 +3953,7 @@ impl Sim {
         // perm floats 0xd1..0xd9/0xda/0xdb → object_ids[0x19..0x22].
         if def.destruct_release_random_bonus {
             if let Some(bonus) = self.roll_random_bonus(assets) {
-                self.request_spawn(SpawnReq {
+                self.request_spawn(assets, SpawnReq {
                     unit: bonus,
                     pos: epos,
                     heading: None,
@@ -4060,7 +4070,7 @@ impl Sim {
         {
             p.last_hit_fx = self.game_time;
             let pos = Vec2::new(p.screen.x + self.cam_x - WORLD_TO_SCREEN_X, self.scroll + SCREEN_H - p.screen.y);
-            self.request_spawn(SpawnReq {
+            self.request_spawn(assets, SpawnReq {
                 unit: pdef.active_spawn_on_hit,
                 pos,
                 heading: None,
@@ -4100,7 +4110,7 @@ impl Sim {
             // Low-shield warning object, latched until shields recover.
             p.shield_warned = true;
             let pos = Vec2::new(p.screen.x + self.cam_x - WORLD_TO_SCREEN_X, self.scroll + SCREEN_H - p.screen.y);
-            self.request_spawn(SpawnReq {
+            self.request_spawn(assets, SpawnReq {
                 unit: pdef.active_shield_warning_object,
                 pos,
                 heading: None,
@@ -4114,7 +4124,7 @@ impl Sim {
         // Death-spawn object (m_field0xba, spawned by G_Player::Destroy).
         if let Some((unit, pos)) = death_spawn {
             if unit != NONE_ID {
-                self.request_spawn(SpawnReq {
+                self.request_spawn(assets, SpawnReq {
                     unit,
                     pos,
                     heading: None,
@@ -4144,7 +4154,7 @@ impl Sim {
                     ((n * 37) % 24) as f32 - 12.0,
                     ((n * 53) % 24) as f32 - 12.0,
                 );
-                self.request_spawn(SpawnReq {
+                self.request_spawn(assets, SpawnReq {
                     unit: u,
                     pos: pos + off,
                     heading: None,

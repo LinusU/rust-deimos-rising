@@ -1413,7 +1413,7 @@ pub fn flow_system(
                     if let Some(rid) = assets.object_ids.entries.get(0x18).map(|e| e.1) {
                         if rid != crate::pak::NONE_ID {
                             let pos = Vec2::new(sim.0.cam_x + 240.0, sim.0.scroll + 240.0);
-                            sim.0.request_spawn_screen(SpawnReq {
+                            sim.0.request_spawn_screen(&assets, SpawnReq {
                                 unit: rid,
                                 pos,
                                 heading: None,
