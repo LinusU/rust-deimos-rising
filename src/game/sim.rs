@@ -960,7 +960,8 @@ impl Sim {
         // everything else faces the unit def's initialHeading with no roll
         // (initialHeadingSetInEditor does not affect facing).
         let tol = def.initial_heading_tolerance;
-        let half_tol = if tol >= 0 { (tol + 1) >> 1 } else { tol >> 1 };
+        // Original half-range idiom (sbb/sar): (tol>=0 ? tol : tol+1) >> 1.
+        let half_tol = (if tol >= 0 { tol } else { tol + 1 }) >> 1;
         let mut facing = if req.heading_forced {
             let mut h = req.heading.unwrap_or(0.0);
             if tol != 0 {
