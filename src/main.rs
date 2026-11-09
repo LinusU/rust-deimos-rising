@@ -255,8 +255,9 @@ fn trace_replay(
                 let d = a.units.get(&e.unit);
                 let st = d.and_then(|d| d.states.get(e.state));
                 println!(
-                    "ENT #{} {} '{}' scr=({:.0},{:.0}) owner={} state={}:{} face={} frame={} dir={} hdg={:.0} vis={} scale={:.2} layer={} ground={}",
+                    "ENT #{} age={} {} '{}' scr=({:.0},{:.0}) owner={} state={}:{} face={} frame={} dir={} hdg={:.0} vis={} scale={:.2} layer={} ground={}",
                     e.unique_num,
+                    e.age,
                     game::sim::rid_str(e.unit),
                     d.map(|d| d.name.as_str()).unwrap_or("?"),
                     sp.x, sp.y, e.owner, e.state,
