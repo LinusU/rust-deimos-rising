@@ -2609,7 +2609,10 @@ impl Sim {
             }
 
             // --- motion blur afterimages (G_MotionBlur_New trigger) ---
-            if state.motion_blur_required {
+            // The original rolls the interval every tick the state's blur
+            // flag is set AND the sprite face isn't 'none' — the roll is
+            // inside that gate, so the guard must match or rand desyncs.
+            if state.motion_blur_required && state.sprite_face != NONE_ID {
                 let interval = rand_int(
                     &mut self.rng,
                     state.motion_blur_min_time,
