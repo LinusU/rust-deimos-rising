@@ -204,6 +204,126 @@ fn film_probe() {
     }
 }
 
+/// Replay recorded inputs through the headless sim, printing the player's
+/// phase changes plus a status line every 10 seconds. `--entities-at <tick>`
+/// also lists the live on-screen entities at that tick.
+fn trace_replay(
+    a: &mut assets::GameAssets,
+    level: ResId,
+    players: usize,
+    seed: u64,
+    rec: &game::render::DemoRec,
+    n: usize,
+    args: &[String],
+) {
+    let mut sim = game::render::start_level(a, level, players, seed).expect("level");
+    let a = &*a;
+    let ent_at = args
+        .iter()
+        .position(|x| x == "--entities-at")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok());
+    let mut fire_frames = 0u32;
+    let mut bomb_frames = 0u32;
+    for t in 0..n {
+        let inp = rec.input_at(t);
+        if inp.p1.fire { fire_frames += 1; }
+        if inp.p1.bomb { bomb_frames += 1; }
+        let prev_phase = sim.players[0].as_ref().map(|p| p.phase);
+        sim.advance(&a, &inp, 1.0 / 60.0);
+        if let (Some(pp), Some(np)) = (prev_phase, sim.players[0].as_ref().map(|p| p.phase)) {
+            if pp != np {
+                let near: Vec<String> = sim.entities.iter()
+                    .filter(|e| !e.dead)
+                    .take(6)
+                    .map(|e| format!("{:08x}@({:.0},{:.0})", e.unit, e.pos.x, e.pos.y))
+                    .collect();
+                println!("t={:>5} phase {:?} -> {:?} scr=({:.0},{:.0}) ents={}",
+                    t, pp, np,
+                    sim.players[0].as_ref().unwrap().screen.x,
+                    sim.players[0].as_ref().unwrap().screen.y,
+                    near.join(" "));
+            }
+        }
+        // --entities-at <tick>: list the live on-screen entities.
+        if ent_at == Some(t) {
+            for e in sim.entities.iter().filter(|e| !e.dead) {
+                let sp = e.screen_pos(&sim);
+                if sp.y < -50.0 || sp.y > 530.0 {
+                    continue;
+                }
+                let d = a.units.get(&e.unit);
+                let st = d.and_then(|d| d.states.get(e.state));
+                println!(
+                    "ENT #{} {} '{}' scr=({:.0},{:.0}) owner={} state={}:{} face={} frame={} dir={} hdg={:.0} vis={} scale={:.2} layer={} ground={}",
+                    e.unique_num,
+                    game::sim::rid_str(e.unit),
+                    d.map(|d| d.name.as_str()).unwrap_or("?"),
+                    sp.x, sp.y, e.owner, e.state,
+                    st.map(|s| s.name.as_str()).unwrap_or("?"),
+                    st.map(|s| game::sim::rid_str(s.sprite_face)).unwrap_or_default(),
+                    e.frame, e.dir_index, e.heading, e.vis, e.scale,
+                    d.map(|d| game::sim::rid_str(d.draw_layer)).unwrap_or_default(),
+                    d.map(|d| d.is_ground_based).unwrap_or(false),
+                );
+            }
+        }
+        if t % 600 == 599 {
+            let p = sim.players[0].as_ref().unwrap();
+            let mut projs = 0usize;
+            let mut pinfo = String::new();
+            for e in &sim.entities {
+                if let Some(d) = a.units.get(&e.unit) {
+                    if d.player_projectile {
+                        projs += 1;
+                        if projs <= 3 {
+                            pinfo.push_str(&format!(" [{:.0},{:.0} v{:.1},{:.1} tv{:.1},{:.1} st{}]",
+                                e.pos.x, e.pos.y, e.vel.x, e.vel.y, e.tvel.x, e.tvel.y, e.state));
+                        }
+                    }
+                }
+            }
+            println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={}/{} shots={} proj={} ftmr={} bt={} ent={} pick={} coin={} pts={} money={} mult={}",
+                t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills_player, sim.stat_kills, sim.stat_shots, projs, p.fire_timer, p.bomb_burst, sim.entities.len(), sim.stat_pickups, sim.stat_coins, sim.stat_score_points, p.money, p.multiplier);
+            println!("   proj{}", pinfo);
+        }
+    }
+    println!("fire_frames={fire_frames} bomb_frames={bomb_frames} / {n}");
+    println!(
+        "final: scroll={:.0}/{:.0} complete={} phase={:?} score={} money={} spawns={} endseq={}",
+        sim.scroll, sim.max_scroll(), sim.level_complete,
+        sim.players[0].as_ref().map(|p| p.phase),
+        sim.players[0].as_ref().map(|p| p.score).unwrap_or(0),
+        sim.players[0].as_ref().map(|p| p.money).unwrap_or(0),
+        sim.stat_spawns,
+        sim.end_seq_state,
+    );
+}
+
+/// `--trace --input <file> [--level leNN] [--players N]`: run an input
+/// script through the headless sim with the same report as `--filmedbg`.
+fn trace_script(args: &[String]) {
+    let mut a = assets::GameAssets::open(&data_dir()).expect("open");
+    a.load_all_data();
+    let level = arg_value(args, "--level").map(|s| id(&s)).unwrap_or_else(|| id("le07"));
+    let players = arg_value(args, "--players").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let rec = load_input_script(args, level).expect("--trace needs --input <file>");
+    let n = rec.frames();
+    trace_replay(&mut a, level, players, rec.seed, &rec, n, args);
+}
+
+/// Value following `flag` on the command line.
+fn arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+}
+
+/// Parse the `--input <file>` script, if given.
+fn load_input_script(args: &[String], level: ResId) -> Option<game::render::DemoRec> {
+    let path = arg_value(args, "--input")?;
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    Some(game::render::DemoRec::from_script(&text, level, 0xC0FFEE).unwrap_or_else(|e| panic!("{path}: {e}")))
+}
+
 /// Brute-force the retail film bit→action mapping using the score oracle:
 /// field1 records score+0xb3ac2 at the last frame, and the sim is
 /// deterministic given the film seed.
@@ -225,105 +345,9 @@ fn film_test() {
     if args.iter().any(|a| a == "--filmedbg") {
         let film = a.film(film_rid).expect("film");
         let players = if film.frames[1] > 0 { 2 } else { 1 };
-        // Recovered mapping (G_Film bit -> input byte -> action):
-        // bit0=left bit1=right bit2=up bit3=down bit4=bomb bit5=air-fire bit6=cycle.
-        let map = [2usize, 3, 0, 1, 5, 4, 6];
-        let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64).expect("level");
+        let rec = game::render::DemoRec::from_film(&film);
         let n = film.frames[0].min(20000);
-        let ent_at = args
-            .iter()
-            .position(|x| x == "--entities-at")
-            .and_then(|i| args.get(i + 1))
-            .and_then(|v| v.parse::<usize>().ok());
-        let mut fire_frames = 0u32;
-        let mut bomb_frames = 0u32;
-        for t in 0..n {
-            let mk = |p: usize| -> SlotInput {
-                let b = film.inputs[p].get(t).copied().unwrap_or(0);
-                let mut s = SlotInput::default();
-                for (bit, &f) in map.iter().enumerate() {
-                    if b & (1 << bit) != 0 {
-                        match f {
-                            0 => s.up = true, 1 => s.down = true, 2 => s.left = true,
-                            3 => s.right = true, 4 => s.fire = true, 5 => s.bomb = true,
-                            _ => s.cycle = true,
-                        }
-                    }
-                }
-                s
-            };
-            let inp = PlayerInput { p1: mk(0), p2: mk(1) };
-            if inp.p1.fire { fire_frames += 1; }
-            if inp.p1.bomb { bomb_frames += 1; }
-            let prev_phase = sim.players[0].as_ref().map(|p| p.phase);
-            sim.advance(&a, &inp, 1.0 / 60.0);
-            if let (Some(pp), Some(np)) = (prev_phase, sim.players[0].as_ref().map(|p| p.phase)) {
-                if pp != np {
-                    let near: Vec<String> = sim.entities.iter()
-                        .filter(|e| !e.dead)
-                        .take(6)
-                        .map(|e| format!("{:08x}@({:.0},{:.0})", e.unit, e.pos.x, e.pos.y))
-                        .collect();
-                    println!("t={:>5} phase {:?} -> {:?} scr=({:.0},{:.0}) ents={}",
-                        t, pp, np,
-                        sim.players[0].as_ref().unwrap().screen.x,
-                        sim.players[0].as_ref().unwrap().screen.y,
-                        near.join(" "));
-                }
-            }
-            // --entities-at <tick>: list the live on-screen entities.
-            if ent_at == Some(t) {
-                for e in sim.entities.iter().filter(|e| !e.dead) {
-                    let sp = e.screen_pos(&sim);
-                    if sp.y < -50.0 || sp.y > 530.0 {
-                        continue;
-                    }
-                    let d = a.units.get(&e.unit);
-                    let st = d.and_then(|d| d.states.get(e.state));
-                    println!(
-                        "ENT #{} {} '{}' scr=({:.0},{:.0}) owner={} state={}:{} face={} frame={} dir={} hdg={:.0} vis={} scale={:.2} layer={} ground={}",
-                        e.unique_num,
-                        game::sim::rid_str(e.unit),
-                        d.map(|d| d.name.as_str()).unwrap_or("?"),
-                        sp.x, sp.y, e.owner, e.state,
-                        st.map(|s| s.name.as_str()).unwrap_or("?"),
-                        st.map(|s| game::sim::rid_str(s.sprite_face)).unwrap_or_default(),
-                        e.frame, e.dir_index, e.heading, e.vis, e.scale,
-                        d.map(|d| game::sim::rid_str(d.draw_layer)).unwrap_or_default(),
-                        d.map(|d| d.is_ground_based).unwrap_or(false),
-                    );
-                }
-            }
-            if t % 600 == 599 {
-                let p = sim.players[0].as_ref().unwrap();
-                let mut projs = 0usize;
-                let mut pinfo = String::new();
-                for e in &sim.entities {
-                    if let Some(d) = a.units.get(&e.unit) {
-                        if d.player_projectile {
-                            projs += 1;
-                            if projs <= 3 {
-                                pinfo.push_str(&format!(" [{:.0},{:.0} v{:.1},{:.1} tv{:.1},{:.1} st{}]",
-                                    e.pos.x, e.pos.y, e.vel.x, e.vel.y, e.tvel.x, e.tvel.y, e.state));
-                            }
-                        }
-                    }
-                }
-                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={}/{} shots={} proj={} ftmr={} bt={} ent={} pick={} coin={} pts={} money={} mult={}",
-                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills_player, sim.stat_kills, sim.stat_shots, projs, p.fire_timer, p.bomb_burst, sim.entities.len(), sim.stat_pickups, sim.stat_coins, sim.stat_score_points, p.money, p.multiplier);
-                println!("   proj{}", pinfo);
-            }
-        }
-        println!("fire_frames={fire_frames} bomb_frames={bomb_frames} / {n}");
-        println!(
-            "final: scroll={:.0}/{:.0} complete={} phase={:?} score={} money={} spawns={} endseq={}",
-            sim.scroll, sim.max_scroll(), sim.level_complete,
-            sim.players[0].as_ref().map(|p| p.phase),
-            sim.players[0].as_ref().map(|p| p.score).unwrap_or(0),
-            sim.players[0].as_ref().map(|p| p.money).unwrap_or(0),
-            sim.stat_spawns,
-            sim.end_seq_state,
-        );
+        trace_replay(&mut a, film.level_id, players, film.seed as u64, &rec, n, &args);
         return;
     }
     let players = if film.frames[1] > 0 { 2 } else { 1 };
@@ -577,6 +601,10 @@ fn main() {
         film_probe();
         return;
     }
+    if args.iter().any(|a| a == "--trace") {
+        trace_script(&args);
+        return;
+    }
     if args.iter().any(|a| a == "--filmtest") {
         film_test();
         return;
@@ -795,8 +823,8 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(|s| pak::id(s))
         .unwrap_or_else(|| pak::id("le01"));
-    // --shot <dir> [--at f1,f2,...] [--film <rid-hex>] [--title]: save
-    // screenshots of the given frames to <dir>, then exit.
+    // --shot <dir> [--at f1,f2,...] [--film <rid-hex> | --input <file>]
+    // [--title]: save screenshots of the given frames to <dir>, then exit.
     let shot = args.iter().position(|a| a == "--shot").map(|i| {
         let out_dir = PathBuf::from(args.get(i + 1).expect("--shot needs a directory"));
         let frames = args
@@ -814,6 +842,7 @@ fn main() {
             out_dir,
             frames,
             film,
+            script: load_input_script(&args, level),
             title: args.iter().any(|a| a == "--title"),
         }
     });

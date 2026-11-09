@@ -205,6 +205,58 @@ pub struct DemoRec {
 }
 
 impl DemoRec {
+    /// Parse an input script: one `<from>-<to> <keys...>` line per span of
+    /// frames (inclusive; a lone `<frame>` is a single frame). Keys are
+    /// `up down left right fire bomb cycle`, for player 1 unless written
+    /// `p2:<key>`. Spans may overlap; `#` starts a comment.
+    pub fn from_script(text: &str, level: ResId, seed: u64) -> Result<DemoRec, String> {
+        let mut rec = DemoRec { level: Some(level), seed, p1: Vec::new(), p2: Vec::new() };
+        for (ln, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let err = |what: &str| format!("line {}: {}", ln + 1, what);
+            let mut words = line.split_whitespace();
+            let span = words.next().unwrap();
+            let (from, to) = span.split_once('-').unwrap_or((span, span));
+            let from: usize = from.parse().map_err(|_| err("bad start frame"))?;
+            let to: usize = to.parse().map_err(|_| err("bad end frame"))?;
+            if to < from || to >= DEMO_MAX_FRAMES {
+                return Err(err("bad frame span"));
+            }
+            let (mut m1, mut m2) = (0u8, 0u8);
+            for word in words {
+                let (mask, key) = match word.strip_prefix("p2:") {
+                    Some(k) => (&mut m2, k),
+                    None => (&mut m1, word),
+                };
+                let bit = ["up", "down", "left", "right", "fire", "bomb", "cycle"]
+                    .iter()
+                    .position(|k| *k == key)
+                    .ok_or_else(|| err("unknown key"))?;
+                *mask |= 1 << bit;
+            }
+            for (stream, mask) in [(&mut rec.p1, m1), (&mut rec.p2, m2)] {
+                if stream.len() <= to {
+                    stream.resize(to + 1, 0);
+                }
+                for b in &mut stream[from..=to] {
+                    *b |= mask;
+                }
+            }
+        }
+        Ok(rec)
+    }
+
+    /// Both players' inputs at frame `f` (nothing pressed past the end).
+    pub fn input_at(&self, f: usize) -> PlayerInput {
+        PlayerInput {
+            p1: self.p1.get(f).map(|b| DemoRec::unpack(*b)).unwrap_or_default(),
+            p2: self.p2.get(f).map(|b| DemoRec::unpack(*b)).unwrap_or_default(),
+        }
+    }
+
     fn pack(s: &SlotInput) -> u8 {
         (s.up as u8)
             | ((s.down as u8) << 1)
@@ -225,7 +277,7 @@ impl DemoRec {
             cycle: b & 64 != 0,
         }
     }
-    fn frames(&self) -> usize {
+    pub fn frames(&self) -> usize {
         self.p1.len().max(self.p2.len())
     }
     fn save(&self) {
@@ -265,7 +317,7 @@ impl DemoRec {
     /// (bit0=L bit1=R bit2=U bit3=D bit4=bomb bit5=air-fire bit6=cycle)
     /// into our SlotInput packing. This is what the original's attract
     /// mode replays; the seed/level come straight from the film header.
-    fn from_film(film: &crate::assets::FilmData) -> Self {
+    pub fn from_film(film: &crate::assets::FilmData) -> Self {
         let tr = |b: u8| -> u8 {
             let mut s = SlotInput::default();
             if b & 0x01 != 0 { s.left = true; }
@@ -2011,8 +2063,10 @@ pub struct ShotConfig {
     pub out_dir: std::path::PathBuf,
     /// Frame numbers to capture (one sim tick per frame while playing).
     pub frames: Vec<u32>,
-    /// Retail film to replay; without one the level runs with fire held.
+    /// Retail film to replay.
     pub film: Option<ResId>,
+    /// Input script to replay; with neither the level runs with fire held.
+    pub script: Option<DemoRec>,
     /// Capture the title screen instead of gameplay.
     pub title: bool,
 }
@@ -2067,11 +2121,20 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
         .expect("level not found");
     let mut demo = Demo::default();
     let mut initial_state = FlowState::Title;
-    if let Some(cfg) = shot.as_ref().filter(|c| !c.title) {
+    let mut shot = shot;
+    if let Some(cfg) = shot.as_mut().filter(|c| !c.title) {
         let last = cfg.frames.iter().copied().max().unwrap_or(0) as usize;
-        let pb = match cfg.film {
-            Some(rid) => DemoRec::from_film(&assets.film(rid).expect("film not found")),
-            None => {
+        let pb = match (cfg.script.take(), cfg.film) {
+            (Some(mut script), _) => {
+                // Keep playing (idle) until the last capture is written.
+                let len = last + SHOT_EXIT_DELAY as usize + 60;
+                if script.p1.len() < len {
+                    script.p1.resize(len, 0);
+                }
+                script
+            }
+            (None, Some(rid)) => DemoRec::from_film(&assets.film(rid).expect("film not found")),
+            (None, None) => {
                 let fire = DemoRec::pack(&SlotInput { fire: true, ..default() });
                 DemoRec {
                     level: Some(level_id),
