@@ -402,8 +402,8 @@ pub struct Particles {
     groups: Vec<PGroup>,
     tables: Option<ParticleTables>,
     last_scroll: f32,
-    /// Fractional 60 Hz ticks not yet simulated.
-    tick_acc: f32,
+    /// Sim tick the particles were last advanced at.
+    last_tick: u32,
     white: Option<Handle<Image>>,
     /// Particle randomness is seeded so a replay renders identically every
     /// run (screenshots can then be compared).
@@ -565,8 +565,6 @@ pub fn sync_particles(
     mut parts: ResMut<Particles>,
     sim_res: Res<GameSim>,
     flow: Res<Flow>,
-    time: Res<Time>,
-    shot: Option<Res<ShotPlan>>,
     mut images: ResMut<Assets<Image>>,
     mut q: Query<(Entity, &ParticleSprite, &mut Sprite, &mut Transform)>,
 ) {
@@ -575,19 +573,13 @@ pub fn sync_particles(
             commands.entity(e).despawn();
         }
         parts.groups.clear();
+        parts.last_tick = 0;
         return;
     }
-    // Fixed-step at 60 Hz. Leftover time carries to the next frame, so a
-    // frame that is a hair short of 1/60 s does not drop its tick.
-    // Screenshot mode steps exactly one tick per frame, like the sim.
-    let ticks = if shot.is_some() {
-        1
-    } else {
-        parts.tick_acc += time.delta_secs() * 60.0;
-        let n = parts.tick_acc.floor().min(4.0);
-        parts.tick_acc = (parts.tick_acc - n).min(1.0);
-        n as u32
-    };
+    // One particle tick per sim tick.
+    let now = sim_res.0.game_time;
+    let ticks = now.saturating_sub(parts.last_tick).min(8);
+    parts.last_tick = now;
     if ticks > 0 {
         // Spread the terrain scroll since the last tick over this frame's ticks.
         let scroll_delta = (sim_res.0.scroll - parts.last_scroll) / ticks as f32;
