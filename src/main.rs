@@ -860,6 +860,20 @@ fn test_defs() {
         if !u.entry_notice.is_empty() && u.entry_notice != "none" {en+=1; if u.entry_notice_delay>0 {ed+=1;}}
     }
     println!("NOTICES destruct={} entry={} entryDelay={}", dn,en,ed);
+    // Heading-tolerance / owner-heading census: the original only rolls
+    // initialHeadingTolerance for useOwnerHeading units without an owner.
+    let (mut ntol, mut nown, mut ntol_own) = (0, 0, 0);
+    for (rid,u) in &a.units {
+        if u.initial_heading_tolerance != 0 {
+            ntol += 1;
+            if u.use_owner_heading { ntol_own += 1; }
+            if ntol <= 15 {
+                println!("HTOL {:08x} {} tol={} ownHdg={} edtr={} hunts={}", rid, u.name, u.initial_heading_tolerance, u.use_owner_heading, u.initial_heading_set_in_editor, u.initially_hunts_closest_player);
+            }
+        }
+        if u.use_owner_heading { nown += 1; }
+    }
+    println!("HTOL tolerance={} useOwnerHeading={} tol+own={}", ntol, nown, ntol_own);
     for u in a.units.values() {
         if !u.entry_notice.is_empty() && u.entry_notice != "none" {
             println!("  entryNotice '{}' delay={} unit?", &u.entry_notice[..u.entry_notice.len().min(60)], u.entry_notice_delay);
@@ -963,6 +977,24 @@ fn test_defs() {
     }
     for (rid,u) in a.units.iter().filter(|(_,u)| u.destruct_coin != pak::NONE_ID).take(4) {
         println!("  COIN {:08x} {} coin={:08x} n={} gid-kill={:08x}", rid, u.name, u.destruct_coin, u.destruct_num_coins, u.destruct_coin_on_group_kill);
+    }
+    // Scatter census: polar needs both offset axes ranged; randomiseInitialLoc
+    // picks circular (angle+radius draws) vs ellipse (angle draw only).
+    let (mut nper, mut nfix, mut pr, mut pe) = (0, 0, 0, 0);
+    for u in a.units.values() {
+        let xr = u.x_offset_min != u.x_offset_max;
+        let yr = u.y_offset_min != u.y_offset_max;
+        if xr && yr {
+            if u.randomise_initial_loc { pr += 1; } else { pe += 1; }
+        } else if xr || yr {
+            nper += 1;
+        } else {
+            nfix += 1;
+        }
+    }
+    println!("scatter: polarRand={} polarEllipse={} perAxis={} fixed={}", pr, pe, nper, nfix);
+    for (rid,u) in a.units.iter().filter(|(_,u)| u.x_offset_min != u.x_offset_max && u.y_offset_min != u.y_offset_max && !u.randomise_initial_loc).take(10) {
+        println!("  ELLIP {:08x} {} x=[{}..{}] y=[{}..{}]", rid, u.name, u.x_offset_min, u.x_offset_max, u.y_offset_min, u.y_offset_max);
     }
     // le01 objects sample
     if let Some(l) = a.levels.get(&id("le01")) {
