@@ -433,6 +433,10 @@ pub struct Player {
     pub power: f64,
     /// Current air weapon def id.
     pub air_weapon: ResId,
+    /// Weapon selected while the air power-up machine was busy
+    /// (G_WeaponHandler m_airCurrentWeapon); applied when the machine
+    /// returns to idle after the release drains.
+    pub air_weapon_queued: ResId,
     /// Current ground weapon def id.
     pub ground_weapon: ResId,
     /// Ticks until next shot allowed.
@@ -453,6 +457,9 @@ pub struct Player {
     /// Previous-tick air-fire input for the autoRepeat semi-auto gate
     /// (m_field_0xa).
     pub prev_fire: bool,
+    /// Previous-tick cycle input for the edge-triggered weapon switch
+    /// (m_field_0xb).
+    pub prev_cycle: bool,
     /// Shield recharge delay after a hit.
     pub shield_recharge: u32,
     /// Score multiplier.
@@ -792,6 +799,7 @@ impl Sim {
             shields: def.default_shield_percentage as f64,
             power: 0.0,
             air_weapon: id("aiic"),  // Ion Cannon
+            air_weapon_queued: NONE_ID,
             ground_weapon: id("plbo"), // Plasma Bomb
             fire_timer: 0,
             invuln: def.entry_invulnerability_time as u32,
@@ -800,6 +808,7 @@ impl Sim {
             bomb_last: 0,
             prev_bomb: false,
             prev_fire: false,
+            prev_cycle: false,
             shield_recharge: 0,
             multiplier: 1,
             next_life_score: def.life_initial_required_score,
@@ -1466,6 +1475,12 @@ impl Sim {
                     rt.act_unit = NONE_ID;
                     if let Some(p) = self.players[slot].as_mut() {
                         if ground { p.gpower = 0.0 } else { p.power = 0.0 }
+                        // Priv_AirPowerup_Process state-3→0 applies the
+                        // weapon queued by ChangeWeapon while charging.
+                        if !ground && p.air_weapon_queued != NONE_ID {
+                            p.air_weapon = p.air_weapon_queued;
+                            p.air_weapon_queued = NONE_ID;
+                        }
                     }
                 }
             }
@@ -2193,18 +2208,32 @@ impl Sim {
         // ground = bomb held).
         self.step_powerup(assets, slot, false, inp.fire);
         self.step_powerup(assets, slot, true, inp.bomb);
-        // Select Air Weapon key: cycle to the next available PEAA weapon
-        // (G_WeaponHandler inC → GetNextRefPtrByType).
+        // Select Air Weapon key: edge-triggered cycle to the next
+        // available PEAA weapon (G_WeaponHandler inC → GetNextRefPtrByType
+        // → ChangeWeapon). ChangeWeapon swaps immediately only while the
+        // air power-up machine is idle (m_field_0x11 == 0); while charging
+        // or releasing the pick is queued in m_airCurrentWeapon and
+        // applied when the machine returns to state 0.
         if inp.cycle {
             if let Some(p) = self.players[slot].as_mut() {
-                if let Some(w) = next_weapon_after(assets, id("PEAA"), p.air_weapon, self.level_number) {
-                    if w != p.air_weapon {
-                        p.air_weapon = w;
-                        p.weapon_popup = 60;
-                        self.events.push(SimEvent::PlayerEvent(slot, "weapon_cycle"));
+                let edge = !p.prev_cycle;
+                p.prev_cycle = inp.cycle;
+                if edge {
+                    if let Some(w) = next_weapon_after(assets, id("PEAA"), p.air_weapon, self.level_number) {
+                        if w != p.air_weapon {
+                            if p.air_power.state == 0 {
+                                p.air_weapon = w;
+                            } else {
+                                p.air_weapon_queued = w;
+                            }
+                            p.weapon_popup = 60;
+                            self.events.push(SimEvent::PlayerEvent(slot, "weapon_cycle"));
+                        }
                     }
                 }
             }
+        } else if let Some(p) = self.players[slot].as_mut() {
+            p.prev_cycle = false;
         }
     }
 
