@@ -4911,16 +4911,19 @@ impl Sim {
             let max_hp = assets.units.get(&unit).map(|d| d.shields_max).unwrap_or(1.0);
             self.damage_entity(assets, i, max_hp + 1.0, owner);
         }
-        // Pickups: apply effect, destroy entity (full Destroy → destruct_spawn).
-        // Original sets m_field_be=1 after Destroy — the "collected" flag
-        // that suppresses reap-time coin release.
+        // Pickups: apply effect, then Destroy directly — the original calls
+        // entity->Destroy (not Hit/damage), bypassing shield/invulnerable
+        // gates. Routing through damage_entity let pickups with
+        // collision-immunity flags survive and re-collect every frame.
+        // m_field_be=1 after Destroy is the "collected" flag that suppresses
+        // reap-time coin release (ram_kill here).
         for (i, slot) in pickups {
             if self.entities[i].dead {
                 continue;
             }
             if self.apply_pickup(assets, slot, i) {
                 let owner = slot as i32;
-                self.damage_entity(assets, i, f64::MAX, owner);
+                self.destroy_entity(assets, i, owner);
                 self.entities[i].ram_kill = true;
             }
         }
