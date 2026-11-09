@@ -602,6 +602,31 @@ fn main() {
         film_probe();
         return;
     }
+    // --dump-raw <tag> <id> <file>: write a resource's raw bytes (sprite
+    // plates are GIFs, im16 images are TGAs).
+    if let Some(pos) = args.iter().position(|a| a == "--dump-raw") {
+        let mut set = PakSet::open_dir(&data_dir()).expect("open paks");
+        let tag = Tag::from_code(args[pos + 1].as_bytes()).expect("bad tag");
+        let raw = set.read_raw(tag, id(&args[pos + 2])).expect("resource not found");
+        std::fs::write(&args[pos + 3], raw).expect("write");
+        return;
+    }
+    // --ls <pak-name-part>: list a pak's resources (tag folder, id, name).
+    if let Some(part) = arg_value(&args, "--ls") {
+        let set = PakSet::open_dir(&data_dir()).expect("open paks");
+        for (path, pak) in &set.paks {
+            let file = path.file_name().unwrap().to_string_lossy().to_lowercase();
+            if !file.contains(&part.to_lowercase()) {
+                continue;
+            }
+            let mut names: Vec<_> = pak.names.values().collect();
+            names.sort_by(|a, b| (&a.folder, &a.display).cmp(&(&b.folder, &b.display)));
+            for n in names {
+                println!("{} {} {}", n.folder, game::sim::rid_str(n.rid), n.display);
+            }
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--trace") {
         trace_script(&args);
         return;

@@ -180,7 +180,7 @@ pub struct Pak {
     // Keyed by (tag code, rid): the same four-character ID legitimately
     // appears under different tags (e.g. `gaco` is both a `.coli` and a
     // `.tefo` file).
-    names: HashMap<(u32, u32), EntryName>,
+    pub names: HashMap<(u32, u32), EntryName>,
 }
 
 impl Pak {
