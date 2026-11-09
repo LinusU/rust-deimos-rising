@@ -36,10 +36,6 @@ pub const SIDE_SCROLL_MIN: f32 = -32.0;
 pub const SIDE_SCROLL_MAX: f32 = 31.0;
 /// Max live entities (G_EG_RequestSpawn caps at 0x3e8).
 pub const MAX_ENTITIES: usize = 1000;
-/// Ticks of scroll look-ahead for level-object spawning (original uses 0x40 px
-/// of row lookahead; we spawn one screen ahead so they never pop in).
-const SPAWN_AHEAD: f32 = SCREEN_H;
-
 /// Perm-float indices used by the sim (positional into `fill_list`).
 pub mod pf {
     pub const VISIBLE_GAME_WIDTH: usize = 0x36; // 416
@@ -571,6 +567,11 @@ pub struct Sim {
     pub entities: Vec<Entity>,
     /// Indices into `level.objects` not yet spawned (sorted by world y).
     pending_objects: Vec<usize>,
+    /// Level objects inside the initial update rect (y <= screen height),
+    /// spawned once at level start in DESCENDING y order — G_Bgnd_
+    /// DoInitialMapSpawns iterates rows from g_bgndUpdateRectBottom down to
+    /// the scroll offset before the first frame runs.
+    initial_objects: Vec<usize>,
     pub phase: Phase,
     /// Fixed-timestep accumulator (seconds).
     pub acc: f32,
@@ -581,6 +582,11 @@ pub struct Sim {
     spawn_queue: Vec<SpawnReq>,
     /// Parallel to spawn_queue: pinned screen pos for UI entities.
     spawn_locks: Vec<Option<Vec2>>,
+    /// Level-start notice banner deferred until the initial level objects
+    /// have been queued, matching sub_41fc80's order (G_Bgnd_
+    /// DoInitialMapSpawns runs before the Notice_Level_XX RequestSpawn).
+    /// Tuple: (unit id, world pos, screen-lock pos).
+    pub pending_notice: Option<(ResId, Vec2, Vec2)>,
     /// Deferred one-shot actions (e.g. spawn at pos next tick).
     pub events: Vec<SimEvent>,
     /// Debris zones (G_Debris): world-space rects [min_x, min_y, max_x,
@@ -668,6 +674,11 @@ pub struct SpawnReq {
     pub unit: ResId,
     pub pos: Vec2,
     pub heading: Option<f32>,
+    /// SpawnRequest f13 != 0 path: the request carries its own heading
+    /// (weapon spawn-set angle) so arg4=1 and the tolerance roll always
+    /// applies. Level objects leave this false (f13==0 → arg4 =
+    /// initialHeadingSetInEditor, arg5 = f16 headingDegrees).
+    pub heading_forced: bool,
     pub owner: usize,
     pub spawner_player: i32,
     pub stationary: bool,
@@ -677,9 +688,23 @@ pub struct SpawnReq {
 
 impl Sim {
     pub fn new(level: LevelDef, level_id: ResId, seed: u64) -> Sim {
+        // Required-group spawn order (sub_41a5b0 + sub_417900): the map
+        // spawn frontier sweeps the level's file-y from the map bottom
+        // (numRows) toward the top, so objects spawn in DESCENDING file-y
+        // order; the stable sort keeps .leve file order for same-row ties,
+        // matching the required-groups list scan.
+        let level_h = (level.background[3] - level.background[1]).max(1) as f32;
         let mut pending: Vec<usize> = (0..level.objects.len()).collect();
-        pending.sort_by_key(|&i| level.objects[i].y);
-        Sim {
+        pending.sort_by(|&a, &b| level.objects[b].y.cmp(&level.objects[a].y));
+        // G_Bgnd_DoInitialMapSpawns covers rows [numRows-544, numRows]
+        // before frame 0; everything below is scroll-gated.
+        let split = pending
+            .iter()
+            .position(|&i| (level.objects[i].y as f32) < level_h - 544.0)
+            .unwrap_or(pending.len());
+        let initial: Vec<usize> = pending[..split].to_vec();
+        let rest = pending[split..].to_vec();
+        let mut sim = Sim {
             level,
             level_id,
             scroll: 0.0,
@@ -695,7 +720,8 @@ impl Sim {
             level_number: 1,
             players: [None, None],
             entities: Vec::new(),
-            pending_objects: pending,
+            pending_objects: rest,
+            initial_objects: initial,
             phase: Phase::Intro,
             acc: 0.0,
             next_unique: 1,
@@ -721,7 +747,16 @@ impl Sim {
             perfect_count: 0,
             levels_played: 0,
             level_end_complete: false,
-        }
+            pending_notice: None,
+        };
+        // G_Player::ResetAtLevelStart runs for both player objects at every
+        // level start (sub_41fc80 loops i < 2 regardless of active players)
+        // and unconditionally rolls U_Utils_RandomInt(400, 2000) for the
+        // license field — two rand() calls between srand() and the first
+        // spawn. Required for retail film replay rand-stream parity.
+        rand_int(&mut sim.rng, 400, 2000);
+        rand_int(&mut sim.rng, 400, 2000);
+        sim
     }
 
     /// World-space width/height of the level terrain.
@@ -795,6 +830,7 @@ impl Sim {
                 unit: def.entry_spawn,
                 pos: w,
                 heading: None,
+                heading_forced: false,
                 owner: usize::MAX,
                 spawner_player: slot as i32,
                 stationary: false,
@@ -899,22 +935,16 @@ impl Sim {
         }
         let gid = self.next_group_id;
         self.next_group_id = self.next_group_id.wrapping_add(1).max(1);
-        let mut acc = 0u32;
+        // The group-delay roll happens inside each entity's creation tail
+        // (sub_41a890), after its ChangeState rolls — accumulate here so
+        // member k activates at the sum of rolls 1..=k.
+        let mut acc = 0i64;
         for _ in 0..count {
-            acc = acc.saturating_add(if def.group_delay_min != def.group_delay_max {
-                rand_int(
-                    &mut self.rng,
-                    def.group_delay_min as i64,
-                    def.group_delay_max.max(def.group_delay_min) as i64,
-                ) as u32
-            } else {
-                def.group_delay_min.max(0) as u32
-            });
-            self.spawn_one(assets, req, acc, gid);
+            self.spawn_one(assets, req, gid, &mut acc);
         }
     }
 
-    fn spawn_one(&mut self, assets: &GameAssets, req: &SpawnReq, activate_in: u32, group_id: u32) -> Option<usize> {
+    fn spawn_one(&mut self, assets: &GameAssets, req: &SpawnReq, group_id: u32, group_acc: &mut i64) -> Option<usize> {
         let def = assets.units.get(&req.unit)?;
         if def.states.is_empty() {
             return None;
@@ -959,20 +989,33 @@ impl Sim {
         } else {
             rand_float(&mut self.rng, def.initial_speed_min as f64, def.initial_speed_max as f64) as f32
         };
-        let heading_base = req.heading.unwrap_or(def.initial_heading as f32);
+        // sub_01a890 heading resolution: arg4 = heading_forced(f13!=0) ? 1
+        // : initialHeadingSetInEditor; arg5 = request heading (spawn-set
+        // angle via f14, level headingDegrees via f16, else 0). arg4 →
+        // heading = arg5 + tolerance jitter, rolled only when
+        // initialHeadingTolerance != 0 and wrapped to [0,360); !arg4 →
+        // heading = the unit def's initialHeading with no roll.
         let tol = def.initial_heading_tolerance;
-        // The tolerance roll only runs on the useOwnerHeading path
-        // (useRandomAngle in sub_01c840); no retail unit sets
-        // use_owner_heading, so the roll never fires.
-        let heading = if !req.stationary
-            && req.heading.is_none()
-            && def.use_owner_heading
-            && tol != 0
-        {
-            let half = ((tol + 1) >> 1) as i64;
-            heading_base + rand_int(&mut self.rng, -half, half) as f32
+        let arg4 = req.heading_forced || def.initial_heading_set_in_editor;
+        let arg5 = req.heading.unwrap_or(0.0);
+        let heading = if arg4 {
+            if tol != 0 {
+                let half = (tol + 1 - if tol < 0 { 1 } else { 0 }) >> 1;
+                let mut h = arg5 + rand_int(&mut self.rng, -half, half) as f32;
+                if h < 0.0 {
+                    h += 360.0;
+                } else if h > 359.0 {
+                    h -= 360.0;
+                }
+                if h < 0.0 || h > 359.0 {
+                    h = 0.0;
+                }
+                h
+            } else {
+                arg5
+            }
         } else {
-            heading_base
+            def.initial_heading as f32
         };
         // Spawn velocity uses the INVERTED heading (sub_01c840 calls
         // U_Math_InvertAngle before GetVectorFromAngleAndSpeed); the stored
@@ -987,10 +1030,30 @@ impl Sim {
             Vec2::new(hr.sin() * speed, hr.cos() * speed)
         };
         let shields = if def.shields_max > 0.0 { def.shields_max } else { def.shields_base };
-        // Roll the on_timer target once at spawn.
-        let timer_target = if state.on_timer_max > 0 || state.on_timer_min > 0 {
-            rand_int(&mut self.rng, state.on_timer_min as i64, state.on_timer_max.max(state.on_timer_min) as i64) as u32
-        } else { 0 };
+        // ChangeState's rand consumption, in order: the on_timer roll is
+        // UNCONDITIONAL (RandomInt(0,0) still draws rand()), then the
+        // inFlag1(scale) block rolls initialScalePercentTolerance.
+        let timer_target = rand_int(
+            &mut self.rng,
+            state.on_timer_min as i64,
+            state.on_timer_max.max(state.on_timer_min) as i64,
+        ) as u32;
+        let scale_roll = if def.initial_scale_percent_tolerance != 0 {
+            let half = def.initial_scale_percent_tolerance / 2;
+            rand_int(&mut self.rng, -half, half)
+        } else {
+            0
+        };
+        let spawn_scale = (def.initial_scale_percent + scale_roll).max(0) as f32 / 100.0;
+        // sub_41a890 tail: the group-delay roll accumulates per entity.
+        let dmin = def.group_delay_min as i64;
+        let dmax = def.group_delay_max.max(dmin);
+        *group_acc += if dmin != dmax {
+            rand_int(&mut self.rng, dmin, dmax)
+        } else {
+            dmin
+        };
+        let activate_in = (*group_acc).max(0) as u32;
         let idx = self.entities.len();
         // req.owner is an entity index; store the stable unique_num.
         let owner_uid = if req.owner != usize::MAX && req.owner < self.entities.len() {
@@ -1048,7 +1111,7 @@ impl Sim {
             tint: 0.0,
             tint_req: 0.0,
             tint_delta: 0.0,
-            scale: 1.0,
+            scale: spawn_scale,
             scale_tgt: 1.0,
             scale_delta: 0.0,
             particle_bursts: 0,
@@ -1142,6 +1205,7 @@ impl Sim {
                 unit: sp.unit_id,
                 pos,
                 heading,
+                heading_forced: sp.set_heading,
                 owner: usize::MAX,
                 spawner_player: slot as i32,
                 stationary: false,
@@ -1215,6 +1279,7 @@ impl Sim {
                         unit: act_spawn,
                         pos,
                         heading: None,
+                        heading_forced: false,
                         owner: usize::MAX,
                         spawner_player: slot as i32,
                         stationary: false,
@@ -1329,6 +1394,7 @@ impl Sim {
                         unit: rel_spawn,
                         pos,
                         heading: None,
+                        heading_forced: false,
                         owner: usize::MAX,
                         spawner_player: slot as i32,
                         stationary: false,
@@ -1392,6 +1458,38 @@ impl Sim {
         }
     }
 
+    /// Queue a level object for spawning (shared by the initial update-rect
+    /// batch and the scroll-gated pending list).
+    fn queue_level_object(&mut self, assets: &GameAssets, oi: usize) {
+        let obj = &self.level.objects[oi];
+        if obj.unit_id == NONE_ID {
+            return;
+        }
+        // World position: the original entity y IS the file yLoc (screen
+        // pos = y - scrollOffset); our pos.y measures height above the map
+        // bottom, so pos.y = level_height - file_y. 'grnd'-class objects
+        // get x -= 32.0 (sub_41a5b0: xLoc field -= dat_4e34b8 = 32.0f).
+        let ground = assets
+            .units
+            .get(&obj.unit_id)
+            .map(|d| d.is_ground_based)
+            .unwrap_or(false);
+        let pos = Vec2::new(
+            obj.x as f32 - if ground { 32.0 } else { 0.0 },
+            self.level_height() - obj.y as f32,
+        );
+        self.request_spawn(SpawnReq {
+            unit: obj.unit_id,
+            pos,
+            heading: Some(obj.heading_degrees as f32),
+            heading_forced: false,
+            owner: usize::MAX,
+            spawner_player: -1,
+            stationary: obj.stationary,
+            state: None,
+        });
+    }
+
     /// Advance the simulation by one 60 Hz tick.
     pub fn step(&mut self, assets: &GameAssets, input: &PlayerInput) {
         self.game_time += 1;
@@ -1443,6 +1541,7 @@ impl Sim {
                                 unit: def_obj,
                                 pos: wpos,
                                 heading: None,
+                                heading_forced: false,
                                 owner: usize::MAX,
                                 spawner_player: spawner,
                                 stationary: true,
@@ -1541,6 +1640,7 @@ impl Sim {
                             unit: rid,
                             pos,
                             heading: None,
+                            heading_forced: false,
                             owner: usize::MAX,
                             spawner_player: -1,
                             stationary: true,
@@ -1552,36 +1652,38 @@ impl Sim {
         }
 
         // --- level object spawning ---
-        // Objects spawn when the scroll reaches their world y (they appear at
-        // the top edge and scroll down into view).
-        let spawn_horizon = self.scroll + SPAWN_AHEAD;
+        // Initial update-rect objects spawn once, descending y (the
+        // original's DoInitialMapSpawns row order) before any scrolling.
+        for oi in std::mem::take(&mut self.initial_objects) {
+            self.queue_level_object(assets, oi);
+        }
+        // Level-start notice banner: sub_41fc80 runs DoInitialMapSpawns,
+        // then this RequestSpawn, before the first G_Bgnd_Process row
+        // check — so it queues after the initial batch but before any
+        // scroll-gated object.
+        if let Some((unit, pos, screen)) = self.pending_notice.take() {
+            self.request_spawn_screen(SpawnReq {
+                unit,
+                pos,
+                heading: None,
+                heading_forced: false,
+                owner: usize::MAX,
+                spawner_player: -1,
+                stationary: true,
+                state: None,
+            }, screen);
+        }
+
+        // Scroll-gated spawns (sub_410230 → sub_417900): each frame checks
+        // row scrollOffset-0x40 = level_height-544-scroll; objects at that
+        // file y spawn. In descending file-y order this is equivalent to
+        // spawning every object whose file y has been reached by the
+        // frontier.
+        let frontier = self.level_height() - 544.0 - self.scroll;
         while let Some(&oi) = self.pending_objects.first() {
-            let obj = &self.level.objects[oi];
-            if (obj.y as f32) <= spawn_horizon {
+            if (self.level.objects[oi].y as f32) >= frontier {
                 self.pending_objects.remove(0);
-                if obj.unit_id == NONE_ID {
-                    continue;
-                }
-                // Ground-class level objects spawn 32px higher
-                // (sub_41a5b0: typeCode "grnd" → y -= dat_4e34b8 = 32.0f).
-                let mut pos = Vec2::new(obj.x as f32, obj.y as f32);
-                if assets
-                    .units
-                    .get(&obj.unit_id)
-                    .map(|d| d.is_ground_based)
-                    .unwrap_or(false)
-                {
-                    pos.y -= 32.0;
-                }
-                self.request_spawn(SpawnReq {
-                    unit: obj.unit_id,
-                    pos,
-                    heading: Some(obj.heading_degrees as f32),
-                    owner: usize::MAX,
-                    spawner_player: -1,
-                    stationary: obj.stationary,
-                    state: None,
-                });
+                self.queue_level_object(assets, oi);
             } else {
                 break;
             }
@@ -1908,6 +2010,7 @@ impl Sim {
                                 unit: def.entry_spawn,
                                 pos: w,
                                 heading: None,
+                                heading_forced: false,
                                 owner: usize::MAX,
                                 spawner_player: slot as i32,
                                 stationary: false,
@@ -1984,6 +2087,8 @@ impl Sim {
         // burst counter is positive it fires one shot every
         // delayBetweenLoadLaunches ticks, even after release. Blocked
         // while the ground power-up machine is not idle (m_field_0x35).
+        // The intervals come from m_airPermanentWeapon — the DEAG
+        // (default pack/ground) weapon def, i.e. the ground weapon.
         let now = self.game_time;
         let level_num = self.level_number;
         let mut fire_gnd = false;
@@ -2491,9 +2596,14 @@ impl Sim {
         e.state_time = 0;
         e.dir_index = -1;
         let st = &def.states[e.state];
-        e.state_timer_target = if st.on_timer_max > 0 || st.on_timer_min > 0 {
-            rand_int(&mut self.rng, st.on_timer_min, st.on_timer_max.max(st.on_timer_min)) as u32
-        } else { 0 };
+        // ChangeState rolls RandomInt(onTimerMin, onTimerMax) on EVERY state
+        // change — RandomInt(0,0) still consumes a rand() call, so this must
+        // stay unconditional for rand-stream parity.
+        e.state_timer_target = rand_int(
+            &mut self.rng,
+            st.on_timer_min,
+            st.on_timer_max.max(st.on_timer_min),
+        ) as u32;
         e.spawn_timers = vec![SpawnSetRt::default(); st.spawn_sets.len()];
         e.frame = st.sprite_frame_min;
         e.anim_stopped = false;
@@ -3177,7 +3287,10 @@ impl Sim {
             self.request_spawn(SpawnReq {
                 unit: ss.spawn_id,
                 pos: sp,
-                heading: if ss.set_heading { Some(ss.heading_degrees as f32) } else { Some(heading) },
+                // Spawn-set requests only carry a heading when setHeading
+                // is set (req+0xd/+0xe); otherwise f16 stays 0 so arg5=0.
+                heading: if ss.set_heading { Some(ss.heading_degrees as f32) } else { None },
+                heading_forced: ss.set_heading,
                 owner: idx,
                 spawner_player: self.entities[idx].spawner_player,
                 stationary: ss.stationary_option,
@@ -3476,6 +3589,7 @@ impl Sim {
                     unit: cur_state.collision_spawn_id,
                     pos,
                     heading: None,
+                    heading_forced: false,
                     owner: owner_idx,
                     spawner_player: from_player,
                     stationary: false,
@@ -3523,6 +3637,7 @@ impl Sim {
                         unit: life_spawn,
                         pos,
                         heading: None,
+                        heading_forced: false,
                         owner: usize::MAX,
                         spawner_player: slot as i32,
                         stationary: false,
@@ -3578,6 +3693,7 @@ impl Sim {
                 unit: def.destruct_spawn,
                 pos: epos,
                 heading: None,
+                heading_forced: false,
                 owner: usize::MAX,
                 spawner_player: from_player,
                 stationary: false,
@@ -3607,6 +3723,7 @@ impl Sim {
                     unit: def.destruct_coin,
                     pos: epos,
                     heading: None,
+                    heading_forced: false,
                     owner: usize::MAX,
                     spawner_player: from_player,
                     stationary: false,
@@ -3631,6 +3748,7 @@ impl Sim {
                     unit: def.destruct_coin_on_group_kill,
                     pos: epos,
                     heading: None,
+                    heading_forced: false,
                     owner: usize::MAX,
                     spawner_player: from_player,
                     stationary: false,
@@ -3654,6 +3772,7 @@ impl Sim {
                     unit: bonus,
                     pos: epos,
                     heading: None,
+                    heading_forced: false,
                     owner: usize::MAX,
                     spawner_player: from_player,
                     stationary: false,
@@ -3770,6 +3889,7 @@ impl Sim {
                 unit: pdef.active_spawn_on_hit,
                 pos,
                 heading: None,
+                heading_forced: false,
                 owner: usize::MAX,
                 spawner_player: slot as i32,
                 stationary: true,
@@ -3809,6 +3929,7 @@ impl Sim {
                 unit: pdef.active_shield_warning_object,
                 pos,
                 heading: None,
+                heading_forced: false,
                 owner: usize::MAX,
                 spawner_player: slot as i32,
                 stationary: true,
@@ -3822,6 +3943,7 @@ impl Sim {
                     unit,
                     pos,
                     heading: None,
+                    heading_forced: false,
                     owner: usize::MAX,
                     spawner_player: slot as i32,
                     stationary: true,
@@ -3851,6 +3973,7 @@ impl Sim {
                     unit: u,
                     pos: pos + off,
                     heading: None,
+                    heading_forced: false,
                     owner: usize::MAX,
                     spawner_player: slot as i32,
                     stationary: false,
