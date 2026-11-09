@@ -490,6 +490,10 @@ fn main() {
         pickups_probe();
         return;
     }
+    if args.iter().any(|a| a == "--weapons") {
+        weapon_probe();
+        return;
+    }
     if args.iter().any(|a| a == "--playerdefs") {
         player_probe();
         return;
@@ -1218,6 +1222,29 @@ fn state_probe(ridv: u32) {
                 st.on_timer_min, st.on_timer_max,
                 st.on_timer_change_to, st.on_range, st.on_range_change_to,
                 st.entry_sound.id
+            );
+        }
+    }
+}
+
+fn weapon_probe() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut v: Vec<_> = a.weapons.iter().collect();
+    v.sort_by_key(|(rid, _)| **rid);
+    for (rid, w) in v {
+        println!(
+            "{:08x} {:10} type={:08x} xoff={} yoff={} face={:08x} frame={} locked={:08x}/{} act={} spawns={} bscale={:.4}",
+            rid, w.name, w.weapon_type, w.crosshair_x_offset, w.crosshair_y_offset,
+            w.crosshair_face, w.crosshair_frame, w.crosshair_locked_face,
+            w.crosshair_locked_frame, w.crosshair_spawn_on_activation,
+            w.spawns.len(), w.ballistic_scale
+        );
+        for s in &w.spawns {
+            println!(
+                "    spawn {:08x} ({},{}) sethdg={} ang={}",
+                s.unit_id, s.x_loc, s.y_loc, s.set_heading, s.angle
             );
         }
     }

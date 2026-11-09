@@ -1126,6 +1126,11 @@ pub struct WeaponDef {
     pub invulnerable_for_time: i64,
     pub spawns: Vec<WeaponSpawn>,
     pub powerup: WeaponPowerup,
+    /// G_WeaponHandler::Priv_Spawn_Ground's req.m_field24 — the projectile
+    /// velocity scale derived from the crosshair icon's drawn position:
+    /// max(0, (int)(iconFrameH/2 - crosshairYOffset)) / |crosshairYOffset|.
+    /// 1.0 for air weapons (the field is only set on the ground path).
+    pub ballistic_scale: f64,
 }
 
 impl WeaponDef {
@@ -1165,6 +1170,7 @@ impl WeaponDef {
             invulnerable_for_time: cur.get_int("#invulnerableForTime_INT"),
             spawns: Vec::new(),
             powerup: WeaponPowerup::default(),
+            ballistic_scale: 1.0,
         };
         let num_units = cur.get_int("#spawn_NumUnitsToSpawn_INT") as usize;
         for _ in 0..num_units {

@@ -1223,7 +1223,7 @@ impl Sim {
             };
             p.air_weapon
         };
-        self.fire_weapon_id(assets, slot, weapon_id);
+        self.fire_weapon_id(assets, slot, weapon_id, false);
         if let Some(p) = self.players[slot].as_mut() {
             if let Some(w) = assets.weapons.get(&weapon_id) {
                 p.fire_timer = w.delay_between_launches.max(1) as u32;
@@ -1237,10 +1237,10 @@ impl Sim {
             Some(p) if p.phase == PlayerPhase::Active => p.ground_weapon,
             _ => return,
         };
-        self.fire_weapon_id(assets, slot, weapon_id);
+        self.fire_weapon_id(assets, slot, weapon_id, true);
     }
 
-    fn fire_weapon_id(&mut self, assets: &GameAssets, slot: usize, weapon_id: ResId) {
+    fn fire_weapon_id(&mut self, assets: &GameAssets, slot: usize, weapon_id: ResId, ground: bool) {
         let pos = match self.players[slot].as_ref() {
             Some(p) if p.phase == PlayerPhase::Active => p.world_pos(self),
             _ => return,
@@ -1249,11 +1249,18 @@ impl Sim {
             Some(w) => w.clone(),
             None => return,
         };
+        // Priv_Spawn_Ground stamps req.m_field24 — a velocity scale derived
+        // from the crosshair icon position — on every ground-weapon spawn
+        // request; Priv_Spawn_Air leaves it at the 1.0 default.
+        let vel_scale = if ground { wdef.ballistic_scale as f32 } else { 1.0 };
+        let before = self.entities.len();
         for sp in &wdef.spawns {
             if sp.unit_id == NONE_ID {
                 continue;
             }
-            // Weapon spawn offsets: x right, y up-screen = +world y.
+            // req.f4/f8 = spawn-set offset + player loc added directly in
+            // the original's screen-space y (down-positive); our world y is
+            // up-positive altitude, so the file YLoc negates.
             let mut pos = pos;
             pos.x += sp.x_loc as f32;
             pos.y += (-sp.y_loc) as f32;
@@ -1268,6 +1275,15 @@ impl Sim {
                 stationary: false,
                 state: None,
             });
+        }
+        if vel_scale != 1.0 {
+            // sub_01c840's tail: m_field24 scales entity+0x10/0x14 (m_prevX/Y
+            // = integrated velocity) before the +0xf8 snapshot and the
+            // tvel/vdelta init; ChangeState then rewrites tvel/vdelta from
+            // state params, so only the momentum `vel` keeps the scale.
+            for e in &mut self.entities[before..] {
+                e.vel *= vel_scale;
+            }
         }
     }
 

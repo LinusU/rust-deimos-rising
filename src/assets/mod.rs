@@ -223,6 +223,39 @@ impl GameAssets {
                 self.text_formats.insert(rid, crate::data::TextFormat::parse(&t));
             }
         }
+
+        // Priv_Spawn_Ground's m_field24 velocity scale, per ground weapon:
+        // the crosshair icon is drawn at player + (xoff, yoff) minus half
+        // the icon frame, so diffY = iconH/2 - yoff and the scale is
+        // max(0,(int)diffY)/|yoff|. The player position cancels out, making
+        // it a per-weapon constant (the y>=shieldOffset clamp can't bind at
+        // real player altitudes). Air weapons keep the 1.0 default.
+        let ground_ids: Vec<ResId> = self
+            .weapons
+            .iter()
+            .filter(|(_, w)| w.weapon_type == crate::pak::id("PEAG"))
+            .map(|(&rid, _)| rid)
+            .collect();
+        for rid in ground_ids {
+            let (face, frame, yoff) = {
+                let w = &self.weapons[&rid];
+                (w.crosshair_face, w.crosshair_frame, w.crosshair_y_offset)
+            };
+            if yoff == 0 {
+                continue;
+            }
+            let icon_h = self
+                .sprite(face)
+                .and_then(|s| {
+                    s.frames
+                        .get(frame.max(0) as usize)
+                        .map(|f| f.height as i64)
+                })
+                .unwrap_or(0);
+            let diff_y = icon_h / 2 - yoff;
+            let scale = if diff_y > 0 { diff_y as f64 / yoff.unsigned_abs() as f64 } else { 0.0 };
+            self.weapons.get_mut(&rid).unwrap().ballistic_scale = scale;
+        }
     }
 
     // -- sprites ---------------------------------------------------------
