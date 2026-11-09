@@ -1376,7 +1376,11 @@ impl Sim {
         // Priv_Spawn_Ground stamps req.m_field24 — a velocity scale derived
         // from the crosshair icon position — on every ground-weapon spawn
         // request; Priv_Spawn_Air leaves it at the 1.0 default.
-        let vel_scale = if ground { wdef.ballistic_scale as f32 } else { 1.0 };
+        let vel_scale = if ground {
+            self.ground_ballistic_scale(assets, slot, &wdef)
+        } else {
+            1.0
+        };
         let before = self.entities.len();
         let mut spawned = 0usize;
         for sp in &wdef.spawns {
@@ -1412,6 +1416,34 @@ impl Sim {
                 e.vel *= vel_scale;
             }
         }
+    }
+
+    /// Priv_Spawn_Ground's `req.m_field24`, recomputed per shot. The
+    /// crosshair icon is drawn player-relative (G_Player.cpp: weaponLoc =
+    /// ship + crosshairOffset, centered by iconH/2, clamped to
+    /// g_shieldOffset = 0), so diffY = iconH/2 - crosshairYOffset is the
+    /// constant ballistic_scale in normal play; it only goes dynamic when
+    /// the clamp pins the icon at screen top (player high enough that
+    /// weaponLoc.y - iconH/2 < 0), where diffY collapses to m_y.
+    fn ground_ballistic_scale(
+        &self,
+        _assets: &GameAssets,
+        slot: usize,
+        wdef: &crate::data::WeaponDef,
+    ) -> f32 {
+        let off_y = wdef.crosshair_y_offset as f32;
+        if off_y == 0.0 || wdef.ballistic_half_h == 0.0 {
+            return wdef.ballistic_scale as f32;
+        }
+        let Some(p) = self.players[slot].as_ref() else {
+            return 1.0;
+        };
+        // drawLoc.y = clamp(m_y + offY - iconH/2, g_shieldOffset=0, ..).
+        let draw_loc_y = (p.screen.y + off_y - wdef.ballistic_half_h as f32).max(0.0);
+        // diffY = m_y - temp.y; (int) truncates toward zero, then clamps >=0.
+        let diff_y = p.screen.y - draw_loc_y;
+        let rounded = (diff_y as i32).max(0);
+        rounded as f32 / off_y.abs()
     }
 
     /// `Priv_AirPowerup_Process` / ground-bank mirror: charge while the fire

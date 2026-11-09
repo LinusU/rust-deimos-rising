@@ -353,7 +353,9 @@ impl GameAssets {
                 .unwrap_or(0);
             let diff_y = icon_h / 2 - yoff;
             let scale = if diff_y > 0 { diff_y as f64 / yoff.unsigned_abs() as f64 } else { 0.0 };
-            self.weapons.get_mut(&rid).unwrap().ballistic_scale = scale;
+            let w = self.weapons.get_mut(&rid).unwrap();
+            w.ballistic_scale = scale;
+            w.ballistic_half_h = (icon_h / 2) as f64;
         }
     }
 

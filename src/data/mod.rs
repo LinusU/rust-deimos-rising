@@ -1131,6 +1131,10 @@ pub struct WeaponDef {
     /// max(0, (int)(iconFrameH/2 - crosshairYOffset)) / |crosshairYOffset|.
     /// 1.0 for air weapons (the field is only set on the ground path).
     pub ballistic_scale: f64,
+    /// Half the crosshair sprite frame's pixel height — the `h/2` term in
+    /// the m_field24 crosshair-centering math, kept for the runtime
+    /// shieldOffset-clamped recomputation.
+    pub ballistic_half_h: f64,
 }
 
 impl WeaponDef {
@@ -1171,6 +1175,7 @@ impl WeaponDef {
             spawns: Vec::new(),
             powerup: WeaponPowerup::default(),
             ballistic_scale: 1.0,
+            ballistic_half_h: 0.0,
         };
         let num_units = cur.get_int("#spawn_NumUnitsToSpawn_INT") as usize;
         for _ in 0..num_units {
