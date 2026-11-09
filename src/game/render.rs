@@ -1115,6 +1115,33 @@ pub(crate) fn to_world_z(sx: f32, sy: f32, z: f32) -> Vec3 {
     Vec3::new(sx - SCREEN_W * 0.5, SCREEN_H * 0.5 - sy, z)
 }
 
+/// Put every unscaled sprite on whole pixels, where the original draws it.
+///
+/// `U_Sprite_Draw` is handed a sprite's centre in whole pixels and blits
+/// with the top-left at `(x - w/2, y - h/2)`, halving in integers. A
+/// sprite of odd size therefore covers the pixels around `x + 0.5`, half
+/// a pixel off its nominal centre; left on the nominal centre it would
+/// straddle pixel edges and shift by a pixel from one glyph to the next.
+pub fn snap_sprites(images: Res<Assets<Image>>, mut q: Query<(&Sprite, &mut Transform)>) {
+    for (sprite, mut tf) in q.iter_mut() {
+        if tf.scale != Vec3::ONE || tf.rotation != Quat::IDENTITY {
+            continue;
+        }
+        let size = sprite
+            .custom_size
+            .or(sprite.rect.map(|r| r.size()))
+            .or(images.get(&sprite.image).map(|i| i.size_f32()));
+        let Some(size) = size else { continue };
+        // Top-left in screen pixels, then back to the centre Bevy wants.
+        let left = (tf.translation.x + SCREEN_W * 0.5).floor() - (size.x * 0.5).floor();
+        let top = (SCREEN_H * 0.5 - tf.translation.y).floor() - (size.y * 0.5).floor();
+        let snapped = to_world_z(left + size.x * 0.5, top + size.y * 0.5, tf.translation.z);
+        if tf.translation != snapped {
+            tf.translation = snapped;
+        }
+    }
+}
+
 // Draw order. The original sorts sprites into 16 render layers
 // (`U_Sprite_RenderLists_Add`); each maps to a z band here.
 const Z_TERRAIN: f32 = 0.0;
@@ -2390,6 +2417,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
                 sync_players,
                 sync_scorebar,
                 sync_hud_text,
+                snap_sprites,
                 shot_system,
             )
                 .chain(),
@@ -2477,7 +2505,7 @@ pub(crate) fn layout_text(
             let (w, h) = dims(c);
             out.push(Glyph {
                 frame: font_frame(c),
-                center: Vec2::new((x + (w + 1) / 2) as f32, (y + (h + 1) / 2) as f32),
+                center: Vec2::new((x + w / 2) as f32, (y + h / 2) as f32),
             });
         }
         x += advance(c);
