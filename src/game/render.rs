@@ -182,6 +182,11 @@ impl HighScores {
 const DEMO_PATH: &str = "deimos-demo.bin";
 const DEMO_MAX_FRAMES: usize = 20000; // original pad is 0x4e20 bytes
 
+/// Retail demo films (`film` resources) the original's attract mode plays
+/// on the title screen, cycled each time idle playback triggers. The local
+/// `deimos-demo.bin` recording is only a fallback when films can't load.
+const DEMO_FILMS: [u32; 4] = [0x31306564, 0x32306564, 0x33306564, 0x34306564];
+
 /// Recorded input stream for one player: 7 bits/frame
 /// (up,down,left,right,fire,bomb,cycle).
 #[derive(Default)]
@@ -247,6 +252,33 @@ impl DemoRec {
         let p2 = buf[20 + n1..20 + n1 + n2].to_vec();
         Some(DemoRec { level: Some(lvl), seed, p1, p2 })
     }
+
+    /// Build a playback stream from a retail `film` resource, translating
+    /// each packed input byte through the recovered G_Film bit map
+    /// (bit0=L bit1=R bit2=U bit3=D bit4=bomb bit5=air-fire bit6=cycle)
+    /// into our SlotInput packing. This is what the original's attract
+    /// mode replays; the seed/level come straight from the film header.
+    fn from_film(film: &crate::assets::FilmData) -> Self {
+        let tr = |b: u8| -> u8 {
+            let mut s = SlotInput::default();
+            if b & 0x01 != 0 { s.left = true; }
+            if b & 0x02 != 0 { s.right = true; }
+            if b & 0x04 != 0 { s.up = true; }
+            if b & 0x08 != 0 { s.down = true; }
+            if b & 0x10 != 0 { s.bomb = true; }
+            if b & 0x20 != 0 { s.fire = true; }
+            if b & 0x40 != 0 { s.cycle = true; }
+            DemoRec::pack(&s)
+        };
+        let n = film.frames[0].max(film.frames[1]);
+        let p1 = (0..n)
+            .map(|t| film.inputs[0].get(t).map(|&b| tr(b)).unwrap_or(0))
+            .collect();
+        let p2 = (0..n)
+            .map(|t| film.inputs[1].get(t).map(|&b| tr(b)).unwrap_or(0))
+            .collect();
+        DemoRec { level: Some(film.level_id), seed: film.seed as u64, p1, p2 }
+    }
 }
 
 /// Demo recorder + playback cursor.
@@ -257,6 +289,8 @@ pub struct Demo {
     /// Playback state: demo being replayed + frame cursor.
     pub playback: Option<DemoRec>,
     pub frame: usize,
+    /// Cursor into DEMO_FILMS so successive attract triggers cycle demos.
+    pub film_idx: usize,
 }
 
 /// Full-screen menu backdrop sprite (menu TGA / level preview).
@@ -1221,12 +1255,24 @@ pub fn flow_system(
             flow.ticks = 0;
         }
     }
-    // Title idle ~20s: start attract playback if a demo exists.
+    // Title idle ~20s: start attract playback. The original plays its
+    // pre-recorded demo films here — cycle through them; fall back to the
+    // locally-recorded demo only when no film resource loads.
     if flow.state == FlowState::Title
         && demo.playback.is_none()
         && flow.ticks > 60 * 20
     {
-        if let Some(pb) = DemoRec::load() {
+        let mut pb_opt: Option<DemoRec> = None;
+        for _ in 0..DEMO_FILMS.len() {
+            let rid = DEMO_FILMS[demo.film_idx % DEMO_FILMS.len()];
+            demo.film_idx += 1;
+            if let Some(film) = assets.film(rid) {
+                pb_opt = Some(DemoRec::from_film(&film));
+                break;
+            }
+        }
+        let pb = pb_opt.or_else(DemoRec::load);
+        if let Some(pb) = pb {
             if let Some(lid) = pb.level {
                 if let Some(new_sim) = start_level(&mut *assets, lid, 1, pb.seed) {
                     sim.0 = new_sim;
@@ -1365,16 +1411,31 @@ pub fn flow_system(
                 flow.ticks = 0;
                 return;
             }
-            // Attract playback finished its recorded frames.
-            if let Some(pb) = &demo.playback {
-                if demo.frame >= pb.frames() {
+            let in_playback = demo.playback.is_some();
+            // Attract playback ends on: recorded frames exhausted, the demo
+            // level completing, or every player dead — then return to the
+            // title. Returning early keeps the level-end/game-over flow
+            // below from overriding the transition (and skips it entirely
+            // while a demo is running).
+            if in_playback {
+                let frames_done = demo.frame >= demo.playback.as_ref().unwrap().frames();
+                let level_done = sim.0.level_end_complete;
+                let any_alive = sim
+                    .0
+                    .players
+                    .iter()
+                    .flatten()
+                    .any(|p| p.phase != PlayerPhase::Dead);
+                let any_slot = sim.0.players.iter().any(|p| p.is_some());
+                if frames_done || level_done || (any_slot && !any_alive) {
                     demo.playback = None;
                     demo.frame = 0;
                     flow.state = FlowState::Title;
                     flow.ticks = 0;
+                    return;
                 }
             }
-            if sim.0.phase == crate::game::sim::Phase::LevelEnd {
+            if !in_playback && sim.0.phase == crate::game::sim::Phase::LevelEnd {
                 // The original's level-end sequence (bonus breakdown +
                 // coin tally) plays out timed inside the sim; advance only
                 // once it fully completes.
@@ -1398,7 +1459,7 @@ pub fn flow_system(
                     }
                     flow.ticks = 0;
                 }
-            } else {
+            } else if !in_playback {
                 let any_alive = sim
                     .0
                     .players
