@@ -2497,7 +2497,7 @@ impl Sim {
             }
             let unit_id = self.entities[i].unit;
             // Clone the def+state to release the assets borrow.
-            let (def, state) = match assets.units.get(&unit_id) {
+            let (def, mut state) = match assets.units.get(&unit_id) {
                 Some(d) if !d.states.is_empty() => {
                     let s = d.states[self.entities[i].state.min(d.states.len() - 1)].clone();
                     (d.clone(), s)
@@ -2508,6 +2508,82 @@ impl Sim {
                 }
             };
             let _ = def;
+
+            // --- state repeat particles (G_EntityGroup stateParticles_*) ---
+            // Runs before state transitions in the original (G_Particle_
+            // NewGroup precedes the on_timer ChangeState), using the
+            // pre-change state — matching that order keeps rand() aligned.
+            // Original gate: MaxNumBursts != 0 && bursts < MaxNumBursts,
+            // throttled to one burst per RepeatDelay ticks.
+            if state.particles_id != NONE_ID && state.particles_max_bursts > 0 {
+                let under_cap =
+                    self.entities[i].particle_bursts < state.particles_max_bursts as u32;
+                let due = self.game_time
+                    >= self.entities[i].particle_last
+                        + state.particles_repeat_delay.max(0) as u32;
+                if under_cap && due {
+                    let unit_scroll = assets
+                        .units
+                        .get(&self.entities[i].unit)
+                        .map(|d| d.is_ground_based)
+                        .unwrap_or(false);
+                    self.emit_particles(
+                        i,
+                        state.particles_id,
+                        state.particles_color,
+                        unit_scroll,
+                        false,
+                    );
+                    self.entities[i].particle_bursts += 1;
+                    self.entities[i].particle_last = self.game_time;
+                }
+            }
+
+            // --- state sound loop/repeat (G_EntityGroup flag3c block) ---
+            // Also precedes state transitions in the original.
+            {
+                let (play, under_cap) = {
+                    let e = &self.entities[i];
+                    let mut play = false;
+                    if state.entry_sound.id != NONE_ID {
+                        if state.sound_loop {
+                            // Repeat every sound_loop_delay ticks.
+                            if e.sound_last_play == 0
+                                || self.game_time
+                                    >= e.sound_last_play + state.sound_loop_delay.max(0) as u32
+                            {
+                                play = true;
+                            }
+                        } else if e
+                            .state_sound_played
+                            .get(e.state)
+                            .copied()
+                            .unwrap_or(false)
+                            && e.sound_play_count == 0
+                        {
+                            play = true;
+                        } else if state.sound_repeat_on_state_change && e.sound_play_count == 0 {
+                            play = true;
+                        }
+                    }
+                    let under_cap = state.sound_max_num_to_play <= 0
+                        || e.sound_play_count < state.sound_max_num_to_play as u32;
+                    (play, under_cap)
+                };
+                if play && under_cap {
+                    // max_num_to_play caps total plays; 0 = uncapped here
+                    // (the original gates the whole block on it — entry
+                    // sounds still fire once via change_state).
+                    self.consume_sound_rand(
+                        state.entry_sound.min_volume,
+                        state.entry_sound.max_volume,
+                    );
+                    self.events.push(SimEvent::Sound(state.entry_sound.id));
+                    let e = &mut self.entities[i];
+                    e.sound_play_count += 1;
+                    e.sound_last_play = self.game_time;
+                }
+            }
 
             // Timers.
             {
@@ -2520,10 +2596,23 @@ impl Sim {
             }
 
             // --- state transitions ---
-            // on_timer → change to named state (or delete).
+            // on_timer → change to named state (or delete). In the
+            // original a normal ChangeState does NOT skip the rest of the
+            // pass — it refreshes state and falls through to Animate /
+            // ProcessRules / movement / SpawnControl this same tick; only
+            // Delete/Destroy (dead) short-circuit via nextChild.
             if state.on_timer_target_reached(&self.entities[i]) {
                 self.apply_state_change(i, &state.on_timer_change_to, assets);
-                continue;
+                if self.entities[i].dead {
+                    continue;
+                }
+                if let Some(d) = assets.units.get(&self.entities[i].unit) {
+                    if !d.states.is_empty() {
+                        state = d
+                            .states[self.entities[i].state.min(d.states.len() - 1)]
+                            .clone();
+                    }
+                }
             }
             // on_counter chains inside ChangeState (entry count), not here.
 
@@ -2740,78 +2829,6 @@ impl Sim {
 
             // --- owner linkage (lock/link/orbit) ---
             self.step_owner_link(i, assets);
-
-            // --- state repeat particles (G_EntityGroup stateParticles_*) ---
-            // Original gate: MaxNumBursts != 0 && bursts < MaxNumBursts,
-            // throttled to one burst per RepeatDelay ticks.
-            if state.particles_id != NONE_ID && state.particles_max_bursts > 0 {
-                let under_cap =
-                    self.entities[i].particle_bursts < state.particles_max_bursts as u32;
-                let due = self.game_time
-                    >= self.entities[i].particle_last
-                        + state.particles_repeat_delay.max(0) as u32;
-                if under_cap && due {
-                    let unit_scroll = assets
-                        .units
-                        .get(&self.entities[i].unit)
-                        .map(|d| d.is_ground_based)
-                        .unwrap_or(false);
-                    self.emit_particles(
-                        i,
-                        state.particles_id,
-                        state.particles_color,
-                        unit_scroll,
-                        false,
-                    );
-                    self.entities[i].particle_bursts += 1;
-                    self.entities[i].particle_last = self.game_time;
-                }
-            }
-
-            // --- state sound loop/repeat (G_EntityGroup flag3c block) ---
-            {
-                let (play, under_cap) = {
-                    let e = &self.entities[i];
-                    let mut play = false;
-                    if state.entry_sound.id != NONE_ID {
-                        if state.sound_loop {
-                            // Repeat every sound_loop_delay ticks.
-                            if e.sound_last_play == 0
-                                || self.game_time
-                                    >= e.sound_last_play + state.sound_loop_delay.max(0) as u32
-                            {
-                                play = true;
-                            }
-                        } else if e
-                            .state_sound_played
-                            .get(e.state)
-                            .copied()
-                            .unwrap_or(false)
-                            && e.sound_play_count == 0
-                        {
-                            play = true;
-                        } else if state.sound_repeat_on_state_change && e.sound_play_count == 0 {
-                            play = true;
-                        }
-                    }
-                    let under_cap = state.sound_max_num_to_play <= 0
-                        || e.sound_play_count < state.sound_max_num_to_play as u32;
-                    (play, under_cap)
-                };
-                if play && under_cap {
-                    // max_num_to_play caps total plays; 0 = uncapped here
-                    // (the original gates the whole block on it — entry
-                    // sounds still fire once via change_state).
-                    self.consume_sound_rand(
-                        state.entry_sound.min_volume,
-                        state.entry_sound.max_volume,
-                    );
-                    self.events.push(SimEvent::Sound(state.entry_sound.id));
-                    let e = &mut self.entities[i];
-                    e.sound_play_count += 1;
-                    e.sound_last_play = self.game_time;
-                }
-            }
 
             // --- motion blur afterimages (G_MotionBlur_New trigger) ---
             // The original rolls the interval every tick the state's blur
