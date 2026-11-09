@@ -159,6 +159,9 @@ pub struct GameAssets {
     pub sound_ids: crate::data::IdList,
     pub strings: HashMap<ResId, crate::data::StillText>,
     pub text_formats: HashMap<ResId, crate::data::TextFormat>,
+    /// Per-sprite frame (width, height) table for collision bounds —
+    /// populated by `warm_sprite_dims`; the sim reads it immutably.
+    pub sprite_dims: HashMap<ResId, Vec<(u32, u32)>>,
 }
 
 /// Parsed `film` resource (G_Film): header + per-player 7-bit input
@@ -243,6 +246,7 @@ impl GameAssets {
             sound_ids: crate::data::IdList { entries: Vec::new() },
             strings: HashMap::new(),
             text_formats: HashMap::new(),
+            sprite_dims: HashMap::new(),
         })
     }
 
@@ -371,6 +375,21 @@ impl GameAssets {
             self.sprites.insert((Tag::Im08.code(), rid), sprite);
         }
         self.sprites.get(&(Tag::Im08.code(), rid))
+    }
+
+    /// Decode `rid`'s sprite and cache its per-frame (w,h) table for the
+    /// sim's collision bounds. Safe to call for missing/non-im08 rids —
+    /// they are skipped.
+    pub fn warm_sprite_dims(&mut self, rid: ResId) {
+        if self.sprite_dims.contains_key(&rid) {
+            return;
+        }
+        let dims = self
+            .sprite(rid)
+            .map(|s| s.frames.iter().map(|f| (f.width, f.height)).collect());
+        if let Some(dims) = dims {
+            self.sprite_dims.insert(rid, dims);
+        }
     }
 
     /// Decode an `im16` TGA into RGBA (cached).

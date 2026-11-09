@@ -83,15 +83,23 @@ impl Crand {
 }
 
 /// `U_Utils_RandomInt(min, max)` = `min + rand() % (max - min + 1)`.
+/// The original early-returns `min` with NO rand() draw when min == max
+/// (0x40f7ee jne skips the rand call) — matching that is essential for
+/// stream parity since many state fields share equal min/max bounds.
 fn rand_int(rng: &mut Crand, min: i64, max: i64) -> i64 {
-    // U_Utils_RandomInt always draws rand(), even when min == max —
-    // skipping the draw would desync the whole stream.
+    if min == max {
+        return min;
+    }
     min + (rng.rand() % (max - min + 1) as u32) as i64
 }
 
 /// `U_Utils_RandomFloat(low, high)` = `rand() * (high - low) / 32767 + min`.
+/// Equal bounds early-return with no draw; reversed bounds roll downward
+/// from the smaller value, matching the original's signed-range math.
 fn rand_float(rng: &mut Crand, low: f64, high: f64) -> f64 {
-    // Always draws rand() like the original, including low == high.
+    if low == high {
+        return low;
+    }
     let min = if low > high { high } else { low };
     rng.rand() as f64 * (high - low) / 32767.0 + min
 }
@@ -582,6 +590,10 @@ pub struct Sim {
     pub stat_shots: u64,
     /// Pickup-type entities spawned (diagnostic).
     pub stat_pickups: u64,
+    /// Coin-type entities spawned (diagnostic).
+    pub stat_coins: u64,
+    /// Raw def.score points awarded on player kills (diagnostic).
+    pub stat_score_points: i64,
     /// Global game tick counter.
     pub game_time: u32,
     /// 1-based level number (weapon level-availability filtering).
@@ -660,6 +672,9 @@ pub struct Sim {
     /// Whole level-end sequence finished (bonus drain + coin tallies) —
     /// the flow layer advances to the next sector on this.
     pub level_end_complete: bool,
+    /// Player world positions captured before this tick's movement —
+    /// the original's playerPrevLocs used by the contact circle test.
+    player_pos_prev: [Vec2; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -763,6 +778,8 @@ impl Sim {
             stat_kills_player: 0,
             stat_shots: 0,
             stat_pickups: 0,
+            stat_coins: 0,
+            stat_score_points: 0,
             game_time: 0,
             level_number: 1,
             players: [None, None],
@@ -793,10 +810,15 @@ impl Sim {
             perfect_count: 0,
             levels_played: 0,
             level_end_complete: false,
+            player_pos_prev: [Vec2::splat(-9999.0); 2],
             pending_notice: None,
             media_mask: None,
             media_tile_size: 0,
         };
+        // G_Game_Play's first act after film srand: startTime =
+        // RandomInt(400,2000) — an attract-mode timer that still consumes
+        // a draw from the seeded stream before any level-init rolls.
+        rand_int(&mut sim.rng, 0x190, 0x7d0);
         sim
     }
 
@@ -909,6 +931,9 @@ impl Sim {
     /// request order.
     pub fn request_spawn(&mut self, assets: &GameAssets, req: SpawnReq) {
         let count = self.roll_spawn_count(assets, req.unit);
+        if std::env::var("DEIMOS_COINLOG").is_ok() && req.unit == id("cass") {
+            eprintln!("t={} reqspawn cass count={} pos={:?}", self.game_time, count, req.pos);
+        }
         if count <= 0 {
             return;
         }
@@ -932,10 +957,13 @@ impl Sim {
     /// (count/appears rolls already consumed at request time) with
     /// cumulative groupDelay activation delay.
     fn spawn_group(&mut self, assets: &GameAssets, req: &SpawnReq, count: i64) {
+        let coinlog = std::env::var("DEIMOS_COINLOG").is_ok() && req.unit == id("cass");
         let Some(def) = assets.units.get(&req.unit).cloned() else {
+            if coinlog { eprintln!("t={} spawn_group {}: no def", self.game_time, req.unit); }
             return;
         };
         if def.states.is_empty() {
+            if coinlog { eprintln!("t={} spawn_group {}: no states", self.game_time, req.unit); }
             return;
         }
         // canBeSpawnedOnlyWhenPlayersActive gate (also blocks while the
@@ -997,7 +1025,10 @@ impl Sim {
         // member k activates at the sum of rolls 1..=k.
         let mut acc = 0i64;
         for _ in 0..count {
-            self.spawn_one(assets, req, gid, &mut acc);
+            let r = self.spawn_one(assets, req, gid, &mut acc);
+            if coinlog {
+                eprintln!("t={} spawn_one {} -> {:?}", self.game_time, req.unit, r);
+            }
         }
     }
 
@@ -1138,12 +1169,15 @@ impl Sim {
                 Vec2::ZERO
             }
         } else {
-            // sub_01c840 heading branch: the tolerance roll only runs when
-            // useOwnerHeading is set AND the request has no owner
-            // (useRandomAngle). No retail unit sets useOwnerHeading, so
-            // non-forced spawns take bare initialHeading with no draw.
+            // sub_01c840 heading branch: the heading source is
+            // initialHeading unless useOwnerHeading selects the owner's
+            // sprite angle (bl=0 suppresses the roll). The tolerance roll
+            // therefore runs for every unit except useOwnerHeading+owner —
+            // and no retail unit sets useOwnerHeading, so all tolerance!=0
+            // units roll here.
             let mut h = def.initial_heading as f32;
-            if def.use_owner_heading && req.owner == usize::MAX && tol != 0 {
+            let sprite_angle = def.use_owner_heading && req.owner != usize::MAX;
+            if !sprite_angle && tol != 0 {
                 h += rand_int(&mut self.rng, -half_tol, half_tol) as f32;
                 if h < 0.0 {
                     h += 360.0;
@@ -1250,6 +1284,16 @@ impl Sim {
         self.next_unique = self.next_unique.wrapping_add(1);
         if def.pickup_type != NONE_ID {
             self.stat_pickups += 1;
+            if std::env::var("DEIMOS_COINLOG").is_ok() && req.unit == id("cass") {
+                eprintln!(
+                    "t={} cass spawned ptype={:08x} coin={} stat_p={} stat_c={}",
+                    self.game_time, def.pickup_type, id("coin"),
+                    self.stat_pickups, self.stat_coins
+                );
+            }
+            if def.pickup_type == id("coin") {
+                self.stat_coins += 1;
+            }
         }
         // G_Game_GroundAccuracy_AddTarget on entity creation.
         if def.include_in_ground_accuracy {
@@ -1462,6 +1506,10 @@ impl Sim {
                             self.players[slot].as_ref().map(|p| p.power).unwrap_or(0.0)
                         };
                         if pd.powerup_overload_sound.id != NONE_ID {
+                            self.consume_sound_rand(
+                                pd.powerup_overload_sound.min_volume,
+                                pd.powerup_overload_sound.max_volume,
+                            );
                             self.events.push(SimEvent::Sound(pd.powerup_overload_sound.id));
                         }
                     }
@@ -1518,6 +1566,10 @@ impl Sim {
                                 if rt.ovl_count >= pd.powerup_overload_num_warnings {
                                     self.destroy_player(assets, slot);
                                 } else if pd.powerup_overload_sound.id != NONE_ID {
+                                    self.consume_sound_rand(
+                                        pd.powerup_overload_sound.min_volume,
+                                        pd.powerup_overload_sound.max_volume,
+                                    );
                                     self.events
                                         .push(SimEvent::Sound(pd.powerup_overload_sound.id));
                                 }
@@ -1845,6 +1897,15 @@ impl Sim {
             } else {
                 break;
             }
+        }
+
+        // Contact tests run against where the ship WAS before this tick's
+        // movement (retail's playerPrevLocs).
+        for slot in 0..2 {
+            self.player_pos_prev[slot] = self.players[slot]
+                .as_ref()
+                .map(|p| p.world_pos(self))
+                .unwrap_or(Vec2::splat(-9999.0));
         }
 
         // --- players ---
@@ -2673,6 +2734,10 @@ impl Sim {
                     // max_num_to_play caps total plays; 0 = uncapped here
                     // (the original gates the whole block on it — entry
                     // sounds still fire once via change_state).
+                    self.consume_sound_rand(
+                        state.entry_sound.min_volume,
+                        state.entry_sound.max_volume,
+                    );
                     self.events.push(SimEvent::Sound(state.entry_sound.id));
                     let e = &mut self.entities[i];
                     e.sound_play_count += 1;
@@ -2887,6 +2952,7 @@ impl Sim {
         // flag (entity +0x144 array) records it has played once.
         let entry_sound = st.entry_sound.id;
         if entry_sound != NONE_ID {
+            self.consume_sound_rand(st.entry_sound.min_volume, st.entry_sound.max_volume);
             self.events.push(SimEvent::Sound(entry_sound));
             let e = &mut self.entities[idx];
             if e.state_sound_played.len() > state_idx {
@@ -2990,6 +3056,15 @@ impl Sim {
         e.scale_delta = (st.scale_delta_percent as f32 / 100.0).abs();
     }
 
+    /// `U_Sound_Play(U_Sound_Settings*)` consumes one rand draw when the
+    /// volume range is non-degenerate: RandomFloat(minVolume,maxVolume).
+    /// The channel roll RandomInt(channel,channel) early-returns with no
+    /// draw, and pitch is applied outside this path. Values are
+    /// audio-only, so the result is discarded — only the draw matters.
+    fn consume_sound_rand(&mut self, min_volume: i64, max_volume: i64) {
+        let _ = rand_float(&mut self.rng, min_volume as f64, max_volume as f64);
+    }
+
     /// Emit a spark burst at an entity's screen position. `scroll` marks
     /// ground-class units whose particles track the terrain.
     fn emit_particles(&mut self, idx: usize, kind: ResId, color: u32, scroll: bool, circular: bool) {
@@ -3023,17 +3098,13 @@ impl Sim {
 
     /// Leave a debris zone at an entity's bounds (G_Debris_New).
     fn add_debris(&mut self, idx: usize, assets: &GameAssets) {
+        let (hw, hh) = entity_half_extents(assets, &self.entities[idx]);
         let e = &self.entities[idx];
-        let r = assets
-            .units
-            .get(&e.unit)
-            .map(entity_radius)
-            .unwrap_or(8.0);
         self.debris.push([
-            e.pos.x - r,
-            e.pos.y - r,
-            e.pos.x + r,
-            e.pos.y + r,
+            e.pos.x - hw,
+            e.pos.y - hh,
+            e.pos.x + hw,
+            e.pos.y + hh,
         ]);
         if self.debris.len() > 512 {
             self.debris.remove(0);
@@ -3074,13 +3145,9 @@ impl Sim {
         if !collides || hit || self.debris.is_empty() {
             return;
         }
+        let (hw, hh) = entity_half_extents(assets, &self.entities[idx]);
         let e = &self.entities[idx];
-        let r = assets
-            .units
-            .get(&e.unit)
-            .map(entity_radius)
-            .unwrap_or(8.0);
-        let (x0, y0, x1, y1) = (e.pos.x - r, e.pos.y - r, e.pos.x + r, e.pos.y + r);
+        let (x0, y0, x1, y1) = (e.pos.x - hw, e.pos.y - hh, e.pos.x + hw, e.pos.y + hh);
         let hit_debris = self.debris.iter().any(|d| {
             x1 >= d[0] && x0 <= d[2] && y1 >= d[1] && y0 <= d[3]
         });
@@ -3171,8 +3238,11 @@ impl Sim {
             self.scroll + SCREEN_H - e.pos.y
         };
         let scale = if rand_int(&mut self.rng, 0, 1) != 0 { 1.0f32 } else { 1.4 };
+        // Retail draw order: X int roll, shared /100 fraction roll, X sign,
+        // Y int roll (reusing the fraction), conditional Y sign.
+        let mut dx = rand_int(&mut self.rng, 1, 4) as f32;
         let div = rand_int(&mut self.rng, 1, 100) as f32 / 100.0;
-        let mut dx = rand_int(&mut self.rng, 1, 4) as f32 + div;
+        dx += div;
         if rand_int(&mut self.rng, 0, 1) != 0 {
             dx = -dx;
         }
@@ -3362,8 +3432,9 @@ impl Sim {
     fn constrain_in_game_area(&mut self, idx: usize, assets: &GameAssets) {
         let w = self.level_width();
         let h = pf(assets, pf::VISIBLE_GAME_HEIGHT) as f32;
+        let (hw, hh) = entity_half_extents(assets, &self.entities[idx]);
         let e = &mut self.entities[idx];
-        let r = entity_radius(assets.units.get(&e.unit).unwrap()) * 0.5;
+        let r = hw;
         if e.pos.x < r {
             e.pos.x = r;
             e.vel.x = -e.vel.x;
@@ -3375,8 +3446,8 @@ impl Sim {
             e.vdelta.x = -e.vdelta.x;
             e.tvel.x = -e.tvel.x;
         }
-        let min_y = self.scroll;
-        let max_y = self.scroll + h;
+        let min_y = self.scroll + hh;
+        let max_y = self.scroll + h - hh;
         if e.pos.y < min_y {
             e.pos.y = min_y;
             e.vel.y = -e.vel.y;
@@ -3857,6 +3928,7 @@ impl Sim {
             // Score is awarded only on shield depletion (Score_Adjust,
             // non-raw → multiplied).
             if from_player >= 0 {
+                self.stat_score_points += def.score;
                 self.add_score(from_player as usize, def.score as i64, false, assets);
             }
             self.destroy_entity(assets, idx, from_player);
@@ -3874,6 +3946,7 @@ impl Sim {
             def.shield_sound
         };
         if snd.id != NONE_ID {
+            self.consume_sound_rand(snd.min_volume, snd.max_volume);
             self.events.push(SimEvent::Sound(snd.id));
         }
         // hitParticles burst on non-lethal hits (G_Entity::Hit).
@@ -4192,6 +4265,17 @@ impl Sim {
         // coin when vMatch (the PERM-group exclusion can't occur —
         // no retail entity joins the permanent group).
         if in_flag2 && in_flag1 && !ram_kill {
+            if std::env::var("DEIMOS_COINLOG").is_ok()
+                && (def.destruct_coin != NONE_ID || def.destruct_coin_on_group_kill != NONE_ID)
+            {
+                eprintln!(
+                    "t={} coinrel unit={:08x} ncoj={} vmatch={} gid={} killed={}/{}",
+                    self.game_time, self.entities[idx].unit, def.destruct_num_coins,
+                    vmatch, gid,
+                    self.groups.get(&gid).map(|g| g.killed).unwrap_or(0),
+                    self.groups.get(&gid).map(|g| g.expected).unwrap_or(0),
+                );
+            }
             if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {
                 for _ in 0..def.destruct_num_coins.min(64) {
                     self.request_spawn(assets, SpawnReq {
@@ -4310,6 +4394,10 @@ impl Sim {
             });
         }
         if def.destruct_sound.id != NONE_ID {
+            self.consume_sound_rand(
+                def.destruct_sound.min_volume,
+                def.destruct_sound.max_volume,
+            );
             self.events.push(SimEvent::Sound(def.destruct_sound.id));
         }
 
@@ -4615,13 +4703,23 @@ impl Sim {
             if !contacts_players || def.harmless_to_players {
                 continue;
             }
-            let r = entity_radius(def);
+            // Sprite-bounds collision (G_EntityGroup::Process): AABB
+            // overlap gate, then a circle test between the entity and the
+            // player's PREVIOUS position. Both radii are half sprite
+            // heights, per the original's (bottom-top)/2.
+            let (ehw, ehh) = entity_half_extents(assets, e);
             for slot in 0..2 {
-                if ppos[slot].x < -999.0 {
-                    continue; // no active player in this slot
+                let Some(p) = self.players[slot].as_ref() else { continue };
+                if p.phase != PlayerPhase::Active {
+                    continue;
                 }
-                let dist = ppos[slot].distance(e.pos);
-                if dist >= r + 12.0 {
+                let (phw, phh) = player_half_extents(assets, p);
+                if (e.pos.x - ppos[slot].x).abs() > ehw + phw
+                    || (e.pos.y - ppos[slot].y).abs() > ehh + phh
+                {
+                    continue;
+                }
+                if self.player_pos_prev[slot].distance(e.pos) >= phh + ehh {
                     continue;
                 }
                 // Pickup overlap (original checks pickup_type != none first).
@@ -4654,7 +4752,7 @@ impl Sim {
             if !pdef.player_projectile {
                 continue;
             }
-            let pr = entity_radius(pdef);
+            let (pew, peh) = entity_half_extents(assets, &self.entities[i]);
             for j in 0..self.entities.len() {
                 if i == j || self.entities[j].dead || self.entities[j].activate_in > 0 {
                     continue;
@@ -4679,13 +4777,20 @@ impl Sim {
                 {
                     continue;
                 }
-                let tr = entity_radius(tdef);
-                if epos.distance(self.entities[j].pos) < pr + tr {
-                    hits.push((j, pdef.damage, espawner));
-                    shots.push(i);
-                    self.stat_hits += 1;
-                    break; // one target per projectile per tick
+                let (tew, teh) = entity_half_extents(assets, &self.entities[j]);
+                let tpos = self.entities[j].pos;
+                // AABB gate then half-height circle test, matching the
+                // original's bounds-overlap + DoCircleCollisionDetection.
+                if (epos.x - tpos.x).abs() > pew + tew || (epos.y - tpos.y).abs() > peh + teh {
+                    continue;
                 }
+                if epos.distance(tpos) >= peh + teh {
+                    continue;
+                }
+                hits.push((j, pdef.damage, espawner));
+                shots.push(i);
+                self.stat_hits += 1;
+                break; // one target per projectile per tick
             }
         }
 
@@ -4939,14 +5044,81 @@ impl Sim {
     }
 }
 
-fn entity_radius(def: &UnitDef) -> f32 {
-    if def.player_projectile {
-        4.0
-    } else if def.harmless_to_players {
-        8.0
-    } else {
-        14.0
+/// Sprite rid an entity currently draws — mirrors render.rs's
+/// `entity_sprite` selection (state sprite_face → editor preview → unit).
+fn entity_sprite_rid(def: &UnitDef, e: &Entity) -> ResId {
+    if let Some(st) = def.states.get(e.state) {
+        if st.sprite_face != NONE_ID {
+            return st.sprite_face;
+        }
     }
+    if def.editor_preview_sprite_face != NONE_ID {
+        return def.editor_preview_sprite_face;
+    }
+    e.unit
+}
+
+/// (half-width, half-height) of the entity's current sprite frame in
+/// world units — the original's GetBounds extents (m_halfWidth/Height)
+/// used by both the AABB pre-check and the circle radii. Falls back to
+/// the old fixed radii when sprite dims were never warmed.
+fn entity_half_extents(assets: &GameAssets, e: &Entity) -> (f32, f32) {
+    let fallback = if assets
+        .units
+        .get(&e.unit)
+        .map(|d| d.player_projectile)
+        .unwrap_or(false)
+    {
+        (4.0, 4.0)
+    } else {
+        (14.0, 14.0)
+    };
+    let Some(def) = assets.units.get(&e.unit) else {
+        return fallback;
+    };
+    let rid = entity_sprite_rid(def, e);
+    let Some(dims) = assets.sprite_dims.get(&rid) else {
+        return fallback;
+    };
+    let (w, h) = dims
+        .get(e.frame.max(0) as usize)
+        .or_else(|| dims.first())
+        .copied()
+        .unwrap_or((0, 0));
+    if w == 0 || h == 0 {
+        return fallback;
+    }
+    let s = e.scale.max(0.01);
+    (w as f32 * 0.5 * s, h as f32 * 0.5 * s)
+}
+
+/// Player ship half-extents from the current air weapon's appearance
+/// sprite at the tilt frame (G_Player::GetBounds equivalent).
+fn player_half_extents(assets: &GameAssets, p: &Player) -> (f32, f32) {
+    let fallback = (16.0, 16.0);
+    let Some(wdef) = assets.weapons.get(&p.air_weapon) else {
+        return fallback;
+    };
+    let rid = if p.slot == 0 {
+        wdef.player1_appearance_face
+    } else {
+        wdef.player2_appearance_face
+    };
+    if rid == NONE_ID {
+        return fallback;
+    }
+    let Some(dims) = assets.sprite_dims.get(&rid) else {
+        return fallback;
+    };
+    let (w, h) = dims
+        .get(p.tilt_frame)
+        .or_else(|| dims.first())
+        .copied()
+        .unwrap_or((0, 0));
+    if w == 0 || h == 0 {
+        return fallback;
+    }
+    (w as f32 * 0.5, h as f32 * 0.5)
 }
 
 impl UnitState {

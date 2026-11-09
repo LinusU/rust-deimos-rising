@@ -1718,6 +1718,25 @@ pub fn start_level(
     players: usize,
     seed: u64,
 ) -> Option<Sim> {
+    // Warm per-frame sprite dimensions for the sim's collision bounds
+    // (entity/player half-extents = current frame's half height/width).
+    let mut rids: Vec<ResId> = Vec::new();
+    for (rid, u) in &assets.units {
+        rids.push(*rid);
+        rids.push(u.editor_preview_sprite_face);
+        for st in &u.states {
+            rids.push(st.sprite_face);
+        }
+    }
+    for w in assets.weapons.values() {
+        rids.push(w.player1_appearance_face);
+        rids.push(w.player2_appearance_face);
+    }
+    for rid in rids {
+        if rid != crate::pak::NONE_ID {
+            assets.warm_sprite_dims(rid);
+        }
+    }
     let level = assets.levels.get(&level_id)?.clone();
     let mut sim = Sim::new(level, level_id, seed);
     // Media mask + g_bgndTileSize (bg width / mask width, int division).

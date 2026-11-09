@@ -281,8 +281,8 @@ fn film_test() {
                         }
                     }
                 }
-                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={}/{} shots={} proj={} ftmr={} bt={} ent={}",
-                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills_player, sim.stat_kills, sim.stat_shots, projs, p.fire_timer, p.bomb_burst, sim.entities.len());
+                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={}/{} shots={} proj={} ftmr={} bt={} ent={} pick={} coin={} pts={} money={} mult={}",
+                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills_player, sim.stat_kills, sim.stat_shots, projs, p.fire_timer, p.bomb_burst, sim.entities.len(), sim.stat_pickups, sim.stat_coins, sim.stat_score_points, p.money, p.multiplier);
                 println!("   proj{}", pinfo);
             }
         }
@@ -381,7 +381,20 @@ fn film_test() {
 
 fn perm_probe() {
     let dir = data_dir();
-    let set = PakSet::open_dir(&dir).expect("open paks");
+    let mut set = PakSet::open_dir(&dir).expect("open paks");
+    let first = set
+        .entries_of_tag(Tag::Flli)
+        .first()
+        .map(|e| e.rid);
+    if let Some(t) = set
+        .read_text(Tag::Flli, pak::id("flli"))
+        .or_else(|| first.and_then(|r| set.read_text(Tag::Flli, r)))
+    {
+        let fl = crate::data::FillList::parse(&t);
+        for i in 0..fl.entries.len() {
+            println!("pf({:#04x}) = {} ({})", i, fl.entries[i].1, fl.entries[i].0);
+        }
+    }
     for tag in [
         Tag::Flli, Tag::Reli, Tag::Coli, Tag::Edli, Tag::Stli, Tag::Tefo, Tag::Film, Tag::Pref,
         Tag::Plde, Tag::Leve, Tag::Wede,
@@ -389,6 +402,47 @@ fn perm_probe() {
         println!("== {:?}", tag);
         for e in set.entries_of_tag(tag) {
             println!("  {:08x} {}", e.rid, e.display);
+        }
+    }
+}
+
+fn dims_probe() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    // Warm dims for every unit's drawn sprite + player appearance faces,
+    // mirroring start_level, then report the collision-relevant sizes.
+    let mut rids: Vec<ResId> = Vec::new();
+    for (rid, u) in &a.units {
+        rids.push(*rid);
+        rids.push(u.editor_preview_sprite_face);
+        for st in &u.states {
+            rids.push(st.sprite_face);
+        }
+    }
+    for w in a.weapons.values() {
+        rids.push(w.player1_appearance_face);
+        rids.push(w.player2_appearance_face);
+    }
+    let mut warmed = 0usize;
+    let mut missing = 0usize;
+    for rid in rids {
+        if rid == pak::NONE_ID {
+            continue;
+        }
+        let before = a.sprite_dims.len();
+        a.warm_sprite_dims(rid);
+        if a.sprite_dims.len() > before {
+            warmed += 1;
+        } else {
+            missing += 1;
+        }
+    }
+    println!("sprite_dims: warmed={warmed} missing={missing} total={}", a.sprite_dims.len());
+    for rid in [pak::id("pl1c"), pak::id("buzz"), pak::id("cass"), pak::id("allp"), pak::id("plla"), pak::id("bu01")] {
+        match a.sprite_dims.get(&rid) {
+            Some(d) => println!("  {:08x} {}: {} frames first={:?}", rid, game::sim::rid_str(rid), d.len(), d.first()),
+            None => println!("  {:08x} {}: NO DIMS", rid, game::sim::rid_str(rid)),
         }
     }
 }
@@ -470,6 +524,10 @@ fn main() {
         cat(&args[2], &args[3]);
         return;
     }
+    if args.iter().any(|a| a == "--dims") {
+        dims_probe();
+        return;
+    }
     if args.iter().any(|a| a == "--test-assets") {
         test_assets();
         return;
@@ -503,8 +561,21 @@ fn main() {
         state_probe(v);
         return;
     }
+    if args.iter().any(|a| a == "--coincensus") {
+        coin_census();
+        return;
+    }
     if args.iter().any(|a| a == "--scores") {
         score_census();
+        return;
+    }
+    if args.iter().any(|a| a == "--bonus") {
+        bonus_census();
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--spawners") {
+        let v: u32 = u32::from_str_radix(&args[pos + 1], 16).unwrap();
+        spawner_census(v);
         return;
     }
     if args.iter().any(|a| a == "--flags") {
@@ -808,6 +879,13 @@ fn test_defs() {
         if u.spawn_only_when_players_active { onlyact+=1; }
     }
     println!("UNITS total={} groups={} nospawn={} delown={} onlyactive={}", a.units.len(), grp, nospawn, delown, onlyact);
+    let mut appother=Vec::new(); let mut grpdetail=Vec::new();
+    for (rid,u) in &a.units {
+        if u.appears_percent != 100 { appother.push((*rid,u.name.clone(),u.appears_percent)); }
+        if u.num_in_group_min != 1 || u.num_in_group_max != 1 { grpdetail.push((*rid,u.name.clone(),(u.num_in_group_min,u.num_in_group_max))); }
+    }
+    println!("UNITS appearsOther={:?}", appother);
+    println!("UNITS grpDetail={:?}", grpdetail);
     let mut nlock=0; let mut nlink=0; let mut norb=0; let mut ncyc=0; let mut nhold=0;
     for u in a.units.values() { for st in &u.states {
         if st.lock_to_owner_loc {nlock+=1;} if st.link_to_owner_loc {nlink+=1;} if st.orbit_owner {norb+=1;}
@@ -1623,6 +1701,70 @@ fn weapon_probe() {
                 u.map(|u| u.initial_speed_max).unwrap_or(-1.0),
                 u.map(|u| u.initial_heading_set_in_editor).unwrap_or(false),
             );
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn coin_census() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut n_coin = 0; let mut n_grpcoin = 0; let mut tot_coins = 0i64;
+    let mut by_unit: Vec<(ResId, String, i64, ResId)> = Vec::new();
+    for (rid, u) in &a.units {
+        if u.destruct_coin != pak::NONE_ID && u.destruct_num_coins > 0 {
+            n_coin += 1; tot_coins += u.destruct_num_coins;
+            by_unit.push((*rid, u.name.clone(), u.destruct_num_coins, u.destruct_coin));
+        }
+        if u.destruct_coin_on_group_kill != pak::NONE_ID { n_grpcoin += 1; }
+    }
+    println!("COINS units_with_coin={} total_coins={} units_with_grpcoin={}", n_coin, tot_coins, n_grpcoin);
+    by_unit.sort_by_key(|u| -u.2);
+    for (rid, name, n, coin) in by_unit.iter().take(25) {
+        println!("  {:08x} {:35} n={} -> {:08x}", rid, name, n, coin);
+    }
+}
+
+#[allow(dead_code)]
+fn spawner_census(target: u32) {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut hits = Vec::new();
+    for (rid, u) in &a.units {
+        if u.destruct_spawn == target { hits.push((rid, u.name.clone(), "destruct_spawn".to_string())); }
+        if u.deletion_spawn == target { hits.push((rid, u.name.clone(), "deletion_spawn".to_string())); }
+        if u.destruct_coin == target { hits.push((rid, u.name.clone(), "destruct_coin".to_string())); }
+        if u.destruct_coin_on_group_kill == target { hits.push((rid, u.name.clone(), "grp_coin".to_string())); }
+        for st in &u.states {
+            for ss in &st.spawn_sets {
+                if ss.spawn_id == target { hits.push((rid, u.name.clone(), "spawnset".to_string())); }
+            }
+        }
+    }
+    for (rid, name, how) in &hits { println!("{:08x} {:35} via {}", rid, name, how); }
+    println!("total {} spawners of {:08x}", hits.len(), target);
+}
+
+#[allow(dead_code)]
+fn bonus_census() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut n = 0;
+    for (rid, u) in &a.units {
+        if u.destruct_release_random_bonus { n += 1; println!("{:08x} {}", rid, u.name); }
+    }
+    println!("total {} units with destructReleaseRandomBonus", n);
+    // also list the Random Bonus wrapper units and their spawn targets
+    for (rid, u) in &a.units {
+        if u.name.starts_with("Random Bonus") {
+            for st in &u.states {
+                for ss in &st.spawn_sets {
+                    println!("RB {:08x} {} state '{}' -> {:08x}", rid, u.name, st.name, ss.spawn_id);
+                }
+            }
         }
     }
 }
