@@ -1033,26 +1033,30 @@ impl Sim {
         } else {
             def.initial_heading as f32
         };
-        // sub_41c540 position scatter: when BOTH offset axes carry a
-        // range the original uses polar scatter — a RandomInt(0,359)
-        // angle plus a RandomFloat radius (two rand() draws, same count
-        // as the independent-axis rolls). Single-axis ranges roll only
-        // that axis; equal bounds are a fixed offset with no draw.
+        // sub_41c540 position scatter. When BOTH offset axes carry a range
+        // the original takes the polar branch: a RandomInt(0,359) angle
+        // always draws, then randomiseInitialLoc chooses between a
+        // RandomFloat(0,|xMax|) radius on a circle (second draw) and a
+        // fixed |xMax|,|yMax| ellipse (no second draw). Single-axis ranges
+        // roll only that axis; equal bounds are a fixed offset, no draw.
         let xr = def.x_offset_min != def.x_offset_max;
         let yr = def.y_offset_min != def.y_offset_max;
         let pos = if xr && yr {
             let angle = rand_int(&mut self.rng, 0, 0x167) as f32;
-            let radius = def
-                .x_offset_min
-                .abs()
-                .max(def.x_offset_max.abs())
-                .max(def.y_offset_min.abs())
-                .max(def.y_offset_max.abs());
-            let r = rand_float(&mut self.rng, 0.0, radius) as f32;
             let ar = angle.to_radians();
             // GetVectorFromAngle yields screen-space (y-down) offsets;
             // world y is up-positive, so the y component negates.
-            req.pos + Vec2::new(ar.sin() * r, -ar.cos() * r)
+            let (sx, sy) = (ar.sin(), -ar.cos());
+            if def.randomise_initial_loc {
+                let r = rand_float(&mut self.rng, 0.0, def.x_offset_max.abs()) as f32;
+                req.pos + Vec2::new(sx * r, sy * r)
+            } else {
+                req.pos
+                    + Vec2::new(
+                        sx * def.x_offset_max.abs() as f32,
+                        sy * def.y_offset_max.abs() as f32,
+                    )
+            }
         } else if xr || yr {
             let jx = if xr {
                 let (lo, hi) = if def.x_offset_min <= def.x_offset_max {
@@ -1102,7 +1106,10 @@ impl Sim {
         let vel = if req.stationary {
             Vec2::ZERO
         } else if req.heading_forced || def.initial_heading_set_in_editor {
-            let a = invert_angle(req.heading.unwrap_or(0.0)).to_radians();
+            // sub_01c840's forced branch reuses arg4 = inArg7, the facing
+            // stored at entity+0x130: the rolled request heading for forced
+            // spawns, initialHeading for editor-heading units.
+            let a = invert_angle(facing).to_radians();
             // GetVectorFromAngleAndSpeed is screen-space (y-down); negate y.
             Vec2::new(a.sin() * speed, -a.cos() * speed)
         } else if def.initially_hunts_closest_player {
@@ -1131,8 +1138,12 @@ impl Sim {
                 Vec2::ZERO
             }
         } else {
+            // sub_01c840 heading branch: the tolerance roll only runs when
+            // useOwnerHeading is set AND the request has no owner
+            // (useRandomAngle). No retail unit sets useOwnerHeading, so
+            // non-forced spawns take bare initialHeading with no draw.
             let mut h = def.initial_heading as f32;
-            if tol != 0 {
+            if def.use_owner_heading && req.owner == usize::MAX && tol != 0 {
                 h += rand_int(&mut self.rng, -half_tol, half_tol) as f32;
                 if h < 0.0 {
                     h += 360.0;
