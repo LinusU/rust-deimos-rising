@@ -2473,7 +2473,7 @@ pub(crate) fn layout_text(
         x += spacing;
         if c != ' ' {
             // sub_43e8c0: the glyph's centre is half its own size in from
-            // the pen position, rounding up.
+            // the pen position, so its top-left lands on the pen.
             let (w, h) = dims(c);
             out.push(Glyph {
                 frame: font_frame(c),
