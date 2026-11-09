@@ -3191,11 +3191,13 @@ impl Sim {
     }
 
     /// Debris collision (G_EntityGroup tick block): entities flagged
-    /// collidesWithGroundObstacles that touch a debris zone are reset to
-    /// their entry position once (m_field134), and if they also create
-    /// obstacles their bounds become new debris.
+    /// collidesWithGroundObstacles that touch a debris zone are parked at
+    /// g_entityGroupDefaultLoc — always (0,0), off the playfield, so the
+    /// normal off-screen cull removes them next pass (m_field134 latches
+    /// the one-shot). If they also create obstacles their bounds become
+    /// new debris.
     fn step_debris(&mut self, idx: usize, assets: &GameAssets) {
-        let (collides, creates, hit, entry) = {
+        let (collides, creates, hit) = {
             let e = &self.entities[idx];
             let def = match assets.units.get(&e.unit) {
                 Some(d) => d,
@@ -3205,7 +3207,6 @@ impl Sim {
                 def.collides_with_ground_obstacles,
                 def.destruct_create_obstacle,
                 e.debris_hit,
-                e.entry_pos,
             )
         };
         if !collides || hit || self.debris.is_empty() {
@@ -3219,7 +3220,7 @@ impl Sim {
         });
         if hit_debris {
             let e = &mut self.entities[idx];
-            e.pos = entry;
+            e.pos = Vec2::ZERO;
             e.debris_hit = true;
             if creates {
                 self.add_debris(idx, assets);

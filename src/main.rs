@@ -931,6 +931,16 @@ fn test_defs() {
         .map(|u| format!("{}", u.name)).collect();
     println!("ACCURACY targets={}", acc.len());
     for n in acc.iter().take(40) { println!("   {}", n); }
+    // Debris/ground-obstacle flag census.
+    let gobs: Vec<String> = a.units.values()
+        .filter(|u| u.collides_with_ground_obstacles)
+        .map(|u| format!("{}", u.name)).collect();
+    let mkobs: Vec<String> = a.units.values()
+        .filter(|u| u.destruct_create_obstacle)
+        .map(|u| format!("{}", u.name)).collect();
+    println!("DEBRIS collideWithGroundObs={} destructCreateObstacle={}", gobs.len(), mkobs.len());
+    for n in gobs.iter().take(30) { println!("   cwg {}", n); }
+    for n in mkobs.iter().take(30) { println!("   dco {}", n); }
     // Shield level-scaling census: base/inc/max per unit.
     let mut sh_pos=0; let mut sh_neg=0; let mut sh_zero=0;
     for (rid,u) in &a.units {
