@@ -158,6 +158,9 @@ pub struct Entity {
     /// game-time of the last step (Priv_RotateToTargetLoc port).
     pub rot_dir: i64,
     pub rot_last: u32,
+    /// m_field_0xb8: ticks of rotation pause armed by spawn-set volleys
+    /// (pauseRotationWhileSpawning / timeToPauseRotation).
+    pub rot_pause: u32,
     /// Non-looping animation reached its last frame (rule condition
     /// "This Entity's Animation Has Stopped" — the original's `m_field_0xb6`).
     pub anim_stopped: bool,
@@ -216,6 +219,9 @@ pub struct Entity {
     pub sound_play_count: u32,
     pub sound_last_play: u32,
     pub state_sound_played: Vec<bool>,
+    /// Per-state entry counts (entity +0x144 array) — drives
+    /// #stateOnCounter chains inside ChangeState.
+    pub state_entry_count: Vec<u32>,
     /// Last motion-blur spawn tick (m_field_e4).
     pub blur_last: u32,
     /// Position where this entity was requested to spawn — the debris
@@ -232,15 +238,16 @@ pub struct Entity {
     pub carried_weapon: ResId,
 }
 
-/// Per-spawn-set runtime state.
-#[derive(Clone, Default)]
+/// `G_Entity::SpawnControl` runtime state per spawn set — mirrors the
+/// original's zeroed 0x16-byte `Priv_SpawnInfoView`: delay until the next
+/// volley arm, game_time of the last arm, shots left this volley, and the
+/// tick period between shots.
+#[derive(Clone, Copy, Default)]
 pub struct SpawnSetRt {
-    pub next_volley: u32,
-    pub volleys_left: u32,
-    pub shots_left: u32,
-    pub shot_timer: u32,
-    pub started: bool,
-    pub done: bool,
+    pub delay: u32,
+    pub last_arm: u32,
+    pub remaining: u32,
+    pub period: u32,
 }
 
 impl Entity {
@@ -1079,41 +1086,26 @@ impl Sim {
             let a = invert_angle(h).to_radians();
             Vec2::new(a.sin() * speed, a.cos() * speed)
         };
-        let shields = if def.shields_max > 0.0 { def.shields_max } else { def.shields_base };
-        // sub_4135a0 draws RandomInt(onTimerMin, onTimerMax) for the initial
-        // state's timer — unconditional, equal bounds still consume rand().
-        let timer_target = rand_int(
-            &mut self.rng,
-            state.on_timer_min,
-            state.on_timer_max.max(state.on_timer_min),
-        ) as u32;
-        let scale_roll = if def.initial_scale_percent_tolerance != 0 {
-            let half = (def.initial_scale_percent_tolerance + 1) >> 1;
-            rand_int(&mut self.rng, -half, half)
-        } else {
-            0
+        // sub_41a990 shield init: entity+0x12c = shields_BaseAmount, and
+        // when LevelIncrement is non-zero it becomes
+        // base + (levelNum-1)*inc capped at MaxAmount. Retail increments
+        // are all >= 0, so the original's sign check must admit positives.
+        let shields = {
+            let mut s = def.shields_base;
+            if def.shields_level_increment != 0.0 {
+                s = (self.level_number as f64 - 1.0) * def.shields_level_increment + def.shields_base;
+                if def.shields_max < s {
+                    s = def.shields_max;
+                }
+            }
+            s
         };
-        let spawn_scale = (def.initial_scale_percent + scale_roll).max(0) as f32 / 100.0;
-        // sub_41a890 tail: the group-delay roll accumulates per entity.
-        let dmin = def.group_delay_min as i64;
-        let dmax = def.group_delay_max.max(dmin);
-        *group_acc += if dmin != dmax {
-            rand_int(&mut self.rng, dmin, dmax)
-        } else {
-            dmin
-        };
-        let activate_in = (*group_acc).max(0) as u32;
         let idx = self.entities.len();
         // req.owner is an entity index; store the stable unique_num.
         let owner_uid = if req.owner != usize::MAX && req.owner < self.entities.len() {
             self.entities[req.owner].unique_num
         } else {
             u32::MAX
-        };
-        let flee_target = if state.flee_id != NONE_ID {
-            self.compute_flee_target(assets, state.flee_id, pos)
-        } else {
-            None
         };
         self.entities.push(Entity {
             unit: req.unit,
@@ -1122,27 +1114,17 @@ impl Sim {
             heading: facing,
             state: state_idx,
             state_time: 0,
-            state_timer_target: timer_target,
+            state_timer_target: 0,
             age: 0,
-            // sub_4135a0: non-editor-heading units draw a random initial
-            // sprite frame; initialHeadingSetInEditor units derive the
-            // frame from the heading instead (no draw). U_Utils_RandomInt
-            // consumes rand() even when min == max.
-            frame: if def.initial_heading_set_in_editor {
-                state.sprite_frame_min
-            } else {
-                rand_int(
-                    &mut self.rng,
-                    state.sprite_frame_min,
-                    state.sprite_frame_max.max(state.sprite_frame_min),
-                )
-            },
+            // Placeholder — ChangeState(true) below rolls the initial
+            // frame (or derives it from heading for editor-heading units).
+            frame: state.sprite_frame_min,
             frame_timer: 0,
             dir_index: -1,
             shields,
             owner: owner_uid,
             spawner_player: req.spawner_player,
-            spawn_timers: vec![SpawnSetRt::default(); state.spawn_sets.len()],
+            spawn_timers: Vec::new(),
             hit_cooldown: 0,
             glow: GlowRt::default(),
             hit_change_time: 0,
@@ -1153,9 +1135,10 @@ impl Sim {
             tracking: false,
             rot_dir: -1,
             rot_last: 0,
+            rot_pause: 0,
             anim_stopped: false,
             screen_lock: None,
-            activate_in,
+            activate_in: 0,
             group_id,
             owner_off: Vec2::ZERO,
             owner_prev: Vec2::ZERO,
@@ -1165,14 +1148,14 @@ impl Sim {
             vdelta: Vec2::ZERO,
             fleeing: state.flee_id != NONE_ID,
             stationary: req.stationary,
-            flee_target,
+            flee_target: None,
             vis: 100.0,
             vis_req: 100.0,
             vis_delta: 0.0,
             tint: 0.0,
             tint_req: 0.0,
             tint_delta: 0.0,
-            scale: spawn_scale,
+            scale: 1.0,
             scale_tgt: 1.0,
             scale_delta: 0.0,
             particle_bursts: 0,
@@ -1180,6 +1163,7 @@ impl Sim {
             sound_play_count: 0,
             sound_last_play: 0,
             state_sound_played: vec![false; def.states.len()],
+            state_entry_count: vec![0; def.states.len()],
             blur_last: 0,
             entry_pos: req.pos,
             debris_hit: false,
@@ -1194,15 +1178,25 @@ impl Sim {
         if def.include_in_ground_accuracy {
             self.accuracy_targets += 1;
         }
-        let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
-        self.cache_owner_link(idx, has_link, state.orbit_owner);
-        // No ChangeState at spawn: sub_01c840 already set vel = tvel and
-        // vdelta = 0, matching the original's field init exactly.
+        // sub_41a990 calls ChangeState(true, initialState) — every
+        // state-entry roll (on_timer, frame, scale, flee, spawn-set init)
+        // happens inside it, in the original's order.
+        self.change_state(idx, state_idx, def, assets, true);
+        // sub_41a890 tail: the group-delay roll accumulates per entity
+        // AFTER its ChangeState rolls; cyclic scatter follows.
+        let dmin = def.group_delay_min as i64;
+        let dmax = def.group_delay_max.max(dmin);
+        *group_acc += if dmin != dmax {
+            rand_int(&mut self.rng, dmin, dmax)
+        } else {
+            dmin
+        };
+        self.entities[idx].activate_in = (*group_acc).max(0) as u32;
         self.scatter_cyclic_spawn(assets, idx);
-        self.set_visual_targets(idx, state);
-        // Initial state entry sound.
-        if state.entry_sound.id != NONE_ID {
-            self.events.push(SimEvent::Sound(state.entry_sound.id));
+        // Stationary destruct-obstacle units leave a debris zone from
+        // spawn (sub_41a990 tail: m_field134 && destructCreateObstacle).
+        if req.stationary && def.destruct_create_obstacle {
+            self.add_debris(idx, assets);
         }
         // stateUseParentDirection: adopt the owner's facing at spawn.
         if state.use_parent_direction {
@@ -1516,7 +1510,7 @@ impl Sim {
             .iter()
             .position(|s| s.use_on_weapon_powerup_release)
         {
-            self.change_state(idx, si, &def, assets);
+            self.change_state(idx, si, &def, assets, false);
         }
     }
 
@@ -2252,6 +2246,7 @@ impl Sim {
                 e.age += 1;
                 e.state_time += 1;
                 if e.hit_cooldown > 0 { e.hit_cooldown -= 1; }
+                if e.rot_pause > 0 { e.rot_pause -= 1; }
                 e.glow.process();
             }
 
@@ -2261,10 +2256,7 @@ impl Sim {
                 self.apply_state_change(i, &state.on_timer_change_to, assets);
                 continue;
             }
-            if state.on_counter > 0 && self.entities[i].state_time as i64 >= state.on_counter {
-                self.apply_state_change(i, &state.on_counter_change_to, assets);
-                continue;
-            }
+            // on_counter chains inside ChangeState (entry count), not here.
 
             // --- animation ---
             self.step_animation(i, &state);
@@ -2284,10 +2276,14 @@ impl Sim {
             };
 
             // --- tracking flag (m_field_0xb5): rotating to a live target ---
+            // m_field_0xb8 (rot_pause) suppresses rotation while a spawn-set
+            // volley is winding down (Priv_DoRotationAsRequired gate).
             {
                 let epos = self.entities[i].pos;
                 let has_target = self.nearest_player_dist(epos) != f32::MAX;
-                self.entities[i].tracking = state.rotate_to_target && has_target;
+                self.entities[i].tracking = state.rotate_to_target
+                    && has_target
+                    && self.entities[i].rot_pause == 0;
             }
 
             // --- rotate_to_target sweep (Priv_RotateToTargetLoc): step the
@@ -2635,39 +2631,117 @@ impl Sim {
         let unit_id = self.entities[idx].unit;
         if let Some(def) = assets.units.get(&unit_id) {
             if let Some(ns) = find_state(def, name) {
-                self.change_state(idx, ns, def, assets);
+                self.change_state(idx, ns, def, assets, false);
             }
         }
     }
 
-    fn change_state(&mut self, idx: usize, new_state: usize, def: &UnitDef, assets: &GameAssets) {
+    fn change_state(&mut self, idx: usize, new_state: usize, def: &UnitDef, assets: &GameAssets, force: bool) {
         let ns = new_state.min(def.states.len() - 1);
-        let epos = self.entities[idx].pos;
-        let flee_target = if def.states[ns].flee_id != NONE_ID {
-            self.compute_flee_target(assets, def.states[ns].flee_id, epos)
-        } else {
-            None
+        // Frame-roll gate: entity +0x1c mirrors state +0x300 (the sprite
+        // face resId); the roll runs on forced entries or when it changes.
+        let old_face = {
+            let e = &self.entities[idx];
+            def.states[e.state.min(def.states.len() - 1)].sprite_face
         };
+        let epos = self.entities[idx].pos;
         let e = &mut self.entities[idx];
         e.state = ns;
         let state_idx = e.state;
+        // entity +0x144[state]: cumulative entry count for on_counter.
+        if e.state_entry_count.len() < def.states.len() {
+            e.state_entry_count.resize(def.states.len(), 0);
+        }
+        e.state_entry_count[state_idx] += 1;
         // Priv_Flee on state entry: flee_id != "none" sets m_field_0xc0 and
         // computes the destination; any other state clears the flag.
         e.fleeing = def.states[ns].flee_id != NONE_ID;
-        e.flee_target = flee_target;
         e.state_time = 0;
         e.dir_index = -1;
         let st = &def.states[e.state];
-        // ChangeState rolls RandomInt(onTimerMin, onTimerMax) on EVERY state
-        // change — RandomInt(0,0) still consumes a rand() call, so this must
-        // stay unconditional for rand-stream parity.
+        // ChangeState rand order: on_timer roll (unconditional —
+        // RandomInt(0,0) still draws), then the sprite-frame roll when
+        // forced or the frame field changed (initialHeadingSetInEditor
+        // units derive the frame from heading instead — no draw), then
+        // the initial-scale roll on forced entries only, then Priv_Flee,
+        // then the spawn-set init rolls.
         e.state_timer_target = rand_int(
             &mut self.rng,
             st.on_timer_min,
             st.on_timer_max.max(st.on_timer_min),
         ) as u32;
-        e.spawn_timers = vec![SpawnSetRt::default(); st.spawn_sets.len()];
-        e.frame = st.sprite_frame_min;
+        if force || st.sprite_face != old_face {
+            e.frame = if def.initial_heading_set_in_editor {
+                // GetFrameForAngle(facing): direction-major frame layout,
+                // no rand draw.
+                let nd = st.num_directions.max(1);
+                let span = (st.sprite_frame_max.max(st.sprite_frame_min)
+                    - st.sprite_frame_min
+                    + 1)
+                .max(1);
+                let per_dir = (span / nd).max(1);
+                st.sprite_frame_min
+                    + heading_to_dir(e.heading, nd as usize) * per_dir
+            } else {
+                rand_int(
+                    &mut self.rng,
+                    st.sprite_frame_min,
+                    st.sprite_frame_max.max(st.sprite_frame_min),
+                )
+            };
+        }
+        if force {
+            // inFlag1 scale block: roll only when the tolerance range is
+            // non-zero; the negative clamp sits inside that same branch.
+            let mut base = def.initial_scale_percent;
+            let range = def.initial_scale_percent_tolerance;
+            if range != 0 {
+                let half = range / 2;
+                base += rand_int(&mut self.rng, -half, half);
+                if base < 0 {
+                    base = 0;
+                }
+            }
+            e.scale = base as f32 / 100.0;
+        }
+        // Priv_Flee rolls run after the scale block, before spawn sets.
+        e.flee_target = if st.flee_id != NONE_ID {
+            Self::compute_flee_target(&mut self.rng, self.scroll, assets, st.flee_id, epos)
+        } else {
+            None
+        };
+        // Priv_CheckSpawningAbilityAtStateChange: every non-'none' spawn
+        // set rolls delay/total/period (in that order) and arms its first
+        // volley immediately; 'none' sets reset to inert zeros.
+        let now = self.game_time;
+        e.spawn_timers = st
+            .spawn_sets
+            .iter()
+            .map(|ss| {
+                if ss.spawn_id == NONE_ID {
+                    SpawnSetRt::default()
+                } else {
+                    SpawnSetRt {
+                        delay: rand_int(
+                            &mut self.rng,
+                            ss.delay_between_min,
+                            ss.delay_between_max.max(ss.delay_between_min),
+                        ) as u32,
+                        last_arm: now,
+                        remaining: rand_int(
+                            &mut self.rng,
+                            ss.volley_min,
+                            ss.volley_max.max(ss.volley_min),
+                        ) as u32,
+                        period: rand_int(
+                            &mut self.rng,
+                            ss.rate_min,
+                            ss.rate_max.max(ss.rate_min),
+                        ) as u32,
+                    }
+                }
+            })
+            .collect();
         e.anim_stopped = false;
         e.tracking = false;
         e.rot_dir = -1;
@@ -2681,7 +2755,10 @@ impl Sim {
         let has_link = st.lock_to_owner_loc || st.link_to_owner_loc || st.orbit_owner;
         let orbit = st.orbit_owner;
         self.cache_owner_link(idx, has_link, orbit);
-        self.state_velocity_init(idx, st, false);
+        // ChangeState's velocity block: forced entries aim along the
+        // (inverted) facing heading; transitions preserve the velocity
+        // direction and ease the magnitude toward max_speed.
+        self.state_velocity_init(idx, st, force);
         self.set_visual_targets(idx, st);
         // stateEntrySound plays on every state entry; the per-state-index
         // flag (entity +0x144 array) records it has played once.
@@ -2691,6 +2768,25 @@ impl Sim {
             let e = &mut self.entities[idx];
             if e.state_sound_played.len() > state_idx {
                 e.state_sound_played[state_idx] = true;
+            }
+        }
+        // ChangeState tail: #stateOnCounter chains after N entries into
+        // this state — the count resets, then ChangeState(false) recurses
+        // into the named target (or Delete/Destroy flags).
+        if st.on_counter > 0 {
+            let reached = {
+                let e = &mut self.entities[idx];
+                let c = e.state_entry_count.get(state_idx).copied().unwrap_or(0);
+                if c as i64 == st.on_counter {
+                    e.state_entry_count[state_idx] = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            if reached {
+                let target = st.on_counter_change_to.clone();
+                self.apply_state_change(idx, &target, assets);
             }
         }
     }
@@ -2703,8 +2799,8 @@ impl Sim {
     /// values are screen-band offsets, so world y = scroll + value. The
     /// dat_004dfda8 constants at +0x738/+0x744 are runtime-initialised and
     /// unrecovered; 0.0/1.0 reproduce the observed retail behaviour.
-    fn compute_flee_target(&mut self, assets: &GameAssets, flee_id: ResId, pos: Vec2) -> Option<Vec2> {
-        let scroll = self.scroll as f64;
+    fn compute_flee_target(rng: &mut Crand, scroll: f32, assets: &GameAssets, flee_id: ResId, pos: Vec2) -> Option<Vec2> {
+        let scroll = scroll as f64;
         let p = |i: usize| pf(assets, i) as f64;
         let wy = |v: f64| (scroll + v) as f32;
         let rx = |rng: &mut Crand, hi: f64| rand_float(rng, 0.0, hi) as f32;
@@ -2713,13 +2809,13 @@ impl Sim {
         let t = if flee_id == id("cega") {
             Some(Vec2::new(p(0x36) as f32, wy(p(0x37))))
         } else if flee_id == id("eara") {
-            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(p(0xe))))
+            Some(Vec2::new(rx(rng, p(0x36)), wy(p(0xe))))
         } else if flee_id == id("wera") {
-            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(p(0xf))))
+            Some(Vec2::new(rx(rng, p(0x36)), wy(p(0xf))))
         } else if flee_id == id("nora") {
-            Some(Vec2::new(p(0x10) as f32, ry(&mut self.rng, p(0x37))))
+            Some(Vec2::new(p(0x10) as f32, ry(rng, p(0x37))))
         } else if flee_id == id("sora") {
-            Some(Vec2::new(p(0x11) as f32, ry(&mut self.rng, p(0x37))))
+            Some(Vec2::new(p(0x11) as f32, ry(rng, p(0x37))))
         } else if flee_id == id("eace") {
             Some(Vec2::new(p(0x36) as f32, wy(p(0xe))))
         } else if flee_id == id("wece") {
@@ -2729,26 +2825,26 @@ impl Sim {
         } else if flee_id == id("soce") {
             Some(Vec2::new(p(0x11) as f32, wy(p(0x37))))
         } else if flee_id == id("rave") {
-            let y = if coin(&mut self.rng) { p(0xe) } else { p(0xf) };
-            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(y)))
+            let y = if coin(rng) { p(0xe) } else { p(0xf) };
+            Some(Vec2::new(rx(rng, p(0x36)), wy(y)))
         } else if flee_id == id("opve") {
             let y = if p(0x37) < pos.y as f64 { p(0xe) } else { p(0xf) };
-            Some(Vec2::new(rx(&mut self.rng, p(0x36)), wy(y)))
+            Some(Vec2::new(rx(rng, p(0x36)), wy(y)))
         } else if flee_id == id("raho") {
-            let x = if coin(&mut self.rng) { p(0x11) } else { p(0x10) };
-            Some(Vec2::new(x as f32, ry(&mut self.rng, p(0x37))))
+            let x = if coin(rng) { p(0x11) } else { p(0x10) };
+            Some(Vec2::new(x as f32, ry(rng, p(0x37))))
         } else if flee_id == id("opho") {
             let x = if p(0x36) < pos.x as f64 { p(0x10) } else { p(0x11) };
-            Some(Vec2::new(x as f32, ry(&mut self.rng, p(0x37))))
+            Some(Vec2::new(x as f32, ry(rng, p(0x37))))
         } else {
             // Unknown flee-id: fall back to a random point in the visible
             // play area (the pre-table behaviour).
             Some(Vec2::new(
-                rand_float(&mut self.rng, 32.0, 448.0) as f32,
+                rand_float(rng, 32.0, 448.0) as f32,
                 rand_float(
-                    &mut self.rng,
-                    self.scroll as f64,
-                    (self.scroll + SCREEN_H) as f64,
+                    rng,
+                    scroll,
+                    (scroll + SCREEN_H as f64) as f64,
                 ) as f32,
             ))
         };
@@ -3160,7 +3256,7 @@ impl Sim {
     /// and computes the destination through the flee-id arm table.
     fn begin_flee(&mut self, idx: usize, assets: &GameAssets, flee_id: ResId) {
         let pos = self.entities[idx].pos;
-        let target = self.compute_flee_target(assets, flee_id, pos);
+        let target = Self::compute_flee_target(&mut self.rng, self.scroll, assets, flee_id, pos);
         let e = &mut self.entities[idx];
         e.fleeing = true;
         e.flee_target = target;
@@ -3281,18 +3377,24 @@ impl Sim {
         e.frame = dir_base + next;
     }
 
+    /// `G_Entity::SpawnControl`: per-tick spawn-set state machine.
+    /// remaining > 0 → count down period; at 0 fire one shot and re-roll
+    /// period. remaining == 0 → repeat sets re-arm once
+    /// game_time >= last_arm + delay, re-rolling period/total/delay in
+    /// that order; non-repeat sets stay inert until the next ChangeState.
     fn step_spawn_sets(&mut self, idx: usize, state: &UnitState) {
         if state.spawn_sets.is_empty() {
             return;
         }
         let mut timers = self.entities[idx].spawn_timers.clone();
-        let (pos, heading) = {
+        let (pos, heading, now, spawner_player) = {
             let e = &self.entities[idx];
-            (e.pos, e.heading)
+            (e.pos, e.heading, self.game_time, e.spawner_player)
         };
         // spawnIfFleeing (spawnDef+0x4e): while the parent is fleeing
         // (m_field_0xc0), only flagged spawn sets may fire.
         let fleeing = state.flee_id != NONE_ID;
+        let mut fires: Vec<usize> = Vec::new();
         for (si, ss) in state.spawn_sets.iter().enumerate() {
             if si >= timers.len() || ss.spawn_id == NONE_ID {
                 continue;
@@ -3301,38 +3403,50 @@ impl Sim {
                 continue;
             }
             let rt = &mut timers[si];
-            if rt.done {
-                continue;
-            }
-            if !rt.started {
-                rt.started = true;
-                rt.next_volley = rand_int(&mut self.rng, ss.delay_between_min, ss.delay_between_max.max(ss.delay_between_min)) as u32;
-                rt.shots_left = rand_int(&mut self.rng, ss.volley_min, ss.volley_max.max(ss.volley_min)) as u32;
-                rt.shot_timer = 0;
-                continue;
-            }
-            if rt.shots_left == 0 {
-                if rt.next_volley > 0 {
-                    rt.next_volley -= 1;
-                    if rt.next_volley == 0 && !ss.repeat_spawns {
-                        rt.done = true;
-                    }
-                } else if ss.repeat_spawns {
-                    rt.shots_left = rand_int(&mut self.rng, ss.volley_min, ss.volley_max.max(ss.volley_min)) as u32;
-                    rt.shot_timer = 0;
+            if rt.remaining > 0 {
+                if rt.period > 0 {
+                    rt.period -= 1;
                 }
-                continue;
+                if rt.period == 0 {
+                    rt.remaining = rt.remaining.saturating_sub(1);
+                    rt.period = rand_int(
+                        &mut self.rng,
+                        ss.rate_min,
+                        ss.rate_max.max(ss.rate_min),
+                    ) as u32;
+                    fires.push(si);
+                }
+            } else if ss.repeat_spawns
+                && now.wrapping_sub(rt.last_arm) >= rt.delay
+            {
+                rt.last_arm = now;
+                rt.period = rand_int(
+                    &mut self.rng,
+                    ss.rate_min,
+                    ss.rate_max.max(ss.rate_min),
+                ) as u32;
+                rt.remaining = rand_int(
+                    &mut self.rng,
+                    ss.volley_min,
+                    ss.volley_max.max(ss.volley_min),
+                ) as u32;
+                rt.delay = rand_int(
+                    &mut self.rng,
+                    ss.delay_between_min,
+                    ss.delay_between_max.max(ss.delay_between_min),
+                ) as u32;
+                // spawnDef+0x48/+0x4a → m_field_0xb8 rotation pause.
+                if ss.pause_rotation_while_spawning {
+                    let e = &mut self.entities[idx];
+                    if ss.time_to_pause_rotation as u32 > e.rot_pause {
+                        e.rot_pause = ss.time_to_pause_rotation as u32;
+                    }
+                }
             }
-            if rt.shot_timer > 0 {
-                rt.shot_timer -= 1;
-                continue;
-            }
-            // Fire one shot.
-            rt.shots_left = rt.shots_left.saturating_sub(1);
-            rt.shot_timer = rand_int(&mut self.rng, ss.rate_min, ss.rate_max.max(ss.rate_min)) as u32;
-            if rt.shots_left == 0 {
-                rt.next_volley = rand_int(&mut self.rng, ss.delay_between_min, ss.delay_between_max.max(ss.delay_between_min)) as u32;
-            }
+        }
+        self.entities[idx].spawn_timers = timers;
+        for si in fires {
+            let ss = &state.spawn_sets[si];
             // Position: owner-relative offset or absolute.
             let local = Vec2::new(ss.x_offset as f32, -ss.y_offset as f32);
             let sp = if ss.absolute_coordinates {
@@ -3354,12 +3468,11 @@ impl Sim {
                 heading: if ss.set_heading { Some(ss.heading_degrees as f32) } else { None },
                 heading_forced: ss.set_heading,
                 owner: idx,
-                spawner_player: self.entities[idx].spawner_player,
+                spawner_player,
                 stationary: ss.stationary_option,
                 state: None,
             });
         }
-        self.entities[idx].spawn_timers = timers;
     }
 
     /// `G_Entity::ProcessRules` — evaluates up to 5 rules in order; the
