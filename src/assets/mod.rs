@@ -811,7 +811,30 @@ fn decode_tga(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let img = image::load_from_memory_with_format(data, image::ImageFormat::Tga).ok()?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
-    Some((w, h, rgba.into_raw()))
+    let mut raw = rgba.into_raw();
+    let lut = tga_gamma_lut();
+    for px in raw.chunks_exact_mut(4) {
+        for c in &mut px[..3] {
+            *c = lut[(*c >> 3) as usize];
+        }
+    }
+    Some((w, h, raw))
+}
+
+/// The brightening QuickTime's TGA importer applies to every 16-bit image
+/// the original loads (backdrops, terrain, the score bar), as an 8-bit
+/// output value per 5-bit input level.
+///
+/// Measured against the original running under Drydock: each 5-bit channel
+/// level `v` comes out as `round(31 * (v / 31) ^ 0.7455)`. Sprites (GIF
+/// plates) are not affected.
+fn tga_gamma_lut() -> [u8; 32] {
+    let mut lut = [0u8; 32];
+    for (v, out) in lut.iter_mut().enumerate() {
+        let level = (31.0 * (v as f64 / 31.0).powf(0.7455)).round() as u8;
+        *out = (level << 3) | (level >> 2);
+    }
+    lut
 }
 
 // ---------------------------------------------------------------------------
