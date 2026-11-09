@@ -35,6 +35,99 @@ pub struct Sound {
     pub sample_rate: u32,
 }
 
+/// Level media mask (`im16` 16-bit TGA): a tile map where pixel value
+/// `0x1f` marks "media" surface (G_Bgnd_MediaMask_GetSurfaceAtLoc).
+/// Rows are stored top-down, matching the U_Image/QuickTime pixel order.
+#[derive(Clone)]
+pub struct MediaMask {
+    pub w: u32,
+    pub h: u32,
+    /// Row-major u16 pixels, `w * h` entries.
+    pub px: Vec<u16>,
+}
+
+impl MediaMask {
+    #[inline]
+    pub fn at(&self, x: u32, y: u32) -> u16 {
+        if x >= self.w || y >= self.h {
+            return 0;
+        }
+        self.px[(y * self.w + x) as usize]
+    }
+}
+
+/// Decode an uncompressed/RLE 16bpp TGA into a top-down u16 pixel map.
+/// Returns None for other pixel formats (the retail masks are all
+/// type-2, 16bpp, bottom-up).
+fn decode_media_mask_tga(data: &[u8]) -> Option<MediaMask> {
+    if data.len() < 18 {
+        return None;
+    }
+    let idlen = data[0] as usize;
+    let cmap_type = data[1];
+    let img_type = data[2];
+    if cmap_type != 0 || (img_type != 2 && img_type != 10) {
+        return None;
+    }
+    let cmap_len = u16::from_le_bytes([data[5], data[6]]) as usize;
+    let cmap_depth = data[7];
+    let w = u16::from_le_bytes([data[12], data[13]]) as u32;
+    let h = u16::from_le_bytes([data[14], data[15]]) as u32;
+    let bpp = data[16];
+    let desc = data[17];
+    if bpp != 16 || w == 0 || h == 0 {
+        return None;
+    }
+    let mut off = 18 + idlen + cmap_len * (cmap_depth as usize / 8);
+    let n = (w * h) as usize;
+    let mut file_rows: Vec<u16> = Vec::with_capacity(n);
+    if img_type == 2 {
+        if data.len() < off + n * 2 {
+            return None;
+        }
+        for c in data[off..off + n * 2].chunks_exact(2) {
+            file_rows.push(u16::from_le_bytes([c[0], c[1]]));
+        }
+    } else {
+        // RLE: packet header high bit = run, count = (hdr & 0x7f) + 1.
+        while file_rows.len() < n {
+            if off >= data.len() {
+                return None;
+            }
+            let hdr = data[off];
+            off += 1;
+            let count = (hdr & 0x7f) as usize + 1;
+            if hdr & 0x80 != 0 {
+                if off + 2 > data.len() {
+                    return None;
+                }
+                let v = u16::from_le_bytes([data[off], data[off + 1]]);
+                off += 2;
+                file_rows.extend(std::iter::repeat(v).take(count));
+            } else {
+                if off + count * 2 > data.len() {
+                    return None;
+                }
+                for c in data[off..off + count * 2].chunks_exact(2) {
+                    file_rows.push(u16::from_le_bytes([c[0], c[1]]));
+                }
+                off += count * 2;
+            }
+        }
+        file_rows.truncate(n);
+    }
+    // TGA descriptor bit 5 = top-down storage; retail masks are bottom-up.
+    let top_down = desc & 0x20 != 0;
+    let w_us = w as usize;
+    let mut px = vec![0u16; n];
+    for y in 0..h as usize {
+        let src_y = if top_down { y } else { h as usize - 1 - y };
+        px[y * w_us..(y + 1) * w_us]
+            .copy_from_slice(&file_rows[src_y * w_us..(src_y + 1) * w_us]);
+    }
+    Some(MediaMask { w, h, px })
+}
+
 impl Sound {
     pub fn duration_secs(&self) -> f32 {
         self.samples.len() as f32 / (self.channels as f32 * self.sample_rate as f32)
@@ -47,6 +140,7 @@ pub struct GameAssets {
     pub set: PakSet,
     sprites: HashMap<(u32, ResId), Sprite>,
     images16: HashMap<ResId, (u32, u32, Vec<u8>)>, // TGA -> (w,h,rgba)
+    media_masks: HashMap<ResId, Option<MediaMask>>,
     sounds: HashMap<ResId, Sound>,
     // Parsed text resources, cached by (tag, id).
     pub units: HashMap<ResId, crate::data::UnitDef>,
@@ -134,6 +228,7 @@ impl GameAssets {
             set,
             sprites: HashMap::new(),
             images16: HashMap::new(),
+            media_masks: HashMap::new(),
             sounds: HashMap::new(),
             units: HashMap::new(),
             weapons: HashMap::new(),
@@ -286,6 +381,19 @@ impl GameAssets {
             self.images16.insert(rid, img);
         }
         self.images16.get(&rid)
+    }
+
+    /// Decode a level media-mask `im16` TGA into u16 tiles (cached).
+    /// Returns None when the resource is missing or not a 16bpp TGA.
+    pub fn media_mask(&mut self, rid: ResId) -> Option<&MediaMask> {
+        if !self.media_masks.contains_key(&rid) {
+            let mask = self
+                .set
+                .read_raw(Tag::Im16, rid)
+                .and_then(|raw| decode_media_mask_tga(&raw));
+            self.media_masks.insert(rid, mask);
+        }
+        self.media_masks.get(&rid).and_then(|m| m.as_ref())
     }
 
     // -- audio -----------------------------------------------------------

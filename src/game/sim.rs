@@ -595,6 +595,14 @@ pub struct Sim {
     pub pending_notice: Option<(ResId, Vec2, Vec2)>,
     /// Deferred one-shot actions (e.g. spawn at pos next tick).
     pub events: Vec<SimEvent>,
+    /// Level media mask (im16 16-bit TGA), loaded at level start.
+    /// `G_Bgnd_MediaMask_GetSurfaceAtLoc` reads pixel 0x1f as surface 1.
+    pub media_mask: Option<crate::assets::MediaMask>,
+    /// `g_bgndTileSize` = background width / mask width (5 for retail).
+    pub media_tile_size: i64,
+    /// Entities destroyed via `destroy_entity` this tick — the reap sweep
+    /// (sub_01b2d0) runs `CanSpawnOnMedia` on each, in list order.
+    reap_media: Vec<usize>,
     /// Debris zones (G_Debris): world-space rects [min_x, min_y, max_x,
     /// max_y] left by destroyed `destructCreateObstacle` units. Fixed in
     /// world space = scroll-locked like the original's screen rects.
@@ -752,6 +760,9 @@ impl Sim {
             levels_played: 0,
             level_end_complete: false,
             pending_notice: None,
+            media_mask: None,
+            media_tile_size: 0,
+            reap_media: Vec::new(),
         };
         sim
     }
@@ -1779,6 +1790,19 @@ impl Sim {
 
         // --- collisions ---
         self.collide(assets);
+
+        // --- reap sweep (sub_01b2d0) ---
+        // Every Destroy'd entity gets a CanSpawnOnMedia pass at end of
+        // frame, in entity-list order — the water-splash reward rolls and
+        // spawns here even when destructSpawn was absent. Runs before
+        // `retain` while the recorded indices are still valid.
+        self.reap_media.sort_unstable();
+        let reaped = std::mem::take(&mut self.reap_media);
+        for idx in reaped {
+            if idx < self.entities.len() && self.entities[idx].dead {
+                self.can_spawn_on_media(assets, idx);
+            }
+        }
 
         // --- cleanup ---
         self.entities.retain(|e| !e.dead);
@@ -3887,6 +3911,98 @@ impl Sim {
         }
     }
 
+    /// `G_Entity::CanSpawnOnMedia` — for ground-based units that don't
+    /// death-spawn on any media, samples the level media mask at the
+    /// entity's position. On a mask-0x1f tile it spawns the
+    /// `mediaImpactSize` water-splash perm object and returns false, so
+    /// the caller skips `destructSpawn`. Mask lookup mirrors
+    /// `G_Bgnd_MediaMask_GetSurfaceAtLoc`: only pixel value 0x1f maps to
+    /// surface 1; everything else (incl. out-of-bounds) is surface 0.
+    fn can_spawn_on_media(&mut self, assets: &GameAssets, idx: usize) -> bool {
+        let (is_ground, any_media, mis, pos, spawner) = {
+            let e = &self.entities[idx];
+            let Some(def) = assets.units.get(&e.unit) else { return true };
+            (
+                def.is_ground_based,
+                def.do_death_spawn_on_any_media,
+                def.media_impact_size,
+                e.pos,
+                e.spawner_player,
+            )
+        };
+        if !is_ground || any_media {
+            return true;
+        }
+        // loc = ((int)m_x + 0x20, scrollOffset + (int)m_y). m_x/m_y are
+        // the entity's world/screen fields: pos.x IS m_x (ground units
+        // store xLoc-32, so +0x20 restores the file xLoc for the mask);
+        // pos.y = level_height - (scrollOffset + m_y) gives
+        // loc.y = level_height - pos.y. The (int) truncations are kept
+        // for faithfulness at sub-tile edges.
+        let on_media = {
+            let Some(mask) = &self.media_mask else { return true };
+            if mask.w == 0 || self.media_tile_size <= 0 {
+                return true;
+            }
+            let loc_x = pos.x as i64 + 32;
+            let scroll_off = (self.max_scroll() - self.scroll) as i64;
+            let m_y = self.scroll + SCREEN_H - pos.y;
+            let loc_y = scroll_off + m_y as i64;
+            let tx = loc_x / self.media_tile_size;
+            let ty = loc_y / self.media_tile_size;
+            tx >= 0
+                && ty >= 0
+                && tx < mask.w as i64
+                && ty < mask.h as i64
+                && mask.at(tx as u32, ty as u32) == 0x1f
+        };
+        if !on_media {
+            return true;
+        }
+        // mediaImpactSize fourcc → perm water-splash object (obj[6..9]).
+        // "smra"/"lara"/"mera" roll RandomInt; retail only uses "smra"
+        // (Plasma Bomb, Bomb Crater) and "smal" (Tank - Tracks).
+        let obj_slot = if mis == id("med ") {
+            Some(8)
+        } else if mis == id("lara") {
+            Some(if rand_int(&mut self.rng, 0, 1) != 0 { 8 } else { 9 })
+        } else if mis == id("mera") {
+            Some(match rand_int(&mut self.rng, 0, 2) {
+                0 => 6,
+                1 => 7,
+                _ => 8,
+            })
+        } else if mis == id("smra") {
+            Some(if rand_int(&mut self.rng, 0, 1) != 0 { 6 } else { 7 })
+        } else if mis == id("larg") {
+            Some(9)
+        } else if mis == id("smal") {
+            Some(7)
+        } else if mis == id("tiny") {
+            Some(6)
+        } else {
+            None
+        };
+        if let Some(rid) = obj_slot.and_then(|s| assets.object_ids.entries.get(s)).map(|e| e.1) {
+            if rid != NONE_ID {
+                self.request_spawn(
+                    assets,
+                    SpawnReq {
+                        unit: rid,
+                        pos,
+                        heading: None,
+                        heading_forced: false,
+                        owner: idx,
+                        spawner_player: spawner,
+                        stationary: false,
+                        state: None,
+                    },
+                );
+            }
+        }
+        false
+    }
+
     /// `G_Entity::Destroy` — the destruct path: spawn/sound/particle
     /// effects, coin release, random bonus drop, child handling. No score
     /// (the original awards score in `Hit`, before `Destroy` is reached).
@@ -3967,11 +4083,11 @@ impl Sim {
             def.is_ground_based,
             false,
         );
-        // destructSpawn (0x45e): CanSpawnOnMedia-gated in the original —
-        // approximated unconditional until the media mask is ported.
+        // destructSpawn (0x45e): gated by CanSpawnOnMedia — ground units
+        // dying on a media-mask tile spawn the water splash instead.
         // destruct_notice: floating text — TODO notice system (unused in
         // retail data).
-        if def.destruct_spawn != NONE_ID {
+        if def.destruct_spawn != NONE_ID && self.can_spawn_on_media(assets, idx) {
             self.request_spawn(assets, SpawnReq {
                 unit: def.destruct_spawn,
                 pos: epos,
@@ -3990,6 +4106,10 @@ impl Sim {
         self.entities[idx].dead = true;
         self.entities[idx].destroyed = true;
         self.stat_kills += 1;
+        // Reap sweep (sub_01b2d0): every Destroy'd entity gets a second
+        // CanSpawnOnMedia pass at end of frame — the water-splash reward
+        // rolls there even when destructSpawn was absent.
+        self.reap_media.push(idx);
 
         // G_Game_GroundAccuracy_AddDestroyed. The rb06 reward is NOT armed
         // here: the original arms it at the NEXT level's start when this

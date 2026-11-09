@@ -1720,6 +1720,12 @@ pub fn start_level(
 ) -> Option<Sim> {
     let level = assets.levels.get(&level_id)?.clone();
     let mut sim = Sim::new(level, level_id, seed);
+    // Media mask + g_bgndTileSize (bg width / mask width, int division).
+    sim.media_mask = assets.media_mask(sim.level.media_mask).cloned();
+    if let Some(m) = &sim.media_mask {
+        let bg_w = (sim.level.background[2] - sim.level.background[0]).max(1) as i64;
+        sim.media_tile_size = bg_w / m.w as i64;
+    }
     // 1-based mission number for weapon level-availability filtering.
     let level_ids = mission_sorted_level_ids(assets);
     sim.level_number = level_ids.iter().position(|&r| r == level_id).map(|i| i as i64 + 1).unwrap_or(1);
