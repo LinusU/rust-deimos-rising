@@ -925,6 +925,12 @@ fn test_defs() {
         }
     }
     println!("PARTICLES destruct={} hit={} state={} stateRepeat={}", dp,hp,sp,spr);
+    // Ground-accuracy target census.
+    let acc: Vec<String> = a.units.values()
+        .filter(|u| u.include_in_ground_accuracy)
+        .map(|u| format!("{}", u.name)).collect();
+    println!("ACCURACY targets={}", acc.len());
+    for n in acc.iter().take(40) { println!("   {}", n); }
     // Shield level-scaling census: base/inc/max per unit.
     let mut sh_pos=0; let mut sh_neg=0; let mut sh_zero=0;
     for (rid,u) in &a.units {
