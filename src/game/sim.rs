@@ -21,12 +21,18 @@ pub const SCREEN_W: f32 = 640.0;
 pub const SCREEN_H: f32 = 480.0;
 /// Terrain width in world pixels.
 pub const WORLD_W: f32 = 480.0;
-/// Left edge of the 416-px playfield on screen.
-pub const PLAY_LEFT: f32 = 112.0;
+/// Left edge of the 416-px playfield on screen: the original copies its
+/// game buffer to the window at `LeftBorderWidth` (perm 0x3b = 32), see
+/// `U_Display` in W_Display.cpp.
+pub const PLAY_LEFT: f32 = 32.0;
 /// Right edge of the playfield on screen (PLAY_LEFT + VisibleGameWidth 416).
 pub const PLAY_RIGHT: f32 = PLAY_LEFT + 416.0;
-/// World→screen x offset: 480-wide world centered in the 640 window.
-pub const WORLD_TO_SCREEN_X: f32 = 80.0;
+/// Horizontal centre of the playfield on screen.
+pub const PLAY_CENTER_X: f32 = PLAY_LEFT + 208.0;
+/// World→screen x offset. The background is blitted from terrain column
+/// `cam_x + 32` to game-buffer column 0 (`G_Bgnd_CopyToFrontBuffer`), and
+/// the game buffer sits 32 px into the window, so the two cancel out.
+pub const WORLD_TO_SCREEN_X: f32 = 0.0;
 /// Player top game-area limit (perm float 0xb7 = Player_TopGameAreaLimit).
 pub const PLAYER_TOP_LIMIT: f32 = 13.0;
 /// Player bottom limit.
@@ -1904,7 +1910,7 @@ impl Sim {
                             spawner_player: -1,
                             stationary: true,
                             state: None,
-                        }, Vec2::new(320.0, 56.0));
+                        }, Vec2::new(PLAY_CENTER_X, 56.0));
                     }
                 }
             }
@@ -2878,7 +2884,7 @@ impl Sim {
             let sx = e.pos.x - self.cam_x + WORLD_TO_SCREEN_X;
             let off = e.pos.y < -80.0
                 || e.pos.y > self.level_height() + 80.0
-                || sx < -80.0 || sx > SCREEN_W + 80.0
+                || sx < PLAY_LEFT - 192.0 || sx > PLAY_RIGHT + 192.0
                 || sy < -320.0 || sy > SCREEN_H + 320.0;
             if off {
                 self.entities[i].dead = true;

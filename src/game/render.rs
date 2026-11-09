@@ -6,7 +6,9 @@
 //! Bevy world→NDC: camera centered, so bevy_pos = (screen_x - 320, 240 - screen_y).
 
 use crate::assets::GameAssets;
-use crate::game::sim::{Entity as SimEntity, PlayerPhase, Sim, SpawnReq, SCREEN_H, SCREEN_W};
+use crate::game::sim::{
+    Entity as SimEntity, PlayerPhase, Sim, SpawnReq, PLAY_LEFT, PLAY_RIGHT, SCREEN_H, SCREEN_W,
+};
 use crate::pak::ResId;
 use bevy::prelude::*;
 use rand::Rng;
@@ -1121,16 +1123,20 @@ pub fn sync_terrain(
     let Some(handle) = image16_handle(&mut *assets, &mut *images, &mut *book, rid) else {
         return;
     };
-    // Visible slice: image rows [top, top+480] where top = levelH - 480 - scroll.
+    // Visible slice (`G_Bgnd_CopyToFrontBuffer`): image rows [top, top+480]
+    // where top = levelH - 480 - scroll, columns [cam_x+32, cam_x+32+416],
+    // drawn into the playfield at screen x 32..448.
     let level_h = sim.level_height();
-    let img_top = (level_h - SCREEN_H - sim.scroll).max(0.0) as u32;
-    // Terrain sprite: 480 wide x 480 tall slice at screen (0,0)..(480,480).
-    let center = to_world(240.0, 240.0);
+    let img_top = (level_h - SCREEN_H - sim.scroll).max(0.0).floor();
+    let play_w = PLAY_RIGHT - PLAY_LEFT;
+    let img_left = (sim.cam_x + 32.0).max(0.0).floor();
+    let rect = bevy::math::Rect::new(img_left, img_top, img_left + play_w, img_top + SCREEN_H);
+    let center = to_world_z(PLAY_LEFT + play_w * 0.5, SCREEN_H * 0.5, Z_TERRAIN);
     if q.is_empty() {
         commands.spawn((
             Sprite {
                 image: handle,
-                rect: Some(bevy::math::Rect::new(0.0, img_top as f32, 480.0, img_top as f32 + SCREEN_H)),
+                rect: Some(rect),
                 ..default()
             },
             Transform::from_translation(center),
@@ -1139,14 +1145,52 @@ pub fn sync_terrain(
     } else {
         for (_, _, mut sprite, mut transform) in q.iter_mut() {
             sprite.image = handle.clone();
-            sprite.rect = Some(bevy::math::Rect::new(
-                0.0,
-                img_top as f32,
-                480.0,
-                img_top as f32 + SCREEN_H,
-            ));
+            sprite.rect = Some(rect);
             transform.translation = center;
         }
+    }
+}
+
+/// Marks the side borders and score-bar panel framing the playfield.
+#[derive(Component)]
+pub struct FrameSprite;
+
+/// Frame around the playfield while playing: 32-px black borders at both
+/// screen edges (`U_Display::DrawBlackBorders`) and the 160x480 score-bar
+/// panel image `scor` right of the playfield (`G_ScoreBar_ResetAtLevelStart`).
+pub fn sync_frame(
+    mut commands: Commands,
+    flow: Res<Flow>,
+    mut assets: ResMut<GameAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut book: ResMut<TextureBook>,
+    q: Query<Entity, With<FrameSprite>>,
+) {
+    let playing = flow.state == FlowState::Playing;
+    if !playing {
+        for e in q.iter() {
+            commands.entity(e).despawn();
+        }
+        return;
+    }
+    if !q.is_empty() {
+        return;
+    }
+    let border_w = PLAY_LEFT;
+    for cx in [border_w * 0.5, SCREEN_W - border_w * 0.5] {
+        commands.spawn((
+            Sprite::from_color(Color::BLACK, Vec2::new(border_w, SCREEN_H)),
+            Transform::from_translation(to_world_z(cx, SCREEN_H * 0.5, Z_FRAME)),
+            FrameSprite,
+        ));
+    }
+    if let Some(h) = image16_handle(&mut *assets, &mut *images, &mut *book, crate::pak::id("scor")) {
+        let bar_w = SCREEN_W - border_w - SCOREBAR_X;
+        commands.spawn((
+            Sprite::from_image(h),
+            Transform::from_translation(to_world_z(SCOREBAR_X + bar_w * 0.5, SCREEN_H * 0.5, Z_FRAME)),
+            FrameSprite,
+        ));
     }
 }
 
@@ -1544,7 +1588,7 @@ pub fn flow_system(
                                 spawner_player: -1,
                                 stationary: true,
                                 state: None,
-                            }, Vec2::new(320.0, 56.0));
+                            }, Vec2::new(crate::game::sim::PLAY_CENTER_X, 56.0));
                         }
                     }
                 }
@@ -1882,7 +1926,7 @@ pub fn start_level(
     if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
         if rid != crate::pak::NONE_ID {
             let pos = Vec2::new(sim.cam_x + 240.0, sim.scroll + 240.0);
-            sim.pending_notice = Some((rid, pos, Vec2::new(320.0, 56.0)));
+            sim.pending_notice = Some((rid, pos, Vec2::new(crate::game::sim::PLAY_CENTER_X, 56.0)));
         }
     }
     Some(sim)
@@ -2063,6 +2107,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
                 sync_menu,
                 endtext_system,
                 sync_terrain,
+                sync_frame,
                 sync_particles,
                 sync_blurs,
                 sync_crosshair,
@@ -2277,12 +2322,14 @@ pub fn endtext_system(
 }
 
 // ---------------------------------------------------------------------------
-// Score bar (G_ScoreBar port): right-edge 160x480 strip. Perm rects from the
-// `reli` Rects file name each element; screen x = 480 + front-space x.
+// Score bar (G_ScoreBar port): 160x480 strip right of the playfield. Perm
+// rects from the `reli` Rects file are bar-local; sprite positions are perm
+// floats in front-buffer space (bar at x=416), i.e. screen x - PLAY_LEFT.
 // ---------------------------------------------------------------------------
 
-/// Right-edge strip origin on the 640x480 screen (ScoreBarWidth=160).
-const SCOREBAR_X: f32 = 480.0;
+/// Left edge of the 160-px score bar on screen: directly right of the
+/// playfield (`m_screenScorebarRect.left = innerRect->right`).
+const SCOREBAR_X: f32 = PLAY_RIGHT;
 
 /// Animated meter percentages, eased toward the live values like
 /// `G_ScoreBar_Process` (perm floats Shield/Power Meter Increase/DecreaseRate).
