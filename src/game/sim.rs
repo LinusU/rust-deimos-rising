@@ -1340,15 +1340,22 @@ impl Sim {
         if req.stationary && def.destruct_create_obstacle {
             self.add_debris(idx, assets);
         }
-        // stateUseParentDirection: adopt the owner's facing at spawn.
+        // stateUseParentDirection: start on the frame matching the angle
+        // the owner's sprite shows (GetFrameForAngle(GetAngleFromSpriteInfo)).
         if state.use_parent_direction {
             if let Some(owner_idx) = self
                 .entities
                 .iter()
                 .position(|o| o.unique_num == self.entities[idx].owner && !o.dead)
             {
-                let oh = self.entities[owner_idx].heading;
-                self.entities[idx].heading = oh;
+                let owner = &self.entities[owner_idx];
+                let angle = assets
+                    .units
+                    .get(&owner.unit)
+                    .and_then(|d| d.states.get(owner.state))
+                    .map(|st| sprite_angle(owner, st))
+                    .unwrap_or(owner.heading as i32);
+                self.entities[idx].heading = angle as f32;
                 self.entities[idx].dir_index = -1; // force direction re-pick
             }
         }
@@ -3700,9 +3707,9 @@ impl Sim {
             return;
         }
         let mut timers = self.entities[idx].spawn_timers.clone();
-        let (pos, heading, now, spawner_player) = {
+        let (pos, now, spawner_player) = {
             let e = &self.entities[idx];
-            (e.pos, e.heading, self.game_time, e.spawner_player)
+            (e.pos, self.game_time, e.spawner_player)
         };
         // spawnIfFleeing (spawnDef+0x4e): while the parent is fleeing
         // (m_field_0xc0), only flagged spawn sets may fire.
@@ -3766,16 +3773,25 @@ impl Sim {
         }
         for si in fires {
             let ss = &state.spawn_sets[si];
-            // Position: owner-relative offset or absolute.
+            // Position: owner-relative offset or absolute. Offsets are in
+            // screen space (+y down); our world y points up.
             let local = Vec2::new(ss.x_offset as f32, -ss.y_offset as f32);
-            let sp = if ss.absolute_coordinates {
+            let mut req_heading = ss.heading_degrees as f32;
+            let sp = if ss.adjust_offset_for_rotation {
+                // adjustOffsetForUnitRotation (spawnDef+0x44): rotate the
+                // offset by the angle the parent's sprite currently shows.
+                // With setHeading that angle, plus the set's own heading,
+                // is also what the spawned unit is sent off along.
+                let mut angle = sprite_angle(&self.entities[idx], state);
+                if ss.set_heading {
+                    angle = (angle + ss.heading_degrees as i32).rem_euclid(360);
+                    req_heading = angle as f32;
+                }
+                let (sin, cos) = (angle as f32).to_radians().sin_cos();
+                let (ox, oy) = (ss.x_offset as f32, ss.y_offset as f32);
+                pos + Vec2::new((ox * cos - oy * sin).trunc(), -(ox * sin + oy * cos).trunc())
+            } else if ss.absolute_coordinates {
                 Vec2::new(ss.x_offset as f32, ss.y_offset as f32)
-            } else if ss.adjust_offset_for_rotation {
-                let r = heading.to_radians();
-                pos + Vec2::new(
-                    local.x * r.cos() - local.y * r.sin(),
-                    local.x * r.sin() + local.y * r.cos(),
-                )
             } else {
                 pos + local
             };
@@ -3784,7 +3800,7 @@ impl Sim {
                 pos: sp,
                 // Spawn-set requests only carry a heading when setHeading
                 // is set (req+0xd/+0xe); otherwise f16 stays 0 so arg5=0.
-                heading: if ss.set_heading { Some(ss.heading_degrees as f32) } else { None },
+                heading: if ss.set_heading { Some(req_heading) } else { None },
                 heading_forced: ss.set_heading,
                 owner: idx,
                 spawner_player,
@@ -4993,6 +5009,18 @@ impl Sim {
             self.acc = 0.0;
         }
     }
+}
+
+/// `G_Entity::GetAngleFromSpriteInfo`: the angle (degrees, 0 = north,
+/// clockwise) that the entity's current sprite frame depicts.
+fn sprite_angle(e: &Entity, st: &UnitState) -> i32 {
+    let dirs = st.num_directions.max(1) as i32;
+    let per_dir = st.frames_per_direction.max(1) as i32;
+    let frame = e.frame as i32;
+    if dirs == 1 {
+        return (360 / per_dir) * frame;
+    }
+    (360 / dirs) * (frame / per_dir).max(0)
 }
 
 /// Find a state index by name (or 1-based index fallback).
