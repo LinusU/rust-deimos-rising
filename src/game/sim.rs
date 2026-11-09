@@ -4854,21 +4854,11 @@ impl Sim {
                     pickups.push((i, slot));
                     continue;
                 }
-                // Dangerous entity vs player. Retail (G_EntityGroup
-                // 0x418d44) only calls player->Hit when the entity's
-                // CURRENT state has passHitsToOwner AND it resolves to a
-                // live owner (sub_41b700); fileData->damage is the amount.
-                // Enemy bodies/bullets lack the flag, so they pass through
-                // harmlessly — only turret/bubble proxies deal contact hits.
-                let pass_owner = st.map(|s| s.pass_hits_to_owner).unwrap_or(false)
-                    && e.owner != u32::MAX
-                    && self
-                        .entities
-                        .iter()
-                        .any(|o| o.unique_num == e.owner && !o.dead);
-                if pass_owner && !def.terrain_effect && def.damage > 0.0 {
-                    player_hits.push((i, slot, def.damage));
-                }
+                // Entity vs player (G_EG_Process, 0x418c80..0x418d44). Any
+                // entity past the gate above hurts on contact: the entity
+                // (or its owner, with passHitsToOwner) takes pf(0xa1), then
+                // the player takes the unit's damage, unconditionally.
+                player_hits.push((i, slot, def.damage));
             }
         }
 
