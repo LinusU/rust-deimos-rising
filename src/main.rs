@@ -226,8 +226,8 @@ fn film_test() {
         let film = a.film(film_rid).expect("film");
         let players = if film.frames[1] > 0 { 2 } else { 1 };
         // Recovered mapping (G_Film bit -> input byte -> action):
-        // bit0=left bit1=right bit2=up bit3=down bit4=fire bit5=ground-fire bit6=cycle.
-        let map = [2usize, 3, 0, 1, 4, 5, 6];
+        // bit0=left bit1=right bit2=up bit3=down bit4=bomb bit5=air-fire bit6=cycle.
+        let map = [2usize, 3, 0, 1, 5, 4, 6];
         let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64).expect("level");
         let n = film.frames[0].min(20000);
         let mut fire_frames = 0u32;
@@ -280,14 +280,16 @@ fn film_test() {
     // bits {0,1} and {2,3} are the two axis pairs; bits {4,5,6} are the
     // action buttons in some order. Try every axis/order/action assignment.
     //
-    // NOTE: the true retail mapping is already recovered from the decomp —
-    // G_Film::GetInputs permutes the byte into m_unk0..6 and G_Player reads
-    // inputs[0..6] = up/right/down/left/air-fire/ground-fire/cycle, giving
-    // map=[2,3,0,1,4,5,6] (bit0=left bit1=right bit2=up bit3=down
-    // bit4=fire bit5=ground-fire bit6=cycle). Exact score replay still fails
-    // because rand()-stream parity needs every call site ordered like the
-    // original (spawn scatter, flee table, player respawn rolls are not all
-    // ported), so this search remains a diagnostic, not an oracle.
+    // NOTE: the true retail mapping is recovered from the decomp —
+    // G_Film::GetInputs permutes the byte into m_unk0..6 (= inputs[0..6])
+    // and G_Player/G_WeaponHandler consume inputs[0]=up [1]=right
+    // [2]=down [3]=left [4]=bomb(ground) [5]=air-fire [6]=cycle, giving
+    // map=[2,3,0,1,5,4,6] (bit0=left bit1=right bit2=up bit3=down
+    // bit4=bomb bit5=air-fire bit6=cycle). Earlier notes had bits 4/5
+    // swapped — the WeaponHandler Process args are (inputs[4]=inA=ground,
+    // inputs[5]=inB=air). Exact score replay still fails because
+    // rand()-stream parity needs every call site ordered like the
+    // original, so this search remains a diagnostic, not an oracle.
     let perms = [
         [4usize, 5, 6],
         [4, 6, 5],
@@ -526,6 +528,24 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test-sim") {
         test_sim();
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--objdump") {
+        let rid = args.get(pos + 1).map(|s| pak::id(s)).unwrap_or_else(|| pak::id("le07"));
+        let dir = data_dir();
+        let mut a = assets::GameAssets::open(&dir).expect("open");
+        a.load_all_data();
+        let lv = a.levels.get(&rid).expect("level");
+        let mut ys: Vec<i64> = lv.objects.iter().map(|o| o.y).collect();
+        ys.sort();
+        println!("level {:?}: {} objects, bg={:?}", rid, ys.len(), lv.background);
+        println!("y min={} max={} first10={:?} last10={:?}",
+            ys.first().copied().unwrap_or(-1), ys.last().copied().unwrap_or(-1),
+            &ys[..ys.len().min(10)], &ys[ys.len().saturating_sub(10)..]);
+        // histogram per 64px band
+        let mut bands: std::collections::BTreeMap<i64, usize> = Default::default();
+        for &y in &ys { *bands.entry(y / 64).or_insert(0) += 1; }
+        for (b, c) in bands.iter().take(20) { println!("  band {} (y {}..{}): {}", b, b*64, b*64+63, c); }
         return;
     }
     // Default: launch the game.
