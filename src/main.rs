@@ -281,8 +281,8 @@ fn film_test() {
                         }
                     }
                 }
-                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={} proj={} ftmr={} bt={} ent={}",
-                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills, projs, p.fire_timer, p.bomb_burst, sim.entities.len());
+                println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={}/{} shots={} proj={} ftmr={} bt={} ent={}",
+                    t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills_player, sim.stat_kills, sim.stat_shots, projs, p.fire_timer, p.bomb_burst, sim.entities.len());
                 println!("   proj{}", pinfo);
             }
         }
@@ -1579,9 +1579,17 @@ fn weapon_probe() {
             w.spawns.len(), w.ballistic_scale
         );
         for s in &w.spawns {
+            let u = a.units.get(&s.unit_id);
             println!(
-                "    spawn {:08x} ({},{}) sethdg={} ang={}",
-                s.unit_id, s.x_loc, s.y_loc, s.set_heading, s.angle
+                "    spawn {:08x} ({},{}) sethdg={} ang={} proj={} dmg={:.1} hdg={} tol={} spd={}-{} edtr={}",
+                s.unit_id, s.x_loc, s.y_loc, s.set_heading, s.angle,
+                u.map(|u| u.player_projectile).unwrap_or(false),
+                u.map(|u| u.damage).unwrap_or(-1.0),
+                u.map(|u| u.initial_heading).unwrap_or(-1),
+                u.map(|u| u.initial_heading_tolerance).unwrap_or(-1),
+                u.map(|u| u.initial_speed_min).unwrap_or(-1.0),
+                u.map(|u| u.initial_speed_max).unwrap_or(-1.0),
+                u.map(|u| u.initial_heading_set_in_editor).unwrap_or(false),
             );
         }
     }

@@ -578,6 +578,8 @@ pub struct Sim {
     /// Debug counters (hits landed / entities destroyed).
     pub stat_hits: u64,
     pub stat_kills: u64,
+    pub stat_kills_player: u64,
+    pub stat_shots: u64,
     /// Pickup-type entities spawned (diagnostic).
     pub stat_pickups: u64,
     /// Global game tick counter.
@@ -758,6 +760,8 @@ impl Sim {
             level_complete: false,
             stat_hits: 0,
             stat_kills: 0,
+            stat_kills_player: 0,
+            stat_shots: 0,
             stat_pickups: 0,
             game_time: 0,
             level_number: 1,
@@ -1046,7 +1050,9 @@ impl Sim {
                 .max(def.y_offset_max.abs());
             let r = rand_float(&mut self.rng, 0.0, radius) as f32;
             let ar = angle.to_radians();
-            req.pos + Vec2::new(ar.sin() * r, ar.cos() * r)
+            // GetVectorFromAngle yields screen-space (y-down) offsets;
+            // world y is up-positive, so the y component negates.
+            req.pos + Vec2::new(ar.sin() * r, -ar.cos() * r)
         } else if xr || yr {
             let jx = if xr {
                 let (lo, hi) = if def.x_offset_min <= def.x_offset_max {
@@ -1068,7 +1074,9 @@ impl Sim {
             } else {
                 def.y_offset_min as f32
             };
-            req.pos + Vec2::new(jx, jy)
+            // y offsets are screen-space (down-positive) in the original;
+            // negate for world coords like the spawn-set path does.
+            req.pos + Vec2::new(jx, -jy)
         } else {
             req.pos
         };
@@ -1095,7 +1103,8 @@ impl Sim {
             Vec2::ZERO
         } else if req.heading_forced || def.initial_heading_set_in_editor {
             let a = invert_angle(req.heading.unwrap_or(0.0)).to_radians();
-            Vec2::new(a.sin() * speed, a.cos() * speed)
+            // GetVectorFromAngleAndSpeed is screen-space (y-down); negate y.
+            Vec2::new(a.sin() * speed, -a.cos() * speed)
         } else if def.initially_hunts_closest_player {
             let reference = Vec2::new(pf(assets, pf::VISIBLE_GAME_WIDTH) as f32 / 2.0, 0.0);
             let mut best: Option<Vec2> = None;
@@ -1136,7 +1145,8 @@ impl Sim {
             }
             facing = h;
             let a = invert_angle(h).to_radians();
-            Vec2::new(a.sin() * speed, a.cos() * speed)
+            // GetVectorFromAngleAndSpeed is screen-space (y-down); negate y.
+            Vec2::new(a.sin() * speed, -a.cos() * speed)
         };
         // sub_41a990 shield init: entity+0x12c = shields_BaseAmount, and
         // when LevelIncrement is non-zero it becomes
@@ -1309,6 +1319,7 @@ impl Sim {
         // request; Priv_Spawn_Air leaves it at the 1.0 default.
         let vel_scale = if ground { wdef.ballistic_scale as f32 } else { 1.0 };
         let before = self.entities.len();
+        let mut spawned = 0usize;
         for sp in &wdef.spawns {
             if sp.unit_id == NONE_ID {
                 continue;
@@ -1330,7 +1341,9 @@ impl Sim {
                 stationary: false,
                 state: None,
             });
+            spawned += 1;
         }
+        self.stat_shots += spawned as u64;
         if vel_scale != 1.0 {
             // sub_01c840's tail: m_field24 scales entity+0x10/0x14 (m_prevX/Y
             // = integrated velocity) before the +0xf8 snapshot and the
@@ -3131,6 +3144,8 @@ impl Sim {
     /// `pf(0x37)/4 < locY`). Normalized dir * scale becomes the velocity;
     /// the cyclic walk delta is dir * 0.2 (dat_4e34d0).
     fn scatter_cyclic_spawn(&mut self, assets: &GameAssets, idx: usize) {
+        // The original compares locY in screen space (y-down); ours is
+        // world altitude (y-up) — convert before the threshold check.
         let loc_y = {
             let e = &self.entities[idx];
             let is_cyclic = assets
@@ -3142,7 +3157,7 @@ impl Sim {
             if !is_cyclic {
                 return;
             }
-            e.pos.y
+            self.scroll + SCREEN_H - e.pos.y
         };
         let scale = if rand_int(&mut self.rng, 0, 1) != 0 { 1.0f32 } else { 1.4 };
         let div = rand_int(&mut self.rng, 1, 100) as f32 / 100.0;
@@ -3159,9 +3174,10 @@ impl Sim {
         let len = (dx * dx + dy * dy).sqrt();
         let (ux, uy) = (dx / len, dy / len);
         let e = &mut self.entities[idx];
-        e.vel = Vec2::new(ux * scale, uy * scale);
+        // dir is screen-space (y-down); negate y for world coords.
+        e.vel = Vec2::new(ux * scale, -uy * scale);
         e.tvel = e.vel;
-        e.vdelta = Vec2::new(ux * 0.2, uy * 0.2);
+        e.vdelta = Vec2::new(ux * 0.2, -uy * 0.2);
     }
 
     /// `G_EG_CacheOwnerLocOffsetsAndAngles`: snapshot the owner-relative
@@ -3406,7 +3422,9 @@ impl Sim {
             if !e.orbit_radius.is_nan() && angle_step != 0 {
                 e.orbit_angle = (e.orbit_angle + angle_step as f32).rem_euclid(360.0);
                 let hr = e.orbit_angle.to_radians();
-                e.pos = owner_pos + Vec2::new(hr.sin(), hr.cos()) * e.orbit_radius;
+                // Orbit offset is screen-space (y-down) like
+                // GetVectorFromAngle; negate y for world coords.
+                e.pos = owner_pos + Vec2::new(hr.sin(), -hr.cos()) * e.orbit_radius;
             } else {
                 e.pos = owner_pos + e.owner_off;
             }
@@ -4289,6 +4307,9 @@ impl Sim {
         self.entities[idx].destroy_ran = true;
         self.entities[idx].killer = from_player;
         self.stat_kills += 1;
+        if from_player >= 0 {
+            self.stat_kills_player += 1;
+        }
 
         // G_Game_GroundAccuracy_AddDestroyed. The rb06 reward is NOT armed
         // here: the original arms it at the NEXT level's start when this
@@ -4394,6 +4415,9 @@ impl Sim {
         if p.invuln == 0 {
             let dmg = pdef.shield_base_hit_percentage as f64 * amount;
             p.shields -= dmg;
+            if std::env::var("DEIMOS_HITLOG").is_ok() {
+                eprintln!("t={} P{} hit amt={:.1} dmg={:.1} sh={:.1} inv={}", self.game_time, slot, amount, dmg, p.shields, p.invuln);
+            }
             if dmg > 0.0 {
                 // pad7[0]: any real shield damage latches the no-damage
                 // defence bonus off for the rest of the run.
@@ -4680,9 +4704,12 @@ impl Sim {
             self.damage_entity(assets, j, dmg, pl);
         }
         for (eidx, slot, dmg) in player_hits {
-            self.damage_player(assets, slot, dmg);
-            // pass_hits_to_owner (state 0x327): the owner entity soaks
-            // pf(0xa1) damage credited to the contacting player.
+            // G_EG_Process contact block (0x418c80-0x418d44): the contacting
+            // entity — or its owner when pass_hits_to_owner (state+0x327)
+            // resolves — takes pf(0xa1)=100 damage credited to the player
+            // FIRST; the player then takes fileData->damage unconditionally.
+            // This is why enemy projectiles detonate on touch instead of
+            // persisting to re-hit every frame.
             let pass = self.entities.get(eidx).and_then(|e| {
                 assets
                     .units
@@ -4690,6 +4717,7 @@ impl Sim {
                     .and_then(|d| d.states.get(e.state))
                     .map(|st| (st.pass_hits_to_owner, e.owner))
             });
+            let mut owner_hit = false;
             if let Some((true, owner_uid)) = pass {
                 if owner_uid != u32::MAX {
                     if let Some(oidx) = self
@@ -4698,9 +4726,14 @@ impl Sim {
                         .position(|o| o.unique_num == owner_uid && !o.dead)
                     {
                         self.damage_entity(assets, oidx, pf(assets, pf::PASS_HITS_TO_OWNER) as f64, slot as i32);
+                        owner_hit = true;
                     }
                 }
             }
+            if !owner_hit {
+                self.damage_entity(assets, eidx, pf(assets, pf::PASS_HITS_TO_OWNER) as f64, slot as i32);
+            }
+            self.damage_player(assets, slot, dmg);
         }
     }
 
@@ -4758,11 +4791,11 @@ fn vector_to_heading(v: Vec2) -> f32 {
     (90.0 - deg).rem_euclid(360.0)
 }
 
-/// `U_Math_GetVectorFromAngleAndSpeed`: heading degrees → velocity vector
-/// (x = sin, y = cos, matching the original's convention).
+/// World-space velocity for a game angle: `U_Math_GetVectorFromAngleAndSpeed`
+/// is screen-space (y-down); negate y for our up-positive world coords.
 fn vec_from_angle_speed(angle: f32, speed: f32) -> Vec2 {
     let r = angle.to_radians();
-    Vec2::new(r.sin() * speed, r.cos() * speed)
+    Vec2::new(r.sin() * speed, -r.cos() * speed)
 }
 
 /// `U_Math_InvertAngle`: reflect the heading (the original's spawn-heading
