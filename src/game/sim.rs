@@ -4734,11 +4734,19 @@ impl Sim {
                     pickups.push((i, slot));
                     continue;
                 }
-                // Dangerous entity vs player.
-                if !def.player_projectile
-                    && !def.terrain_effect
-                    && def.damage > 0.0
-                {
+                // Dangerous entity vs player. Retail (G_EntityGroup
+                // 0x418d44) only calls player->Hit when the entity's
+                // CURRENT state has passHitsToOwner AND it resolves to a
+                // live owner (sub_41b700); fileData->damage is the amount.
+                // Enemy bodies/bullets lack the flag, so they pass through
+                // harmlessly — only turret/bubble proxies deal contact hits.
+                let pass_owner = st.map(|s| s.pass_hits_to_owner).unwrap_or(false)
+                    && e.owner != u32::MAX
+                    && self
+                        .entities
+                        .iter()
+                        .any(|o| o.unique_num == e.owner && !o.dead);
+                if pass_owner && !def.terrain_effect && def.damage > 0.0 {
                     player_hits.push((i, slot, def.damage));
                 }
             }
@@ -4855,6 +4863,10 @@ impl Sim {
             }
             if !owner_hit {
                 self.damage_entity(assets, eidx, pf(assets, pf::PASS_HITS_TO_OWNER) as f64, slot as i32);
+            }
+            if std::env::var("DEIMOS_HITLOG").is_ok() {
+                let u = self.entities[eidx].unit;
+                eprintln!("t={} P{} contact-hit unit={:08x}({}) dmg={:.2}", self.game_time, slot, u, rid_str(u), dmg);
             }
             self.damage_player(assets, slot, dmg);
         }

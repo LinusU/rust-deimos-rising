@@ -947,6 +947,21 @@ fn test_defs() {
         if !u.entry_notice.is_empty() && u.entry_notice != "none" {en+=1; if u.entry_notice_delay>0 {ed+=1;}}
     }
     println!("NOTICES destruct={} entry={} entryDelay={}", dn,en,ed);
+    // Player-damage-source census: which units can hurt the player on contact.
+    // Retail requires state.passHitsToOwner + a live owner (G_EntityGroup
+    // 0x418d44); damage comes from fileData->damage (#damage_FLOAT).
+    let mut dmg_units: Vec<String> = Vec::new();
+    let mut pho_dmg = 0usize;
+    for (rid, u) in &a.units {
+        if u.damage > 0.0 && !u.player_projectile && !u.terrain_effect && !u.harmless_to_players {
+            let pho = u.states.iter().any(|s| s.pass_hits_to_owner);
+            if pho { pho_dmg += 1; }
+            dmg_units.push(format!("{}:{:08x}{}", u.name, rid, if pho {"*"} else {""}));
+        }
+    }
+    dmg_units.sort();
+    println!("DMG-SOURCES units={} withPassHits={} ( *=passHitsToOwner)", dmg_units.len(), pho_dmg);
+    for n in dmg_units.iter().take(60) { println!("   {}", n); }
     // Heading-tolerance / owner-heading census: the original only rolls
     // initialHeadingTolerance for useOwnerHeading units without an owner.
     let (mut ntol, mut nown, mut ntol_own) = (0, 0, 0);
@@ -1202,6 +1217,7 @@ fn flag_census() {
                 ("collision_spawn", st.collision_spawn_id != crate::pak::NONE_ID),
                 ("collision_repeat", st.collision_repeat_spawns),
                 ("rotate_to_target", st.rotate_to_target),
+                ("pass_hits_to_owner", st.pass_hits_to_owner),
                 ("pause_vertical_scrolling", st.pause_vertical_scrolling),
                 ("rule_unit", st.rules.iter().any(|r| r.unit_id != crate::pak::NONE_ID)),
             ];
@@ -1238,6 +1254,15 @@ fn flag_census() {
         }
     }
     println!("notice-string users: {}", notice_users);
+    // Full passHitsToOwner unit census (player-contact damage gate).
+    let mut pho: Vec<String> = Vec::new();
+    for (rid, u) in &a.units {
+        if u.states.iter().any(|s| s.pass_hits_to_owner) {
+            pho.push(format!("{}:{:08x}", u.name, rid));
+        }
+    }
+    pho.sort(); pho.dedup();
+    println!("passHitsToOwner units ({}): {:?}", pho.len(), pho);
     // Distinct flee_id values in use (for the Priv_Flee arm census).
     let mut flee_vals: Vec<String> = Vec::new();
     for u in a.units.values() {
