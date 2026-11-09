@@ -344,12 +344,22 @@ pub struct Particles {
     tables: Option<ParticleTables>,
     last_scroll: f32,
     white: Option<Handle<Image>>,
+    /// Particle randomness is seeded so a replay renders identically every
+    /// run (screenshots can then be compared).
+    rng: Option<rand::rngs::StdRng>,
 }
+
+/// Fixed seed for the visual-only particle RNG.
+const PARTICLE_SEED: u64 = 0xDE1305;
 
 impl Particles {
     fn tables(&mut self) -> &mut ParticleTables {
         if self.tables.is_none() {
-            let mut rng = rand::thread_rng();
+            use rand::SeedableRng;
+            let mut rng = self
+                .rng
+                .take()
+                .unwrap_or_else(|| rand::rngs::StdRng::seed_from_u64(PARTICLE_SEED));
             let mut t1 = Vec::with_capacity(100);
             let mut t2 = Vec::with_capacity(100);
             for _ in 0..100 {
@@ -370,6 +380,7 @@ impl Particles {
                 t1.push(v * mult);
             }
             self.tables = Some(ParticleTables { t1, t2, idx1: 0, idx2: 0 });
+            self.rng = Some(rng);
         }
         self.tables.as_mut().unwrap()
     }
@@ -419,7 +430,9 @@ impl Particles {
             })
             .collect();
         let mut parts = Vec::with_capacity(count);
-        let mut rng = rand::thread_rng();
+        // Building the tables also seeds the RNG; borrow it for this burst.
+        self.tables();
+        let mut rng = self.rng.take().expect("particle rng seeded by tables()");
         for _ in 0..count {
             let (vx, vy) = {
                 let t = self.tables();
@@ -443,6 +456,7 @@ impl Particles {
                 color: shades[rng.gen_range(0..shades.len())],
             });
         }
+        self.rng = Some(rng);
         self.groups.push(PGroup { scroll, parts });
         if self.groups.len() > 64 {
             self.groups.remove(0);
