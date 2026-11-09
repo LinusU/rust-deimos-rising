@@ -728,14 +728,21 @@ fn decode_sprite(color: &[u8], alpha: &[u8]) -> Option<Sprite> {
     if rects.is_empty() {
         return None;
     }
+    let (_, _, alpha_px) = decode_gif_rgba(alpha)?;
+    // Colour key: the colour plate's third pixel (`U_Sprite.cc` reads the
+    // 16-bit word at offset 4 of the plate's pixel data).
+    let key = color_px.get(8..12).map(rgb555).unwrap_or(0);
     let frames = rects
         .iter()
         .map(|&r| {
             let (fw, fh) = (r.2 as u32, r.3 as u32);
+            let mut rgba = crop_frame(&color_px, w, h, r);
+            let mask = crop_frame(&alpha_px, w, h, r);
+            apply_plate_alpha(&mut rgba, &mask, key);
             GifFrame {
                 width: fw,
                 height: fh,
-                rgba: crop_frame(&color_px, w, h, r),
+                rgba,
                 delay: 0.0,
             }
         })
@@ -745,6 +752,36 @@ fn decode_sprite(color: &[u8], alpha: &[u8]) -> Option<Sprite> {
         height: ch,
         frames,
     })
+}
+
+/// RGBA8 pixel → the original's 15-bit 555 colour word.
+fn rgb555(px: &[u8]) -> u16 {
+    ((px[0] as u16 >> 3) << 10) | ((px[1] as u16 >> 3) << 5) | (px[2] as u16 >> 3)
+}
+
+/// Fill a frame's alpha channel from its alpha-plate crop, as the original
+/// does when encoding a sprite frame (mask builder at VA 0x40df00, blended
+/// by `U_SpriteBlit_DrawNormal`).
+///
+/// Each mask pixel's 5-bit red channel is a transparency level: 0 is
+/// opaque, 1..=30 blends `level/32` of the background through, and 31 (or
+/// a pixel equal to the colour key) is fully transparent. A frame whose
+/// mask has no visible pixel at all is drawn colour-keyed instead.
+fn apply_plate_alpha(rgba: &mut [u8], mask: &[u8], key: u16) {
+    let level = |m: &[u8]| -> u32 {
+        let red = (m[0] >> 3) as u32;
+        if rgb555(m) == key || red >= 31 { 32 } else { red }
+    };
+    let any_visible = mask.chunks_exact(4).any(|m| level(m) < 32);
+    for (px, m) in rgba.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
+        px[3] = if any_visible {
+            ((32 - level(m)) * 255 / 32) as u8
+        } else if rgb555(px) == key {
+            0
+        } else {
+            255
+        };
+    }
 }
 
 fn crop_frame(img: &[u8], iw: usize, ih: usize, rect: (usize, usize, usize, usize)) -> Vec<u8> {
