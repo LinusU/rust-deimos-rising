@@ -942,7 +942,9 @@ pub struct FrameInput {
 // ---------------------------------------------------------------------------
 
 pub fn setup(mut commands: Commands) {
-    commands.spawn(Camera2d);
+    // The original blends translucent sprites on the stored colour values,
+    // so the camera composites in sRGB rather than in linear light.
+    commands.spawn((Camera2d, bevy::camera::CompositingSpace::Srgb));
 }
 
 /// Convert RGBA pixels to a Bevy image with nearest-neighbour sampling.
@@ -1025,14 +1027,7 @@ pub(crate) fn frame_image_blend(
             Blit::Flat => px[..3].fill(255),
             Blit::Shadow => px[..3].fill(0),
         }
-        px[3] = if blit == Blit::Shadow {
-            // The original darkens the stored (gamma-encoded) pixel values;
-            // the GPU blends in linear light. For black the two agree when
-            // the opacity is raised to match: 1 - (1 - a)^2.2.
-            ((1.0 - (1.0 - opacity).powf(2.2)) * 255.0).round() as u8
-        } else {
-            (opacity * 255.0) as u8
-        };
+        px[3] = (opacity * 255.0) as u8;
     }
     let handle = images.add(rgba_image(f.width, f.height, &rgba));
     book.blends.insert(key, handle.clone());
