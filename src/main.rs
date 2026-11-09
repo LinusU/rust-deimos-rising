@@ -1344,8 +1344,9 @@ fn test_unit(ridv: u32) {
         println!("UNIT {:08x} {}", ridv, u.name);
         println!("  init_speed {}..{} heading {} tol {}", u.initial_speed_min, u.initial_speed_max, u.initial_heading, u.initial_heading_tolerance);
         println!("  shields {}/{}+{} dmg {} score {} pickup={:08x} destruct_spawn={:08x} deletion_spawn={:08x}", u.shields_base,u.shields_max,u.shields_level_increment,u.damage,u.score,u.pickup_type,u.destruct_spawn,u.deletion_spawn);
+        println!("  numInGroup {}..{} groupDelay {}..{} appears%={} onlyWhenActive={} noDup={}", u.num_in_group_min,u.num_in_group_max,u.group_delay_min,u.group_delay_max,u.appears_percent,u.spawn_only_when_players_active,u.do_not_spawn_if_type_exists);
         for (i,st) in u.states.iter().enumerate() {
-            println!("  state[{}] '{}' spr={:08x} dirs={} fpd={} framedly={} maxspd={} delta={} rules={:?}", i, st.name, st.sprite_face, st.num_directions, st.frames_per_direction, st.frame_delay, st.max_speed, st.delta, st.rules.iter().map(|r|(r.name.clone(),r.unit_id,r.range,r.condition.clone(),r.action.clone())).collect::<Vec<_>>());
+            println!("  state[{}] '{}' spr={:08x} dirs={} fpd={} framedly={} maxspd={} delta={} ontimer={}-{}->'{}' delNoPl={} destrNoPl={} destrScroll={} rules={:?}", i, st.name, st.sprite_face, st.num_directions, st.frames_per_direction, st.frame_delay, st.max_speed, st.delta, st.on_timer_min, st.on_timer_max, st.on_timer_change_to, st.delete_on_no_active_players, st.destruct_on_no_active_players, st.destruct_if_scrolling_not_paused, st.rules.iter().map(|r|(r.name.clone(),r.unit_id,r.range,r.condition.clone(),r.action.clone())).collect::<Vec<_>>());
             for ss in &st.spawn_sets { println!("     spawnset '{}' id={:08x} x={} y={} rate={}-{} volley={}-{} delay={}-{} repeat={}", ss.name, ss.spawn_id, ss.x_offset, ss.y_offset, ss.rate_min, ss.rate_max, ss.volley_min, ss.volley_max, ss.delay_between_min, ss.delay_between_max, ss.repeat_spawns); }
         }
     }

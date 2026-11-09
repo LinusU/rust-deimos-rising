@@ -1298,6 +1298,12 @@ impl Sim {
             if def.pickup_type == id("coin") {
                 self.stat_coins += 1;
             }
+            if std::env::var("DEIMOS_PICKLOG").is_ok() && def.pickup_type != id("coin") {
+                eprintln!(
+                    "t={} PICKUP spawned unit={:08x} ptype={:08x} pos=({:.0},{:.0})",
+                    self.game_time, req.unit, def.pickup_type, pos.x, pos.y
+                );
+            }
         }
         // G_Game_GroundAccuracy_AddTarget on entity creation.
         if def.include_in_ground_accuracy {
@@ -2460,7 +2466,19 @@ impl Sim {
 
     fn step_entities(&mut self, assets: &GameAssets) {
         self.entity_scroll_pause = false;
-        for i in 0..self.entities.len() {
+        // Retail's G_EG_Process walks a live child linked-list: an entity
+        // spawned mid-pass is appended at the tail and reached later in the
+        // SAME pass. Process in waves so same-tick spawns get their first
+        // full update this tick — required for one-shot spawn-then-delete
+        // states (rb## bonus pods) whose on_timer would otherwise fire
+        // before their spawn-set volley runs.
+        let mut start = 0usize;
+        loop {
+            let end = self.entities.len();
+            if start >= end {
+                break;
+            }
+            for i in start..end {
             if self.entities[i].dead {
                 continue;
             }
@@ -2841,6 +2859,11 @@ impl Sim {
             if off {
                 self.entities[i].dead = true;
             }
+            }
+            if self.entities.len() == end {
+                break;
+            }
+            start = end;
         }
     }
 
@@ -3699,6 +3722,12 @@ impl Sim {
             }
         }
         self.entities[idx].spawn_timers = timers;
+        if !fires.is_empty() && std::env::var("DEIMOS_SPAWNSETLOG").is_ok() {
+            eprintln!(
+                "t={} spawnset parent={:08x} state='{}' fires={:?} pos=({:.0},{:.0})",
+                self.game_time, self.entities[idx].unit, state.name, fires, pos.x, pos.y
+            );
+        }
         for si in fires {
             let ss = &state.spawn_sets[si];
             // Position: owner-relative offset or absolute.
@@ -5181,10 +5210,16 @@ fn player_half_extents(assets: &GameAssets, p: &Player) -> (f32, f32) {
 
 impl UnitState {
     /// Whether the rolled on_timer delay has been reached.
+    ///
+    /// Retail fires on `inArg == entryTime + duration` — i.e. `duration`
+    /// frames AFTER the state-entry frame, so the entry frame itself is a
+    /// free processing pass (its spawn-set volley runs before any delete).
+    /// `state_time` counts processed ticks from 0, so `> target` lands on
+    /// processed-frame #(target+1), matching that absolute-time check.
     fn on_timer_target_reached(&self, e: &Entity) -> bool {
         (self.on_timer_min > 0 || self.on_timer_max > 0)
             && e.state_timer_target > 0
-            && e.state_time >= e.state_timer_target
+            && e.state_time > e.state_timer_target
     }
 }
 
