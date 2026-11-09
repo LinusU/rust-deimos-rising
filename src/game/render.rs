@@ -528,7 +528,8 @@ pub fn sync_particles(
         }
     }
     for (key, pos, color, grow) in desired {
-        let wpos = to_world(pos.x, pos.y);
+        // Unique depth per particle: equal-z sprites have no stable order.
+        let wpos = to_world_z(pos.x, pos.y, Z_PARTICLES + (key % 4096) as f32 / 4096.0 * 4.0);
         // Quick fade-in over first 8 ticks of growth.
         let alpha = (grow / 8.0).min(1.0);
         let col = Color::srgba(color.to_srgba().red, color.to_srgba().green, color.to_srgba().blue, alpha);
@@ -626,7 +627,7 @@ pub fn sync_blurs(
             Some(h) => h,
             None => continue,
         };
-        let wpos = to_world(pos.x, pos.y);
+        let wpos = to_world_z(pos.x, pos.y, Z_BLUR + (key % 4096) as f32 / 4096.0 * 4.0);
         let mut found = None;
         for (_be, bs, sprite, transform) in q.iter_mut() {
             if bs.key == key {
@@ -699,7 +700,7 @@ pub fn sync_weapon_popup(
             }
             // Fade out over the last 20 ticks.
             let alpha = (p.weapon_popup.min(20) as f32 / 20.0).clamp(0.0, 1.0);
-            let pos = to_world(p.screen.x, p.screen.y - 34.0);
+            let pos = to_world_z(p.screen.x, p.screen.y - 34.0, layer_z(13));
             let mut found = None;
             for (be, wp, text, col, tr) in q.iter_mut() {
                 if wp.slot == slot {
@@ -797,7 +798,7 @@ pub fn sync_crosshair(
             ps.x + wdef.crosshair_x_offset as f32,
             ps.y + wdef.crosshair_y_offset as f32,
         );
-        let wpos = to_world(pos.x, pos.y);
+        let wpos = to_world_z(pos.x, pos.y, layer_z(13));
         let mut found = None;
         for (be, ch, sprite, transform) in q.iter_mut() {
             if ch.slot == slot {
@@ -909,6 +910,50 @@ pub fn to_world(sx: f32, sy: f32) -> Vec3 {
     Vec3::new(sx - SCREEN_W * 0.5, SCREEN_H * 0.5 - sy, 0.0)
 }
 
+/// `to_world` at an explicit depth (higher z draws on top).
+fn to_world_z(sx: f32, sy: f32, z: f32) -> Vec3 {
+    Vec3::new(sx - SCREEN_W * 0.5, SCREEN_H * 0.5 - sy, z)
+}
+
+// Draw order. The original sorts sprites into 16 render layers
+// (`U_Sprite_RenderLists_Add`); each maps to a z band here.
+const Z_TERRAIN: f32 = 0.0;
+/// stateDrawToTerrain sprites: painted onto the background, under layer 1.
+const Z_TERRAIN_PASS: f32 = 5.0;
+/// Motion-blur afterimages: just under the low air layer.
+const Z_BLUR: f32 = 65.0;
+/// Particles are plotted after the sprite layers, under the HUD layer.
+const Z_PARTICLES: f32 = 145.0;
+/// Side borders and score bar: cover anything leaving the playfield, the
+/// way the original's 416-px game buffer clips it.
+const Z_FRAME: f32 = 200.0;
+const Z_SCOREBAR: f32 = 210.0;
+
+/// z for one of the original's render layers (0..=15).
+fn layer_z(layer: u32) -> f32 {
+    layer as f32 * 10.0
+}
+
+/// Render layer for a unit's `#drawLayer_ID` (`G_GameObject` draw, layer
+/// switch at G_GameObject.cpp:361). "defa"/"none" fall back on whether the
+/// unit is airborne.
+fn draw_layer(id: ResId, air: bool) -> u32 {
+    match &id.to_le_bytes() {
+        b"grou" => 3,
+        b"grhi" => 5,
+        b"ailo" => 7,
+        b"aihi" => 8,
+        b"plwe" => 9,
+        b"play" => 10,
+        b"plsh" => 11,
+        b"plef" => 12,
+        b"plui" => 13,
+        b"atmo" => 14,
+        b"hud " => 15,
+        _ => if air { 7 } else { 3 },
+    }
+}
+
 /// Sync all sim entities to Bevy sprites (spawn/despawn/update).
 pub fn sync_entities(
     mut commands: Commands,
@@ -922,7 +967,7 @@ pub fn sync_entities(
     let sim = &sim_res.0;
 
     // Desired set: unique_num -> (sprite rid, frame, screen pos, fx).
-    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32, f32, f32, f32, u32, bool)> = HashMap::new();
+    let mut desired: HashMap<u32, (ResId, i64, Vec2, f32, f32, f32, f32, u32, bool, u32)> = HashMap::new();
     if flow.state == FlowState::Playing {
         for e in &sim.entities {
         if e.dead || e.activate_in > 0 || e.vis <= 0.0 {
@@ -938,6 +983,9 @@ pub fn sync_entities(
         let state_def = udef.and_then(|d| d.states.get(state_idx));
         let tint_color = state_def.map(|s| s.tint_color).unwrap_or(0);
         let terrain = state_def.map(|s| s.draw_to_terrain).unwrap_or(false);
+        let layer = udef
+            .map(|d| draw_layer(d.draw_layer, !d.is_ground_based))
+            .unwrap_or(7);
         // stateDoColorise: the base sprite is never drawn — the entity is
         // only visible through its glow/hit-flash overlay.
         if state_def.map(|s| s.do_colorise).unwrap_or(false) && !e.glow.active {
@@ -955,6 +1003,7 @@ pub fn sync_entities(
                 e.scale,
                 tint_color,
                 terrain,
+                layer,
             ),
         );
         }
@@ -971,7 +1020,7 @@ pub fn sync_entities(
     }
 
     // Spawn/update.
-    for (key, (rid, frame, sp, flash, vis, tint, scale, tint_color, terrain)) in &desired {
+    for (key, (rid, frame, sp, flash, vis, tint, scale, tint_color, terrain, layer)) in &desired {
         let handle = match frame_image(&mut *assets, &mut *images, &mut *book, *rid, *frame) {
             Some(h) => h,
             None => continue,
@@ -984,11 +1033,15 @@ pub fn sync_entities(
                 break;
             }
         }
-        let mut wpos = to_world(sp.x, sp.y);
-        // stateDrawToTerrain: render beneath normal sprites (terrain pass).
-        if *terrain {
-            wpos.z = -1.0;
-        }
+        // Within a layer, later-spawned entities draw on top.
+        let order = (*key % 4096) as f32 / 4096.0 * 4.0;
+        let z = if *terrain {
+            // stateDrawToTerrain: painted onto the background.
+            Z_TERRAIN_PASS + order
+        } else {
+            layer_z(*layer) + order
+        };
+        let wpos = to_world_z(sp.x, sp.y, z);
         // Visibility fade → alpha; tint% blends toward tint_color.
         let alpha = (*vis / 100.0).clamp(0.0, 1.0);
         let t = (*tint / 100.0).clamp(0.0, 1.0);
@@ -1125,7 +1178,7 @@ pub fn sync_players(
         let Some(handle) = frame_image(&mut *assets, &mut *images, &mut *book, face, frame_idx) else {
             continue;
         };
-        let wpos = to_world(p.screen.x, p.screen.y);
+        let wpos = to_world_z(p.screen.x, p.screen.y, layer_z(10) + slot as f32);
         // Blink while invulnerable.
         let blink = p.invuln > 0 && (sim.game_time / 4) % 2 == 0;
         let mut found = None;
