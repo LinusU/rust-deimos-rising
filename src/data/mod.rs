@@ -1287,13 +1287,18 @@ pub struct StillText {
 
 impl StillText {
     pub fn parse(text: &str) -> StillText {
-        StillText {
-            strings: text
-                .split(['\r', '\n'])
-                .map(|s| s.trim_end().to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
+        // Blank lines are entries too: they keep later strings at their
+        // index, and space the credits out. Only the empty tail left by a
+        // final line ending is dropped.
+        let mut strings: Vec<String> = text
+            .replace("\r\n", "\n")
+            .split(['\r', '\n'])
+            .map(|s| s.trim_end().to_string())
+            .collect();
+        while strings.last().map(|s| s.is_empty()).unwrap_or(false) {
+            strings.pop();
         }
+        StillText { strings }
     }
 
     pub fn get(&self, index: usize) -> Option<&str> {
