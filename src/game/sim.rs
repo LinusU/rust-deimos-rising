@@ -1050,14 +1050,18 @@ impl Sim {
         let state_idx = req.state.unwrap_or(0).min(def.states.len() - 1);
         let state = &def.states[state_idx];
         // sub_41a990 heading block — runs BEFORE sub_41c540 scatter.
-        // Facing (+0x130): forced requests (f13) use the request heading
-        // plus a tolerance roll when initialHeadingTolerance != 0;
-        // everything else faces the unit def's initialHeading with no roll
-        // (initialHeadingSetInEditor does not affect facing).
+        // Facing (+0x130): a forced spawn uses the request heading plus a
+        // tolerance roll when initialHeadingTolerance != 0; everything
+        // else faces the unit def's initialHeading with no roll.
+        // G_EG_RequestSpawn (0x417e59) forces the spawn when the request
+        // sets a heading, or when the unit has initialHeadingSetInEditor,
+        // in which case the heading is the one the level editor stored
+        // for the object.
+        let forced = req.heading_forced || def.initial_heading_set_in_editor;
         let tol = def.initial_heading_tolerance;
         // Original half-range idiom (sbb/sar): (tol>=0 ? tol : tol+1) >> 1.
         let half_tol = (if tol >= 0 { tol } else { tol + 1 }) >> 1;
-        let mut facing = if req.heading_forced {
+        let mut facing = if forced {
             let mut h = req.heading.unwrap_or(0.0);
             if tol != 0 {
                 h += rand_int(&mut self.rng, -half_tol, half_tol) as f32;
