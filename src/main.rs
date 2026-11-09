@@ -250,7 +250,22 @@ fn film_test() {
             let inp = PlayerInput { p1: mk(0), p2: mk(1) };
             if inp.p1.fire { fire_frames += 1; }
             if inp.p1.bomb { bomb_frames += 1; }
+            let prev_phase = sim.players[0].as_ref().map(|p| p.phase);
             sim.advance(&a, &inp, 1.0 / 60.0);
+            if let (Some(pp), Some(np)) = (prev_phase, sim.players[0].as_ref().map(|p| p.phase)) {
+                if pp != np {
+                    let near: Vec<String> = sim.entities.iter()
+                        .filter(|e| !e.dead)
+                        .take(6)
+                        .map(|e| format!("{:08x}@({:.0},{:.0})", e.unit, e.pos.x, e.pos.y))
+                        .collect();
+                    println!("t={:>5} phase {:?} -> {:?} scr=({:.0},{:.0}) ents={}",
+                        t, pp, np,
+                        sim.players[0].as_ref().unwrap().screen.x,
+                        sim.players[0].as_ref().unwrap().screen.y,
+                        near.join(" "));
+                }
+            }
             if t % 600 == 599 {
                 let p = sim.players[0].as_ref().unwrap();
                 let mut projs = 0usize;
