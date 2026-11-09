@@ -150,6 +150,18 @@ pub struct Entity {
     /// Removed via the Destroy (destruct) path rather than Delete —
     /// distinguishes the two for owner-deletion propagation.
     pub destroyed: bool,
+    /// `G_Entity::Destroy` ran (original m_field_0xd2): gates the reap
+    /// sweep's deletionSpawn path, kill-count, and coin release.
+    pub destroy_ran: bool,
+    /// Player that killed this entity (original m_field_0xce), -1 = none.
+    pub killer: i32,
+    /// Killed by direct player-ship body contact (original m_field_0xbe):
+    /// suppresses coin release in sub_01ae10. Set by the ram path.
+    pub ram_kill: bool,
+    /// Reap sweep (sub_01b2d0) has processed this entity; `retain` only
+    /// removes dead entities once reaped, mirroring the original's
+    /// DeleteLink timing.
+    pub reaped: bool,
     /// Entity is homing/rotating toward a player target (rule condition
     /// "Is Tracking Player" — the original's `m_field_0xb5`).
     pub tracking: bool,
@@ -600,9 +612,6 @@ pub struct Sim {
     pub media_mask: Option<crate::assets::MediaMask>,
     /// `g_bgndTileSize` = background width / mask width (5 for retail).
     pub media_tile_size: i64,
-    /// Entities destroyed via `destroy_entity` this tick — the reap sweep
-    /// (sub_01b2d0) runs `CanSpawnOnMedia` on each, in list order.
-    reap_media: Vec<usize>,
     /// Debris zones (G_Debris): world-space rects [min_x, min_y, max_x,
     /// max_y] left by destroyed `destructCreateObstacle` units. Fixed in
     /// world space = scroll-locked like the original's screen rects.
@@ -762,7 +771,6 @@ impl Sim {
             pending_notice: None,
             media_mask: None,
             media_tile_size: 0,
-            reap_media: Vec::new(),
         };
         sim
     }
@@ -1145,6 +1153,10 @@ impl Sim {
             hit_count: 0,
             dead: false,
             destroyed: false,
+            destroy_ran: false,
+            killer: -1,
+            ram_kill: false,
+            reaped: false,
             tracking: false,
             rot_dir: -1,
             rot_last: 0,
@@ -1791,21 +1803,26 @@ impl Sim {
         // --- collisions ---
         self.collide(assets);
 
-        // --- reap sweep (sub_01b2d0) ---
-        // Every Destroy'd entity gets a CanSpawnOnMedia pass at end of
-        // frame, in entity-list order — the water-splash reward rolls and
-        // spawns here even when destructSpawn was absent. Runs before
-        // `retain` while the recorded indices are still valid.
-        self.reap_media.sort_unstable();
-        let reaped = std::mem::take(&mut self.reap_media);
-        for idx in reaped {
-            if idx < self.entities.len() && self.entities[idx].dead {
-                self.can_spawn_on_media(assets, idx);
+        // --- reap sweep (sub_01b2d0 + sub_01ae10) ---
+        // Every entity flagged dead (m_field_bf) is processed once, in
+        // entity-list order: owner cascade, deletionSpawn media gate,
+        // then group accounting/coin release. Entities killed during the
+        // sweep at a later index are handled in the same pass; earlier
+        // indices wait for the next tick's sweep — matching the original's
+        // live child-list walk. Runs before `retain`.
+        let mut ri = 0usize;
+        while ri < self.entities.len() {
+            if self.entities[ri].dead && !self.entities[ri].reaped {
+                self.reap_entity(assets, ri);
             }
+            ri += 1;
         }
 
         // --- cleanup ---
-        self.entities.retain(|e| !e.dead);
+        // Only dead-and-reaped entities leave; dead-but-unreaped ones
+        // (killed after the sweep point, or deferred by list order)
+        // survive to the next tick's sweep like the original's links.
+        self.entities.retain(|e| !e.dead || !e.reaped);
 
         // --- level-end money tallies (G_Player::MoneyCounter_Process) ---
         if self.phase == Phase::LevelEnd {
@@ -4003,9 +4020,158 @@ impl Sim {
         false
     }
 
-    /// `G_Entity::Destroy` — the destruct path: spawn/sound/particle
-    /// effects, coin release, random bonus drop, child handling. No score
-    /// (the original awards score in `Hit`, before `Destroy` is reached).
+    /// Reap sweep per-entity body (sub_01b2d0 child handling + the
+    /// sub_01ae10 group-accounting tail), in the original's order:
+    /// owner cascade for Destroy'd entities, the deletionSpawn media
+    /// gate for entities that never ran Destroy, then child cascades,
+    /// kill-count/vMatch, and coin release.
+    fn reap_entity(&mut self, assets: &GameAssets, idx: usize) {
+        if idx >= self.entities.len()
+            || !self.entities[idx].dead
+            || self.entities[idx].reaped
+        {
+            return;
+        }
+        let Some(def) = assets.units.get(&self.entities[idx].unit).cloned() else {
+            self.entities[idx].reaped = true;
+            return;
+        };
+        let epos = self.entities[idx].pos;
+        let my_uid = self.entities[idx].unique_num;
+        let destroy_ran = self.entities[idx].destroy_ran;
+        let killer = self.entities[idx].killer;
+        let spawner = self.entities[idx].spawner_player;
+        let owner_uid = self.entities[idx].owner;
+        let gid = self.entities[idx].group_id;
+        let ram_kill = self.entities[idx].ram_kill;
+        let state = self
+            .entities[idx]
+            .state
+            .min(def.states.len().saturating_sub(1));
+        let destroy_owner = def
+            .states
+            .get(state)
+            .map(|s| s.destroy_owner_on_destruction)
+            .unwrap_or(false);
+        // m_field_0x136: entity has spawn-set capacity (any state carries
+        // spawn sets) — gates both child cascades in sub_01ae10.
+        let has_spawn_sets = def.states.iter().any(|s| !s.spawn_sets.is_empty());
+
+        // Owner cascade (sub_01b2d0): Destroy'd entity whose CURRENT
+        // state sets destroyOwnerOnDestruction kills its live owner.
+        // sub_41b700 weak-link check ≈ owner exists and isn't already dead.
+        if destroy_ran && destroy_owner && owner_uid != u32::MAX {
+            let oidx = self
+                .entities
+                .iter()
+                .position(|o| o.unique_num == owner_uid && !o.dead);
+            if let Some(oidx) = oidx {
+                self.destroy_entity(assets, oidx, killer);
+            }
+        }
+
+        // deletionSpawn (fileData 0x2c2): only for entities removed
+        // WITHOUT Destroy ([0xd2]==0), gated by CanSpawnOnMedia exactly
+        // like destructSpawn. No retail unit sets deletionSpawn — the
+        // path is engine-faithful but data-dead.
+        if !destroy_ran
+            && def.deletion_spawn != NONE_ID
+            && self.can_spawn_on_media(assets, idx)
+        {
+            self.request_spawn(assets, SpawnReq {
+                unit: def.deletion_spawn,
+                pos: epos,
+                heading: None,
+                heading_forced: false,
+                owner: idx,
+                spawner_player: spawner,
+                stationary: false,
+                state: None,
+            });
+        }
+
+        // sub_01ae10: child cascades (m_field_0x136-gated).
+        // destructDestroyChildren additionally needs inFlag1 (destroy_ran);
+        // destructDeleteChildren runs regardless. sub_41b090/41b1b0 are
+        // approximated as destroy/delete of every owned child.
+        if has_spawn_sets {
+            if destroy_ran && def.destruct_destroy_children {
+                let kids: Vec<usize> = self
+                    .entities
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| {
+                        *i != idx && !e.dead && e.owner == my_uid
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                for k in kids {
+                    self.destroy_entity(assets, k, killer);
+                }
+            }
+            if def.destruct_delete_children {
+                let kids: Vec<usize> = self
+                    .entities
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| *i != idx && !e.dead && e.owner == my_uid)
+                    .map(|(i, _)| i)
+                    .collect();
+                for k in kids {
+                    self.entities[k].dead = true;
+                }
+            }
+        }
+
+        // Coin release: inFlag2 (killer != -1) && inFlag1 (destroy_ran)
+        // && !ram_kill ([0xbe]==0) && destructCoin != none && count > 0.
+        // Group-kill coin needs vMatch — approximated as "no live member
+        // remains in this group_id" (the original counts reaped members
+        // against the group's expected size).
+        if destroy_ran {
+            if killer != -1 && !ram_kill {
+                if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {
+                    for _ in 0..def.destruct_num_coins.min(64) {
+                        self.request_spawn(assets, SpawnReq {
+                            unit: def.destruct_coin,
+                            pos: epos,
+                            heading: None,
+                            heading_forced: false,
+                            owner: idx,
+                            spawner_player: -1,
+                            stationary: false,
+                            state: None,
+                        });
+                    }
+                }
+            }
+            let vmatch = gid != 0
+                && !self
+                    .entities
+                    .iter()
+                    .any(|e| !e.dead && e.group_id == gid);
+            if vmatch && def.destruct_coin_on_group_kill != NONE_ID {
+                self.request_spawn(assets, SpawnReq {
+                    unit: def.destruct_coin_on_group_kill,
+                    pos: epos,
+                    heading: None,
+                    heading_forced: false,
+                    owner: idx,
+                    spawner_player: -1,
+                    stationary: false,
+                    state: None,
+                });
+            }
+        }
+
+        self.entities[idx].reaped = true;
+    }
+
+    /// `G_Entity::Destroy` — the destruct path: debris/particle/spawn/
+    /// sound effects, flags, ground-accuracy, random bonus drop. Coin
+    /// release and child cascades happen later in the reap sweep
+    /// (sub_01ae10). No score (the original awards score in `Hit`,
+    /// before `Destroy` is reached).
     pub fn destroy_entity(&mut self, assets: &GameAssets, idx: usize, from_player: i32) {
         if idx >= self.entities.len() || self.entities[idx].dead {
             return;
@@ -4015,62 +4181,6 @@ impl Sim {
             None => return,
         };
         let epos = self.entities[idx].pos;
-        let my_uid = self.entities[idx].unique_num;
-        let my_gid = self.entities[idx].group_id;
-
-        // Children first (destruct_destroy/delete_children).
-        if def.destruct_destroy_children || def.destruct_delete_children {
-            let kids: Vec<usize> = self
-                .entities
-                .iter()
-                .enumerate()
-                .filter(|(i, e)| *i != idx && !e.dead && e.owner == my_uid)
-                .map(|(i, _)| i)
-                .collect();
-            for k in kids {
-                if def.destruct_destroy_children {
-                    self.destroy_entity(assets, k, from_player);
-                } else {
-                    self.entities[k].dead = true;
-                }
-            }
-        }
-
-        // Reap-order spawns (sub_01ae10 runs these before child->Destroy):
-        // destructNumCoinsToRelease copies of destructCoin, then the
-        // group-kill coin once when this was the group's last member.
-        if def.destruct_coin != NONE_ID && def.destruct_num_coins > 0 {
-            for _ in 0..def.destruct_num_coins.min(64) {
-                self.request_spawn(assets, SpawnReq {
-                    unit: def.destruct_coin,
-                    pos: epos,
-                    heading: None,
-                    heading_forced: false,
-                    owner: idx,
-                    spawner_player: from_player,
-                    stationary: false,
-                    state: None,
-                });
-            }
-        }
-        if def.destruct_coin_on_group_kill != NONE_ID && my_gid != 0 {
-            let any_left = self
-                .entities
-                .iter()
-                .any(|e| !e.dead && e.group_id == my_gid);
-            if !any_left {
-                self.request_spawn(assets, SpawnReq {
-                    unit: def.destruct_coin_on_group_kill,
-                    pos: epos,
-                    heading: None,
-                    heading_forced: false,
-                    owner: idx,
-                    spawner_player: from_player,
-                    stationary: false,
-                    state: None,
-                });
-            }
-        }
 
         // --- G_Entity::Destroy body ---
         // G_Debris_New on the entity bounds, then the destructParticle
@@ -4085,16 +4195,18 @@ impl Sim {
         );
         // destructSpawn (0x45e): gated by CanSpawnOnMedia — ground units
         // dying on a media-mask tile spawn the water splash instead.
+        // f18 = the entity's spawner player (m_field_0xca), owner = self.
         // destruct_notice: floating text — TODO notice system (unused in
         // retail data).
         if def.destruct_spawn != NONE_ID && self.can_spawn_on_media(assets, idx) {
+            let spawner = self.entities[idx].spawner_player;
             self.request_spawn(assets, SpawnReq {
                 unit: def.destruct_spawn,
                 pos: epos,
                 heading: None,
                 heading_forced: false,
                 owner: idx,
-                spawner_player: from_player,
+                spawner_player: spawner,
                 stationary: false,
                 state: None,
             });
@@ -4105,11 +4217,9 @@ impl Sim {
 
         self.entities[idx].dead = true;
         self.entities[idx].destroyed = true;
+        self.entities[idx].destroy_ran = true;
+        self.entities[idx].killer = from_player;
         self.stat_kills += 1;
-        // Reap sweep (sub_01b2d0): every Destroy'd entity gets a second
-        // CanSpawnOnMedia pass at end of frame — the water-splash reward
-        // rolls there even when destructSpawn was absent.
-        self.reap_media.push(idx);
 
         // G_Game_GroundAccuracy_AddDestroyed. The rb06 reward is NOT armed
         // here: the original arms it at the NEXT level's start when this
