@@ -1299,26 +1299,27 @@ use bevy::window::{Window, WindowPlugin, WindowResolution};
 
 /// Build the input state from keyboard state.
 fn gather_input(keys: Res<ButtonInput<KeyCode>>, mut fi: ResMut<FrameInput>) {
-    // Documented defaults (Deimos Rising Player Guide): P1 = Arrows move,
-    // LCtrl fire air, LShift select weapon, LAlt fire ground. P2 shares the
-    // keyboard on the left side: WASD move, Space fire, Q select, Z ground.
+    // The exe's built-in defaults (key-code table written at VA 0x408f12):
+    // P1 = Arrows, LCtrl fire air, LAlt fire ground, LShift select weapon;
+    // P2 = Numpad 8/4/6/5, End fire air, Delete fire ground, PageDown select.
+    // Space also fires P1's air weapon: Ctrl+Arrow is taken by macOS.
     fi.p1 = SlotInput {
         up: keys.pressed(KeyCode::ArrowUp),
         down: keys.pressed(KeyCode::ArrowDown),
         left: keys.pressed(KeyCode::ArrowLeft),
         right: keys.pressed(KeyCode::ArrowRight),
-        fire: keys.pressed(KeyCode::ControlLeft),
+        fire: keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::Space),
         bomb: keys.pressed(KeyCode::AltLeft),
         cycle: keys.just_pressed(KeyCode::ShiftLeft),
     };
     fi.p2 = SlotInput {
-        up: keys.pressed(KeyCode::KeyW),
-        down: keys.pressed(KeyCode::KeyS),
-        left: keys.pressed(KeyCode::KeyA),
-        right: keys.pressed(KeyCode::KeyD),
-        fire: keys.pressed(KeyCode::Space),
-        bomb: keys.pressed(KeyCode::KeyZ),
-        cycle: keys.just_pressed(KeyCode::KeyQ),
+        up: keys.pressed(KeyCode::Numpad8),
+        down: keys.pressed(KeyCode::Numpad5),
+        left: keys.pressed(KeyCode::Numpad4),
+        right: keys.pressed(KeyCode::Numpad6),
+        fire: keys.pressed(KeyCode::End),
+        bomb: keys.pressed(KeyCode::Delete),
+        cycle: keys.just_pressed(KeyCode::PageDown),
     };
 }
 
