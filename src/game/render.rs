@@ -2323,7 +2323,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
     if shot_mode {
         app.add_systems(PreUpdate, shot_mute_input.after(bevy::input::InputSystems));
     }
-    app.add_systems(Startup, (setup, setup_hud, setup_menu))
+    app.add_systems(Startup, (setup, setup_menu))
         .add_systems(
             Update,
             (
@@ -2342,7 +2342,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
                 sync_entities,
                 sync_players,
                 sync_scorebar,
-                hud_system,
+                sync_hud_text,
                 shot_system,
             )
                 .chain(),
@@ -2354,65 +2354,194 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
 // HUD
 // ---------------------------------------------------------------------------
 
-/// One score-bar text element per player slot.
-#[derive(Component)]
-pub struct HudText {
-    pub slot: usize,
-    pub kind: HudKind,
+// Bitmap text (G_Text port). Every string is drawn from the `tesm` font
+// sprite, one frame per character, laid out by a `tefo` text format.
+
+/// Font sprite used for all text (`g_textSpriteIDs[0]`).
+const FONT: &str = "tesm";
+
+/// Font frame for a character: the jump table at VA 0x43eb70. Anything
+/// outside `!`..=`~`, the space included, gets the blank frame 90.
+fn font_frame(c: char) -> i64 {
+    match c {
+        'A'..='Z' => c as i64 - 'A' as i64,
+        'a'..='z' => 26 + c as i64 - 'a' as i64,
+        '1'..='9' => 52 + c as i64 - '1' as i64,
+        '0' => 61,
+        '!'..='/' => 62 + c as i64 - '!' as i64,
+        ':'..='@' => 77 + c as i64 - ':' as i64,
+        '[' | '{' => 69, // drawn as '('
+        ']' | '}' => 70, // drawn as ')'
+        '\\' => 84,
+        '^' => 85,
+        '_' => 86,
+        '`' => 87,
+        '|' => 88,
+        '~' => 89,
+        _ => 90,
+    }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum HudKind {
-    /// Score digits in the "Score" rect.
-    Score,
-    /// Lives count in the "Life Count" rect.
-    Lives,
+/// One character placed by `layout_text`.
+struct Glyph {
+    frame: i64,
+    /// Sprite centre, in the coordinate space of the format's location.
+    center: Vec2,
 }
 
-/// Spawn HUD text inside the score-bar strip (perm `reli` rects).
-pub fn setup_hud(mut commands: Commands, assets: Res<GameAssets>) {
-    for slot in 0..2 {
-        for (kind, rect_name, size, anchor_right) in [
-            (HudKind::Score, "Score", 13.0, true),
-            (HudKind::Lives, "Life Count", 15.0, false),
-        ] {
-            let full = format!("Scorebar Player {} {}", slot + 1, rect_name);
-            let Some(r) = assets
-                .rect_list
-                .as_ref()
-                .and_then(|l| l.get(&full))
-            else {
-                continue;
-            };
-            let (x, y, w) = (
-                SCOREBAR_X + r.left as f32,
-                r.top as f32,
-                (r.right - r.left) as f32,
-            );
-            commands.spawn((
-                Text::new(""),
-                TextFont {
-                    font_size: bevy::text::FontSize::Px(size),
-                    ..default()
-                },
-                TextColor(Color::srgb(0.9, 0.95, 1.0)),
-                Node {
-                    position_type: PositionType::Absolute,
-                    top: Val::Px(y),
-                    left: Val::Px(x),
-                    width: Val::Px(w),
-                    height: Val::Px((r.bottom - r.top) as f32),
-                    justify_content: if anchor_right {
-                        JustifyContent::FlexEnd
-                    } else {
-                        JustifyContent::FlexStart
-                    },
-                    align_items: AlignItems::Center,
-                    ..default()
-                },
-                HudText { slot, kind },
-            ));
+/// Lay a string out the way `G_Text_Priv_0x43e4e0` does. `pos` is the
+/// text's top-left for `LEFT`; `RIGH` ends there, `CENT` centres on it,
+/// `CEGA` centres in the 416-px game area, `CEBU` in the 640-px screen.
+/// Monospaced text gives every character the widest digit's width.
+fn layout_text(
+    assets: &mut GameAssets,
+    text: &str,
+    pos: Vec2,
+    align: &str,
+    monospaced: bool,
+    spacing: i32,
+) -> Vec<Glyph> {
+    let Some(font) = assets.sprite(crate::pak::id(FONT)) else {
+        return Vec::new();
+    };
+    let dims = |c: char| -> (i32, i32) {
+        font.frames
+            .get(font_frame(c) as usize)
+            .map(|f| (f.width as i32, f.height as i32))
+            .unwrap_or((0, 0))
+    };
+    let widest_digit = "1234567890".chars().map(|c| dims(c).0).max().unwrap_or(0);
+    let advance = |c: char| if monospaced { widest_digit } else { dims(c).0 };
+    let total: i32 = text.chars().map(|c| spacing + advance(c)).sum();
+    let mut x = match align {
+        "RIGH" => pos.x as i32 - total,
+        "CENT" => (pos.x - total as f32 / 2.0) as i32,
+        "CEGA" => ((416.0 - total as f32) / 2.0) as i32,
+        "CEBU" => ((640.0 - total as f32) / 2.0) as i32,
+        _ => pos.x as i32,
+    };
+    let y = pos.y as i32;
+    let mut out = Vec::new();
+    for c in text.chars() {
+        x += spacing;
+        if c != ' ' {
+            // sub_43e8c0: the glyph's centre is half its own size in from
+            // the pen position, rounding up.
+            let (w, h) = dims(c);
+            out.push(Glyph {
+                frame: font_frame(c),
+                center: Vec2::new((x + (w + 1) / 2) as f32, (y + (h + 1) / 2) as f32),
+            });
         }
+        x += advance(c);
+    }
+    out
+}
+
+/// Marks one glyph sprite of the score bar's text.
+#[derive(Component)]
+pub struct HudGlyph {
+    key: (usize, u8, usize),
+}
+
+/// Draw the score-bar numbers with the game font (`G_ScoreBar_Draw`):
+/// each player's score as seven digits (text formats `sbs1`/`sbs2`), and
+/// the lives in reserve (`sbl1`/`sbl2`, or `sll1`/`sll2` on the last life).
+pub fn sync_hud_text(
+    mut commands: Commands,
+    sim_res: Res<GameSim>,
+    flow: Res<Flow>,
+    mut assets: ResMut<GameAssets>,
+    mut images: ResMut<Assets<Image>>,
+    mut book: ResMut<TextureBook>,
+    mut q: Query<(Entity, &HudGlyph, &mut Sprite, &mut Transform)>,
+) {
+    let sim = &sim_res.0;
+    let mut draws: Vec<((usize, u8, usize), Handle<Image>, Vec3, Color)> = Vec::new();
+    if flow.state == FlowState::Playing {
+        let max_lives = crate::game::sim::pf(&assets, 0x8f) as i64; // ScoreBar_Lives_MaxNumDisplayed
+        for slot in 0..2 {
+            let player = sim.players[slot]
+                .as_ref()
+                .filter(|p| p.phase != PlayerPhase::Dead);
+            let in_game = player.is_some();
+            let score = player.map(|p| p.score).unwrap_or(0);
+            let mut lives = player.map(|p| (p.lives as i64 - 1).max(0)).unwrap_or(0);
+            if max_lives > 0 {
+                lives = lives.min(max_lives);
+            }
+            let n = slot + 1;
+            let lives_fmt = if in_game && lives == 0 { format!("sll{n}") } else { format!("sbl{n}") };
+            let texts = [
+                (0u8, format!("sbs{n}"), format!("{:07}", score)),
+                (1u8, lives_fmt, format!("{}", lives)),
+            ];
+            for (kind, fmt_id, text) in texts {
+                let Some(fmt) = assets.text_formats.get(&crate::pak::id(&fmt_id)).cloned() else {
+                    continue;
+                };
+                // Locations are in front-buffer space; the screen is
+                // PLAY_LEFT further right.
+                let pos = Vec2::new(
+                    fmt.get_int("Loc_X") as f32 + PLAY_LEFT,
+                    fmt.get_int("Loc_Y") as f32,
+                );
+                let glyphs = layout_text(
+                    &mut assets,
+                    &text,
+                    pos,
+                    fmt.get("Format").unwrap_or("LEFT").trim(),
+                    fmt.get("Monospaced").map(|v| v.trim() == "TRUE").unwrap_or(false),
+                    fmt.get_int("SpaceBetweenChars") as i32,
+                );
+                // A player who is not in the game has their numbers
+                // blended halfway to nothing.
+                let mut blend = fmt.get_int("BlendAmount_0To32") as u32;
+                if !in_game {
+                    blend += (32 - blend) / 2;
+                }
+                let colorise = fmt.get("Colorise_Do").map(|v| v.trim() == "TRUE").unwrap_or(false);
+                let rgb = u32::from_str_radix(fmt.get("ColoriseColor").unwrap_or("ffffff").trim(), 16)
+                    .unwrap_or(0xffffff);
+                let (blit, color) = if colorise {
+                    (Blit::Flat, Color::srgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8))
+                } else {
+                    (Blit::Sprite, Color::WHITE)
+                };
+                for (i, g) in glyphs.iter().enumerate() {
+                    let Some(handle) = frame_image_blend(
+                        &mut assets, &mut images, &mut book, crate::pak::id(FONT), g.frame, blend.min(32), blit,
+                    ) else {
+                        continue;
+                    };
+                    draws.push((
+                        (slot, kind, i),
+                        handle,
+                        to_world_z(g.center.x, g.center.y, Z_SCOREBAR + 2.0),
+                        color,
+                    ));
+                }
+            }
+        }
+    }
+    let mut existing: HashMap<(usize, u8, usize), Entity> =
+        q.iter().map(|(be, g, _, _)| (g.key, be)).collect();
+    for (key, handle, pos, color) in draws {
+        match existing.remove(&key).and_then(|be| q.get_mut(be).ok()) {
+            Some((_, _, mut sprite, mut transform)) => {
+                sprite.image = handle;
+                sprite.color = color;
+                transform.translation = pos;
+            }
+            None => {
+                let mut sprite = Sprite::from_image(handle);
+                sprite.color = color;
+                commands.spawn((sprite, Transform::from_translation(pos), HudGlyph { key }));
+            }
+        }
+    }
+    for (_, be) in existing {
+        commands.entity(be).despawn();
     }
 }
 
@@ -2789,31 +2918,3 @@ fn ease(cur: &mut f32, target: f32, dt: f32, inc: f32, dec: f32) {
     }
 }
 
-/// Refresh HUD text from sim state each frame.
-pub fn hud_system(
-    sim_res: Res<GameSim>,
-    flow: Res<Flow>,
-    mut q: Query<(&HudText, &mut Text)>,
-) {
-    let sim = &sim_res.0;
-    for (hud, mut text) in q.iter_mut() {
-        if flow.state != FlowState::Playing {
-            text.0 = String::new();
-            continue;
-        }
-        let slot = hud.slot;
-        if flow.paused && slot == 0 && hud.kind == HudKind::Score {
-            text.0 = "PAUSED".to_string();
-            continue;
-        }
-        let Some(p) = sim.players[slot].as_ref() else {
-            text.0 = String::new();
-            continue;
-        };
-        text.0 = match hud.kind {
-            // "%0.7i" score; lives shown are those in reserve (lives - 1).
-            HudKind::Score => format!("{:07}", p.score),
-            HudKind::Lives => format!("{}", (p.lives - 1).clamp(0, 9)),
-        };
-    }
-}
