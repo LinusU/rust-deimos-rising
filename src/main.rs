@@ -1571,17 +1571,42 @@ fn test_sim() {
     let dir = data_dir();
     let mut assets = assets::GameAssets::open(&dir).expect("open");
     assets.load_all_data();
-    let level_id = pak::id("le01");
-    let mut sim = game::render::start_level(&mut assets, level_id, 1, 1).expect("level");
     let secs: u32 = std::env::args()
         .position(|a| a == "--secs")
         .and_then(|i| std::env::args().nth(i + 1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    let level_arg = std::env::args()
+        .position(|a| a == "--level")
+        .and_then(|i| std::env::args().nth(i + 1));
+    let level_id = level_arg
+        .as_deref()
+        .map(pak::id)
+        .unwrap_or_else(|| pak::id("le01"));
+    let players: usize = std::env::args()
+        .position(|a| a == "--players")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .clamp(1, 2);
+    let mut sim = game::render::start_level(&mut assets, level_id, players, 1).expect("level");
     for tick in 0..secs * 60 {
         // Scripted input: wiggle + periodic fire.
         let t = tick as f32;
         let fire = (tick / 45) % 2 == 0;
+        let p2in = if players == 2 {
+            SlotInput {
+                up: (t * 0.07).sin() > 0.4,
+                down: (t * 0.07).sin() < -0.4,
+                left: (t * 0.04).cos() < -0.4,
+                right: (t * 0.04).cos() > 0.4,
+                fire: (tick / 60) % 2 == 0,
+                bomb: (tick / 90) % 3 == 0,
+                cycle: false,
+            }
+        } else {
+            SlotInput::default()
+        };
         let inp = PlayerInput {
             p1: SlotInput {
                 up: (t * 0.05).sin() > 0.3,
@@ -1592,7 +1617,7 @@ fn test_sim() {
                 bomb: false,
                 cycle: false,
             },
-            p2: SlotInput::default(),
+            p2: p2in,
         };
         sim.advance(&assets, &inp, 1.0 / 60.0);
         if tick % 600 == 599 {
