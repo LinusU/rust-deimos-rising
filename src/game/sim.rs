@@ -594,6 +594,8 @@ pub struct Sim {
     pub stat_coins: u64,
     /// Raw def.score points awarded on player kills (diagnostic).
     pub stat_score_points: i64,
+    /// Total entities created via spawn_one (diagnostic).
+    pub stat_spawns: u64,
     /// Global game tick counter.
     pub game_time: u32,
     /// 1-based level number (weapon level-availability filtering).
@@ -780,6 +782,7 @@ impl Sim {
             stat_pickups: 0,
             stat_coins: 0,
             stat_score_points: 0,
+            stat_spawns: 0,
             game_time: 0,
             level_number: 1,
             players: [None, None],
@@ -1282,6 +1285,7 @@ impl Sim {
             carried_weapon: carried_weapon(assets, def, self.level_number),
         });
         self.next_unique = self.next_unique.wrapping_add(1);
+        self.stat_spawns += 1;
         if def.pickup_type != NONE_ID {
             self.stat_pickups += 1;
             if std::env::var("DEIMOS_COINLOG").is_ok() && req.unit == id("cass") {
