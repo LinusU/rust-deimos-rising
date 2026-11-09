@@ -924,6 +924,7 @@ fn flag_census() {
                 ("collision_spawn", st.collision_spawn_id != crate::pak::NONE_ID),
                 ("collision_repeat", st.collision_repeat_spawns),
                 ("rotate_to_target", st.rotate_to_target),
+                ("pause_vertical_scrolling", st.pause_vertical_scrolling),
                 ("rule_unit", st.rules.iter().any(|r| r.unit_id != crate::pak::NONE_ID)),
             ];
             for (n, v) in checks {
@@ -1049,7 +1050,11 @@ fn test_sim() {
             let p = sim.players[0].as_ref().unwrap();
             let mut projs = 0usize;
             let mut pickups = 0usize;
+            let mut pausers = 0usize;
             for e in &sim.entities {
+                if e.dead {
+                    continue;
+                }
                 if let Some(d) = assets.units.get(&e.unit) {
                     if d.player_projectile {
                         projs += 1;
@@ -1057,16 +1062,20 @@ fn test_sim() {
                     if d.pickup_type != pak::NONE_ID {
                         pickups += 1;
                     }
+                    if d.states.get(e.state).map(|s| s.pause_vertical_scrolling).unwrap_or(false) {
+                        pausers += 1;
+                    }
                 }
             }
             println!(
-                "t={:>4}s scroll={:7.1} ent={:>4} proj={:>3} pick={:>2}/{} hit={} kill={} ph={:?} p=({:5.1},{:5.1}) sh={:5.1} score={} money={} mult={} lives={} wpn={:08x} done={}",
+                "t={:>4}s scroll={:7.1} ent={:>4} proj={:>3} pick={:>2}/{} pause={} hit={} kill={} ph={:?} p=({:5.1},{:5.1}) sh={:5.1} score={} money={} mult={} lives={} wpn={:08x} done={}",
                 tick / 60,
                 sim.scroll,
                 sim.entities.len(),
                 projs,
                 pickups,
                 sim.stat_pickups,
+                pausers,
                 sim.stat_hits,
                 sim.stat_kills,
                 sim.phase,
