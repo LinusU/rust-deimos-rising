@@ -38,8 +38,6 @@ pub const PLAY_CENTER_X: f32 = PLAY_LEFT + 208.0;
 pub const WORLD_TO_SCREEN_X: f32 = PLAY_LEFT;
 /// Player top game-area limit (perm float 0xb7 = Player_TopGameAreaLimit).
 pub const PLAYER_TOP_LIMIT: f32 = 13.0;
-/// Player bottom limit.
-pub const PLAYER_BOTTOM_LIMIT: f32 = SCREEN_H - PLAYER_TOP_LIMIT;
 /// Side-scroll clamp (G_Bgnd_AdjustSideScroll: -0x20..=0x1f).
 pub const SIDE_SCROLL_MIN: f32 = -32.0;
 pub const SIDE_SCROLL_MAX: f32 = 31.0;
@@ -2365,7 +2363,11 @@ impl Sim {
         }
         p.vel.x = p.vel.x.clamp(-max_speed, max_speed);
         p.vel.y = p.vel.y.clamp(-max_speed, max_speed);
-        p.screen += p.vel;
+        // The original keeps the ship's x in game-area space (m_x) and
+        // draws it at m_x - sideScroll, so a camera pan slides the ship
+        // across the screen. Move in that space, then convert back.
+        let mut gx = p.screen.x - WORLD_TO_SCREEN_X + self.cam_x + p.vel.x;
+        p.screen.y += p.vel.y;
 
         p.tilt_frame = if inp.left { 4 }
             else if inp.right { 6 }
@@ -2380,14 +2382,28 @@ impl Sim {
             self.cam_x = (self.cam_x + 1.0).min(SIDE_SCROLL_MAX);
         }
 
-        // Clamp to playfield.
-        let hw = 14.0;
-        p.screen.x = p.screen.x.clamp(PLAY_LEFT + hw, PLAY_RIGHT - hw);
-        p.screen.y = p.screen.y.clamp(PLAYER_TOP_LIMIT, PLAYER_BOTTOM_LIMIT);
-        if p.vel.x != 0.0 && (p.screen.x <= PLAY_LEFT + hw || p.screen.x >= PLAY_RIGHT - hw) {
+        // Clamp (G_Player::Process, 0x4349be): the sprite's edges stay
+        // within game x [-32, 448], the full width of the terrain, with
+        // its top at pf(0xb7) or lower, its bottom on screen.
+        let (hw, hh) = {
+            let (w, h) = player_half_extents(assets, p);
+            (w.floor(), h.floor())
+        };
+        let (x_min, x_max) = (hw - 32.0, pf(assets, pf::VISIBLE_GAME_WIDTH) + 32.0 - hw);
+        if gx < x_min {
+            gx = x_min;
+            p.vel.x = 0.0;
+        } else if gx > x_max {
+            gx = x_max;
             p.vel.x = 0.0;
         }
-        if p.vel.y != 0.0 && (p.screen.y <= PLAYER_TOP_LIMIT || p.screen.y >= PLAYER_BOTTOM_LIMIT) {
+        p.screen.x = gx - self.cam_x + WORLD_TO_SCREEN_X;
+        let (y_min, y_max) = (PLAYER_TOP_LIMIT + hh, SCREEN_H - hh);
+        if p.screen.y < y_min {
+            p.screen.y = y_min;
+            p.vel.y = 0.0;
+        } else if p.screen.y > y_max {
+            p.screen.y = y_max;
             p.vel.y = 0.0;
         }
 
