@@ -565,6 +565,10 @@ fn main() {
         player_probe();
         return;
     }
+    if args.iter().any(|a| a == "--levels") {
+        levels_probe();
+        return;
+    }
     if args.iter().any(|a| a == "--states") {
         let v: u32 = std::env::args().nth(2).unwrap().parse().unwrap();
         state_probe(v);
@@ -962,6 +966,20 @@ fn test_defs() {
     dmg_units.sort();
     println!("DMG-SOURCES units={} withPassHits={} ( *=passHitsToOwner)", dmg_units.len(), pho_dmg);
     for n in dmg_units.iter().take(60) { println!("   {}", n); }
+    // Random-bonus drop census: which units release a bonus pod on death,
+    // and what object_ids[0x19..0x22] resolve to.
+    let mut rb: Vec<String> = Vec::new();
+    for (rid, u) in &a.units {
+        if u.destruct_release_random_bonus {
+            rb.push(format!("{}:{:08x}", u.name, rid));
+        }
+    }
+    rb.sort();
+    println!("RANDOMBONUS units={} {:?}", rb.len(), rb);
+    for slot in 0x19usize..=0x22 {
+        let r = a.object_ids.entries.get(slot).map(|e| e.1);
+        println!("   objid[{:02x}] = {:08x}", slot, r.unwrap_or(0));
+    }
     // Heading-tolerance / owner-heading census: the original only rolls
     // initialHeadingTolerance for useOwnerHeading units without an owner.
     let (mut ntol, mut nown, mut ntol_own) = (0, 0, 0);
@@ -1147,6 +1165,20 @@ fn player_probe() {
             rid, p.life_num_initial, p.life_max_num, p.default_shield_percentage,
             p.active_defence_bonus_object, p.active_spawn_on_hit,
             p.active_shield_warning_object, p.active_money_counter_spawn
+        );
+    }
+}
+
+fn levels_probe() {
+    let dir = data_dir();
+    let mut a = assets::GameAssets::open(&dir).expect("open");
+    a.load_all_data();
+    let mut v: Vec<_> = a.levels.iter().collect();
+    v.sort_by_key(|(r, _)| **r);
+    for (rid, l) in v {
+        println!(
+            "{:08x} name={:?} ident={:?} objs={} music={:08x}",
+            rid, l.name, l.identifier, l.objects.len(), l.music
         );
     }
 }

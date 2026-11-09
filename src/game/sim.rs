@@ -1745,6 +1745,9 @@ impl Sim {
                     // the flag so it can happen at most once per run. The
                     // whole award (spawn + score) requires the player def's
                     // defence-bonus object (field0xce) to be defined.
+                    if std::env::var("DEIMOS_ENDLOG").is_ok() {
+                        eprintln!("ENDLOG P{} took_damage={} def_obj={:08x} money={}", slot, took_damage, def_obj, money);
+                    }
                     if !took_damage {
                         if let Some(p) = self.players[slot].as_mut() {
                             p.damage_taken = true;
@@ -1761,12 +1764,13 @@ impl Sim {
                                 stationary: true,
                                 state: None,
                             });
-                            self.add_score(
-                                slot,
-                                self.level_number * pf(assets, 0xb8) as i64,
-                                false,
-                                assets,
-                            );
+                            let pts = self.level_number * pf(assets, 0xb8) as i64;
+                            if std::env::var("DEIMOS_ENDLOG").is_ok() {
+                                eprintln!("ENDLOG P{} defence bonus +{} (lvl={} pfb8={})", slot, pts, self.level_number, pf(assets, 0xb8));
+                            }
+                            self.add_score(slot, pts, false, assets);
+                        } else if std::env::var("DEIMOS_ENDLOG").is_ok() {
+                            eprintln!("ENDLOG P{} def_obj=NONE (no defence bonus)", slot);
                         }
                     }
                     // MoneyCounter_Start: stage the tally inactive — it arms
@@ -1831,6 +1835,9 @@ impl Sim {
                 // 100% accuracy arms the RandomBonus_6 reward for the NEXT
                 // level (exe 0x4e4827 → 0x4e4828 at level start).
                 self.accuracy_reward_carry = pct >= 100.0;
+                if std::env::var("DEIMOS_ENDLOG").is_ok() {
+                    eprintln!("ENDLOG accuracy pct={:.1} tier={} total={} destroyed={}/{} lvl={}", pct, tier, total, self.accuracy_destroyed, self.accuracy_targets, self.level_number);
+                }
                 // Remaining players go invulnerable for the sequence.
                 for p in self.players.iter_mut().flatten() {
                     if p.phase != PlayerPhase::Dead {
