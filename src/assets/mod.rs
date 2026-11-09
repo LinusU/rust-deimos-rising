@@ -728,7 +728,12 @@ fn decode_sprite(color: &[u8], alpha: &[u8]) -> Option<Sprite> {
     if rects.is_empty() {
         return None;
     }
-    let (_, _, alpha_px) = decode_gif_rgba(alpha)?;
+    let (_, _, mut alpha_px) = decode_gif_rgba(alpha)?;
+    let mut color_px = color_px;
+    // Both plates go through QuickTime, so the colours and the mask's
+    // transparency levels are brightened alike.
+    quicktime_brighten(&mut color_px);
+    quicktime_brighten(&mut alpha_px);
     // Colour key: the colour plate's third pixel (`U_Sprite.cc` reads the
     // 16-bit word at offset 4 of the plate's pixel data).
     let key = color_px.get(8..12).map(rgb555).unwrap_or(0);
@@ -812,29 +817,29 @@ fn decode_tga(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
     let mut raw = rgba.into_raw();
-    let lut = tga_gamma_lut();
-    for px in raw.chunks_exact_mut(4) {
-        for c in &mut px[..3] {
-            *c = lut[(*c >> 3) as usize];
-        }
-    }
+    quicktime_brighten(&mut raw);
     Some((w, h, raw))
 }
 
-/// The brightening QuickTime's TGA importer applies to every 16-bit image
-/// the original loads (backdrops, terrain, the score bar), as an 8-bit
-/// output value per 5-bit input level.
+/// Brighten RGBA pixels the way QuickTime's importers do for every image
+/// the original loads: backdrops, terrain, the score bar, sprite plates
+/// and their alpha plates.
 ///
-/// Measured against the original running under Drydock: each 5-bit channel
-/// level `v` comes out as `round(31 * (v / 31) ^ 0.7455)`. Sprites (GIF
-/// plates) are not affected.
-fn tga_gamma_lut() -> [u8; 32] {
+/// Measured against the original running under Drydock: a channel is cut
+/// to 5 bits, and level `v` comes out as `round(31 * (v / 31) ^ 0.7455)`.
+/// The game then works on those 5-bit levels, so a sprite's transparency
+/// levels shift along with its colours.
+fn quicktime_brighten(rgba: &mut [u8]) {
     let mut lut = [0u8; 32];
     for (v, out) in lut.iter_mut().enumerate() {
         let level = (31.0 * (v as f64 / 31.0).powf(0.7455)).round() as u8;
         *out = (level << 3) | (level >> 2);
     }
-    lut
+    for px in rgba.chunks_exact_mut(4) {
+        for c in &mut px[..3] {
+            *c = lut[(*c >> 3) as usize];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
