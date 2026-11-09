@@ -546,6 +546,20 @@ fn main() {
         let mut bands: std::collections::BTreeMap<i64, usize> = Default::default();
         for &y in &ys { *bands.entry(y / 64).or_insert(0) += 1; }
         for (b, c) in bands.iter().take(20) { println!("  band {} (y {}..{}): {}", b, b*64, b*64+63, c); }
+        // scatter-mode census: both axes ranged -> polar scatter in the
+        // original (sub_41c540); single-axis -> independent roll.
+        let mut polar = 0; let mut xonly = 0; let mut yonly = 0; let mut fixed = 0;
+        for (rid, u) in &a.units {
+            let xr = u.x_offset_min != u.x_offset_max;
+            let yr = u.y_offset_min != u.y_offset_max;
+            match (xr, yr) {
+                (true, true) => { polar += 1; println!("  POLAR {:?} x[{},{}] y[{},{}]", rid, u.x_offset_min, u.x_offset_max, u.y_offset_min, u.y_offset_max); }
+                (true, false) => xonly += 1,
+                (false, true) => yonly += 1,
+                (false, false) => fixed += 1,
+            }
+        }
+        println!("scatter census: polar={} xonly={} yonly={} fixed={}", polar, xonly, yonly, fixed);
         return;
     }
     // Default: launch the game.
