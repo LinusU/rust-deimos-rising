@@ -60,10 +60,13 @@ pub enum FlowState {
     Sectors,
     Briefing,
     Playing,
-    GameOver,
-    /// Enter initials for a qualifying hi-score.
+    /// High-score table, shown from the title screen and after a game.
+    Scores,
+    /// Typing a name for a qualifying score, on the score table.
     NameEntry,
     Credits,
+    /// Key-binding screen.
+    Controls,
 }
 
 #[derive(Resource)]
@@ -83,9 +86,21 @@ pub struct Flow {
     pub paused: bool,
     /// Pending hi-score name entries (one per qualifying player).
     pub pending_scores: Vec<PendingScore>,
-    /// Name-entry cursor state while in FlowState::NameEntry.
-    pub name_buf: [char; 3],
-    pub name_idx: usize,
+    /// Name typed so far in FlowState::NameEntry.
+    pub name_text: String,
+    /// Row of the score table to highlight (the entry just added).
+    pub score_hilite: Option<usize>,
+    /// Selected button on the title screen.
+    pub menu_sel: usize,
+    /// Selected (action row, player column) on the Controls screen.
+    pub controls_sel: (usize, usize),
+    /// Controls screen is waiting for the key to bind.
+    pub rebinding: bool,
+    /// Page of the credits being shown.
+    pub credits_page: usize,
+    /// `ticks` value at which every player was found dead, while the
+    /// game-over notice plays out.
+    pub game_over_at: Option<u32>,
     /// Run started above sector 1: 1 life, no hi-score, no progress credit
     /// (original level-select restriction).
     pub restricted: bool,
@@ -176,12 +191,15 @@ impl HighScores {
                 || self.entries.last().map(|e| score > e.score).unwrap_or(true))
     }
 
-    /// Insert a named score, keep top MAX_SCORES sorted.
-    pub fn insert(&mut self, name: String, score: i64, level: String) {
-        self.entries.push(ScoreEntry { name, score, level });
-        self.entries.sort_by(|a, b| b.score.cmp(&a.score));
+    /// Insert a named score, keep the top MAX_SCORES sorted, and return
+    /// the row it landed on.
+    pub fn insert(&mut self, name: String, score: i64, level: String) -> usize {
+        // After every entry scoring at least as much, like the preview row.
+        let row = self.entries.iter().position(|e| score > e.score).unwrap_or(self.entries.len());
+        self.entries.insert(row, ScoreEntry { name, score, level });
         self.entries.truncate(MAX_SCORES);
         self.save();
+        row
     }
 }
 
@@ -356,17 +374,6 @@ pub struct Demo {
     pub film_idx: usize,
 }
 
-/// Full-screen menu backdrop sprite (menu TGA / level preview).
-#[derive(Component)]
-pub struct MenuBg;
-
-/// Logo sprite shown on title/credits screens.
-#[derive(Component)]
-pub struct MenuLogo;
-
-/// Centered menu text block.
-#[derive(Component)]
-pub struct MenuText;
 
 // ---------------------------------------------------------------------------
 // Particles (G_Particle port): spark bursts in screen space
@@ -977,7 +984,7 @@ fn frame_image(
 
 /// Which of the original's sprite blits a baked texture stands in for.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Blit {
+pub(crate) enum Blit {
     /// `DrawNormal` / `DrawTranslucent`: the sprite's own colours.
     Sprite,
     /// `DrawColorised`: white, for `Sprite::color` to supply the tint.
@@ -989,7 +996,7 @@ enum Blit {
 /// Sprite frame as the original's translucent, colourised and shadow blits
 /// draw it: `blend` (0..=32) is added to each pixel's own transparency
 /// level, and anything reaching 32 vanishes.
-fn frame_image_blend(
+pub(crate) fn frame_image_blend(
     assets: &mut GameAssets,
     images: &mut Assets<Image>,
     book: &mut TextureBook,
@@ -1078,7 +1085,7 @@ fn visibility_blend(vis: f32) -> u32 {
     ((vis / 100.0 * 32.0 - 32.0).abs() as u32).min(32)
 }
 
-fn image16_handle(
+pub(crate) fn image16_handle(
     assets: &mut GameAssets,
     images: &mut Assets<Image>,
     book: &mut TextureBook,
@@ -1104,7 +1111,7 @@ pub fn to_world(sx: f32, sy: f32) -> Vec3 {
 }
 
 /// `to_world` at an explicit depth (higher z draws on top).
-fn to_world_z(sx: f32, sy: f32, z: f32) -> Vec3 {
+pub(crate) fn to_world_z(sx: f32, sy: f32, z: f32) -> Vec3 {
     Vec3::new(sx - SCREEN_W * 0.5, SCREEN_H * 0.5 - sy, z)
 }
 
@@ -1481,6 +1488,8 @@ pub fn sync_players(
 
 use crate::game::sim::{PlayerInput, SlotInput};
 use bevy::window::{Window, WindowPlugin, WindowResolution};
+use crate::game::input::KeyBindings;
+use crate::game::menu::{MenuPointer, SectorHit, TitleItem, TITLE_ITEMS};
 
 /// Build the input state from keyboard state.
 fn gather_input(
@@ -1543,10 +1552,6 @@ fn sim_system(
     sim.0.advance(&*assets, &input, dt);
 }
 
-/// Centered level-end breakdown text (G_GameInterface's 0x4e487a buffer).
-#[derive(Component)]
-pub struct EndText;
-
 /// Menu/flow state machine. Drives title → sectors → briefing → play →
 /// cleared/game-over → credits using the retail `lgsp`/`cred` strings.
 pub fn flow_system(
@@ -1557,7 +1562,9 @@ pub fn flow_system(
     mut scores: ResMut<HighScores>,
     mut demo: ResMut<Demo>,
     mut audio: Option<ResMut<crate::game::audio::AudioEngine>>,
-    mut menu_q: Query<&mut Text, With<MenuText>>,
+    pointer: Res<MenuPointer>,
+    mut bindings: ResMut<KeyBindings>,
+    mut exit: MessageWriter<AppExit>,
     time: Res<Time>,
     shot: Option<Res<ShotPlan>>,
 ) {
@@ -1574,7 +1581,7 @@ pub fn flow_system(
     flow.ticks += ticks;
     // Any key aborts attract playback back to the title.
     if demo.playback.is_some() && flow.state == FlowState::Playing {
-        if keys.get_just_pressed().next().is_some() {
+        if keys.get_just_pressed().next().is_some() || pointer.clicked {
             demo.playback = None;
             demo.frame = 0;
             flow.state = FlowState::Title;
@@ -1586,7 +1593,7 @@ pub fn flow_system(
     // locally-recorded demo only when no film resource loads.
     if flow.state == FlowState::Title
         && demo.playback.is_none()
-        && flow.ticks > 60 * 20
+        && flow.ticks > ATTRACT_IDLE_TICKS
     {
         let mut pb_opt: Option<DemoRec> = None;
         for _ in 0..DEMO_FILMS.len() {
@@ -1620,8 +1627,13 @@ pub fn flow_system(
                     }
                     flow.state = FlowState::Playing;
                     flow.ticks = 0;
+                    flow.game_over_at = None;
                 }
             }
+        }
+        // Nothing to play: don't retry every frame.
+        if flow.state == FlowState::Title {
+            flow.ticks = 0;
         }
     }
     // Caps Lock toggles pause during play (documented default).
@@ -1641,47 +1653,124 @@ pub fn flow_system(
     }
     let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
     let space = keys.just_pressed(KeyCode::Space);
-    let any = enter || space;
-    let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
-    let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
+    let any = enter || space || pointer.clicked;
+    let up = keys.just_pressed(KeyCode::ArrowUp);
+    let down = keys.just_pressed(KeyCode::ArrowDown);
+    let left = keys.just_pressed(KeyCode::ArrowLeft);
+    let right = keys.just_pressed(KeyCode::ArrowRight);
     let esc = keys.just_pressed(KeyCode::Escape);
+    // Set when a menu choice should play the button sound (perm sound 2).
+    let mut click = false;
 
     match flow.state {
         FlowState::Title => {
-            if keys.just_pressed(KeyCode::Digit1) || enter {
-                flow.players = 1;
-                flow.state = FlowState::Sectors;
-            } else if keys.just_pressed(KeyCode::Digit2) {
-                flow.players = 2;
-                flow.state = FlowState::Sectors;
-            } else if keys.just_pressed(KeyCode::KeyC) {
-                flow.state = FlowState::Credits;
+            let n = TITLE_ITEMS.len();
+            if up {
+                flow.menu_sel = (flow.menu_sel + n - 1) % n;
+                flow.ticks = 0;
+            }
+            if down {
+                flow.menu_sel = (flow.menu_sel + 1) % n;
+                flow.ticks = 0;
+            }
+            let hover = pointer.pos.and_then(|pos| crate::game::menu::title_hit(&mut assets, pos));
+            if pointer.moved {
+                if let Some(i) = hover {
+                    flow.menu_sel = i;
+                }
+            }
+            let mut chosen = None;
+            if enter {
+                chosen = Some(TITLE_ITEMS[flow.menu_sel].1);
+            }
+            if pointer.clicked {
+                if let Some(i) = hover {
+                    flow.menu_sel = i;
+                    chosen = Some(TITLE_ITEMS[i].1);
+                }
+            }
+            // The original's keyboard shortcuts (G_Interface, key handler
+            // at VA 0x426d20): 1/N, 2, S/H, D, Q. C is ours, for Controls.
+            for (key, item) in [
+                (KeyCode::Digit1, TitleItem::OnePlayer),
+                (KeyCode::KeyN, TitleItem::OnePlayer),
+                (KeyCode::Digit2, TitleItem::TwoPlayers),
+                (KeyCode::KeyC, TitleItem::Controls),
+                (KeyCode::KeyS, TitleItem::Scores),
+                (KeyCode::KeyH, TitleItem::Scores),
+                (KeyCode::KeyD, TitleItem::Demos),
+                (KeyCode::KeyQ, TitleItem::Quit),
+            ] {
+                if keys.just_pressed(key) {
+                    chosen = Some(item);
+                }
+            }
+            if let Some(item) = chosen {
+                click = true;
+                if let Some(i) = TITLE_ITEMS.iter().position(|t| t.1 == item) {
+                    flow.menu_sel = i;
+                }
+                flow.ticks = 0;
+                match item {
+                    TitleItem::OnePlayer | TitleItem::TwoPlayers => {
+                        flow.players = if item == TitleItem::OnePlayer { 1 } else { 2 };
+                        // Open on the furthest sector reached.
+                        flow.sector = (flow.progress as usize).min(flow.level_ids.len().saturating_sub(1));
+                        flow.state = FlowState::Sectors;
+                    }
+                    TitleItem::Controls => {
+                        flow.controls_sel = (0, 0);
+                        flow.rebinding = false;
+                        flow.state = FlowState::Controls;
+                    }
+                    TitleItem::Scores => {
+                        flow.score_hilite = None;
+                        flow.state = FlowState::Scores;
+                    }
+                    // Run the idle timer out: attract mode starts next frame.
+                    TitleItem::Demos => flow.ticks = ATTRACT_IDLE_TICKS + 1,
+                    TitleItem::Quit => {
+                        exit.write(AppExit::Success);
+                    }
+                }
             }
         }
         FlowState::Sectors => {
-            // Only sectors 0..=progress are unlocked (sequential campaign).
-            let n = ((flow.progress as usize) + 1).min(flow.level_ids.len());
-            flow.sector = flow.sector.min(n.saturating_sub(1));
-            if n > 0 {
-                if up {
-                    flow.sector = (flow.sector + n - 1) % n;
-                }
-                if down {
-                    flow.sector = (flow.sector + 1) % n;
-                }
+            // Every sector can be looked at; only those reached can be
+            // started (sequential campaign).
+            let n = flow.level_ids.len();
+            let hit = pointer
+                .pos
+                .filter(|_| pointer.clicked)
+                .and_then(|pos| crate::game::menu::sector_hit(&assets, pos));
+            if (left || up || hit == Some(SectorHit::Previous)) && flow.sector > 0 {
+                flow.sector -= 1;
+                click = true;
             }
-            if enter || space {
-                // New run: drop any carried state from a previous run.
-                flow.carry = None;
-                flow.levels_played = 0;
-                flow.state = FlowState::Briefing;
-                flow.ticks = 0;
+            if (right || down || hit == Some(SectorHit::Next)) && flow.sector + 1 < n {
+                flow.sector += 1;
+                click = true;
+            }
+            // "Press any button to start": either fire key works too.
+            let fire = [crate::game::input::FIRE, crate::game::input::BOMB]
+                .iter()
+                .any(|&a| keys.just_pressed(bindings.keys[0][a]));
+            if enter || space || fire || hit == Some(SectorHit::Current) {
+                if flow.sector as u32 <= flow.progress {
+                    // New run: drop any carried state from a previous run.
+                    flow.carry = None;
+                    flow.levels_played = 0;
+                    flow.state = FlowState::Briefing;
+                    flow.ticks = 0;
+                    click = true;
+                }
             } else if esc {
                 flow.state = FlowState::Title;
+                flow.ticks = 0;
             }
         }
         FlowState::Briefing => {
-            if flow.ticks > 80 || any {
+            if flow.ticks > BRIEFING_TICKS || any {
                 let lid = flow.level_ids.get(flow.sector).copied();
                 if let Some(lid) = lid {
                     if let Some(new_sim) =
@@ -1721,6 +1810,7 @@ pub fn flow_system(
                         flow.state = FlowState::Playing;
                         flow.ticks = 0;
                         flow.paused = false;
+                        flow.game_over_at = None;
                     }
                 }
             }
@@ -1794,282 +1884,201 @@ pub fn flow_system(
                     .any(|p| p.phase != PlayerPhase::Dead);
                 let any_slot = sim.0.players.iter().any(|p| p.is_some());
                 if any_slot && !any_alive {
-                    flow.state = FlowState::GameOver;
-                    flow.ticks = 0;
-                    // Notice_GameOver object (perm 0x18), once.
-                    if let Some(rid) = assets.object_ids.entries.get(0x18).map(|e| e.1) {
-                        if rid != crate::pak::NONE_ID {
-                            let pos = Vec2::new(sim.0.cam_x + 240.0, sim.0.scroll + 240.0);
-                            sim.0.request_spawn_screen(&assets, SpawnReq {
-                                unit: rid,
-                                pos,
-                                heading: None,
-                                heading_forced: false,
-                                owner: usize::MAX,
-                                spawner_player: -1,
-                                stationary: true,
-                                state: None,
-                            }, Vec2::new(crate::game::sim::PLAY_CENTER_X, 56.0));
+                    match flow.game_over_at {
+                        None => {
+                            flow.game_over_at = Some(flow.ticks);
+                            // Notice_GameOver object (perm 0x18), once.
+                            if let Some(rid) = assets.object_ids.entries.get(0x18).map(|e| e.1) {
+                                if rid != crate::pak::NONE_ID {
+                                    let pos = Vec2::new(sim.0.cam_x + 240.0, sim.0.scroll + 240.0);
+                                    sim.0.request_spawn_screen(&assets, SpawnReq {
+                                        unit: rid,
+                                        pos,
+                                        heading: None,
+                                        heading_forced: false,
+                                        owner: usize::MAX,
+                                        spawner_player: -1,
+                                        stationary: true,
+                                        state: None,
+                                    }, Vec2::new(crate::game::sim::PLAY_CENTER_X, 56.0));
+                                }
+                            }
                         }
+                        // Let the notice play, then go to the score table.
+                        Some(at) if enter || flow.ticks > at + GAME_OVER_TICKS => {
+                            flow.game_over_at = None;
+                            // Queue hi-score entries for qualifying players,
+                            // best first. Restricted runs (started above
+                            // sector 1) never count.
+                            let mut results: Vec<PendingScore> = if flow.restricted {
+                                Vec::new()
+                            } else {
+                                sim.0
+                                    .players
+                                    .iter()
+                                    .flatten()
+                                    .filter(|p| p.score > 0)
+                                    .map(|p| PendingScore {
+                                        score: p.score,
+                                        level: sim.0.level.name.clone(),
+                                    })
+                                    .collect()
+                            };
+                            results.sort_by(|a, b| b.score.cmp(&a.score));
+                            flow.pending_scores = results
+                                .into_iter()
+                                .filter(|ps| scores.qualifies(ps.score))
+                                .collect();
+                            flow.name_text.clear();
+                            flow.score_hilite = None;
+                            flow.state = if flow.pending_scores.is_empty() {
+                                FlowState::Scores
+                            } else {
+                                FlowState::NameEntry
+                            };
+                            // Persist the recorded run as the attract demo
+                            // (G_Film_Save "last").
+                            if !demo.rec.p1.is_empty() {
+                                demo.rec.save();
+                            }
+                            flow.ticks = 0;
+                        }
+                        Some(_) => {}
                     }
                 }
             }
         }
-        FlowState::GameOver => {
-            if enter {
-                // Queue hi-score entries for qualifying players, best first.
-                // Restricted runs (started above sector 1) never count.
-                flow.pending_scores.clear();
-                let mut results: Vec<PendingScore> = if flow.restricted {
-                    Vec::new()
-                } else {
-                sim
-                    .0
-                    .players
-                    .iter()
-                    .flatten()
-                    .filter_map(|p| {
-                        if p.score > 0 {
-                            Some(PendingScore {
-                                score: p.score,
-                                level: sim.0.level.name.clone(),
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-                };
-                results.sort_by(|a, b| b.score.cmp(&a.score));
-                flow.pending_scores = results
-                    .into_iter()
-                    .filter(|ps| scores.qualifies(ps.score))
-                    .collect();
-                if !flow.pending_scores.is_empty() {
-                    flow.name_buf = ['A', 'A', 'A'];
-                    flow.name_idx = 0;
-                    flow.state = FlowState::NameEntry;
-                } else {
-                    flow.state = FlowState::Title;
-                }
-                // Persist the recorded run as the attract demo (G_Film_Save
-                // "last").
-                if !demo.rec.p1.is_empty() {
-                    demo.rec.save();
-                }
-                flow.ticks = 0;
-            }
-        }
         FlowState::NameEntry => {
-            // 3-letter initials: up/down cycle A-Z, left/right move, enter ok.
-            if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW) {
-                let ni = flow.name_idx;
-                let c = flow.name_buf[ni];
-                flow.name_buf[ni] =
-                    if c == 'Z' { 'A' } else { ((c as u8 - b'A' + 1) % 26 + b'A') as char };
-            }
-            if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS) {
-                let ni = flow.name_idx;
-                let c = flow.name_buf[ni];
-                flow.name_buf[ni] =
-                    if c == 'A' { 'Z' } else { ((c as u8 - b'A' + 25) % 26 + b'A') as char };
-            }
-            if keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyA) {
-                flow.name_idx = flow.name_idx.saturating_sub(1);
-            }
-            if keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyD) {
-                flow.name_idx = (flow.name_idx + 1).min(2);
+            // Type a name on the score table; Enter confirms it.
+            let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+            for key in keys.get_just_pressed() {
+                if *key == KeyCode::Backspace {
+                    flow.name_text.pop();
+                } else if let Some(c) = typed_char(*key, shift) {
+                    if flow.name_text.chars().count() < NAME_MAX_CHARS {
+                        flow.name_text.push(c);
+                    }
+                }
             }
             if enter {
                 if let Some(ps) = flow.pending_scores.first().cloned() {
-                    let name: String = flow.name_buf.iter().collect();
-                    scores.insert(name, ps.score, ps.level);
+                    let typed = flow.name_text.trim();
+                    let name = if typed.is_empty() { "Player" } else { typed }.to_string();
+                    flow.score_hilite = Some(scores.insert(name, ps.score, ps.level));
                     flow.pending_scores.remove(0);
+                    click = true;
                 }
+                flow.name_text.clear();
                 if flow.pending_scores.is_empty() {
-                    flow.state = FlowState::Title;
-                } else {
-                    flow.name_buf = ['A', 'A', 'A'];
-                    flow.name_idx = 0;
+                    flow.state = FlowState::Scores;
                 }
                 flow.ticks = 0;
             }
         }
-        FlowState::Credits => {
-            if any {
+        FlowState::Scores => {
+            // Scores_Duration (pf 0x4e), or any key.
+            if any || esc || flow.ticks > crate::game::sim::pf(&assets, 0x4e) as u32 {
                 flow.state = FlowState::Title;
                 flow.ticks = 0;
             }
         }
-    }
-
-    // Menu text.
-    let text = menu_text(&flow, &sim.0, &assets, &scores);
-    for mut t in menu_q.iter_mut() {
-        t.0 = text.clone();
-    }
-}
-
-fn menu_text(flow: &Flow, sim: &Sim, assets: &GameAssets, scores: &HighScores) -> String {
-    let name_of = |i: usize| -> String {
-        flow.level_ids
-            .get(i)
-            .and_then(|r| assets.levels.get(r))
-            .map(|l| l.name.clone())
-            .unwrap_or_else(|| "???".into())
-    };
-    match flow.state {
-        FlowState::Title => "DEIMOS RISING\n\n1 PLAYER  .... press 1\n2 PLAYERS .... press 2\nCREDITS ...... press C\n\nA MODERN REMAKE".to_string(),
-        FlowState::Sectors => {
-            let mut s = String::from("CHOOSE A STARTING SECTOR\n\n");
-            for (i, _) in flow.level_ids.iter().enumerate() {
-                if i > flow.progress as usize {
-                    s.push_str(&format!("   SECTOR {:>2}  (LOCKED)\n", i + 1));
-                    continue;
-                }
-                let cur = if i == flow.sector { "> " } else { "  " };
-                s.push_str(&format!("{}{}\n", cur, name_of(i)));
-            }
-            s.push_str("\nARROWS select - ENTER launch - ESC back");
-            s
-        }
-        FlowState::Briefing => {
-            format!(
-                "SECTOR {}: {}\n\nPRESS ANY KEY TO LAUNCH",
-                flow.sector + 1,
-                name_of(flow.sector).to_uppercase()
-            )
-        }
-        FlowState::GameOver => {
-            let score: i64 = sim.players.iter().flatten().map(|p| p.score).sum();
-            let money: i64 = sim.players.iter().flatten().map(|p| p.money).sum();
-            let mut s = format!("GAME OVER\n\nSCORE {:>8}   BONUS ${}\n", score, money);
-            if !scores.entries.is_empty() {
-                s.push_str("\nHI-SCORES\n");
-                for (i, e) in scores.entries.iter().take(5).enumerate() {
-                    s.push_str(&format!(
-                        "{:>2}. {:<3} {:>8}  {}\n",
-                        i + 1,
-                        e.name,
-                        e.score,
-                        e.level
-                    ));
-                }
-            }
-            s.push_str("\nPRESS ENTER");
-            s
-        }
-        FlowState::NameEntry => {
-            let ps = flow.pending_scores.first();
-            let mut s = String::from("NEW HIGH SCORE!\n\n");
-            if let Some(ps) = ps {
-                s.push_str(&format!("SCORE {:>8}  {}\n\n", ps.score, ps.level));
-            }
-            s.push_str("ENTER YOUR INITIALS\n\n   ");
-            for (i, c) in flow.name_buf.iter().enumerate() {
-                if i == flow.name_idx {
-                    s.push_str(&format!("[{}]", c));
-                } else {
-                    s.push(*c);
-                }
-            }
-            s.push_str("\n\nUP/DOWN change - LEFT/RIGHT move - ENTER ok");
-            s
-        }
         FlowState::Credits => {
-            let mut s = String::new();
-            // 'cred' still-text page: developer/publisher/unit/music credits.
-            if let Some(st) = assets.strings.get(&crate::pak::id("cred")) {
-                let mut page = 0usize;
-                for line in &st.strings {
-                    if line.starts_with("<page") {
-                        page += 1;
-                        if page > 1 {
-                            break;
-                        }
-                        continue;
+            let pages = crate::game::menu::credits_pages(&assets);
+            let page_ticks = pages.get(flow.credits_page).map(|p| p.ticks).unwrap_or(0);
+            if esc {
+                flow.credits_page = pages.len();
+            } else if any || flow.ticks > page_ticks {
+                flow.credits_page += 1;
+                flow.ticks = 0;
+            }
+            if flow.credits_page >= pages.len() {
+                flow.credits_page = 0;
+                flow.state = FlowState::Title;
+                flow.ticks = 0;
+            }
+        }
+        FlowState::Controls => {
+            let (mut row, mut col) = flow.controls_sel;
+            if flow.rebinding {
+                if esc {
+                    flow.rebinding = false;
+                } else if let Some(key) = keys
+                    .get_just_pressed()
+                    .copied()
+                    .find(|k| crate::game::input::is_bindable(*k))
+                {
+                    bindings.bind(col, row, key);
+                    bindings.save();
+                    flow.rebinding = false;
+                    click = true;
+                }
+            } else {
+                let rows = crate::game::menu::CONTROLS_ROWS;
+                if up {
+                    row = (row + rows - 1) % rows;
+                }
+                if down {
+                    row = (row + 1) % rows;
+                }
+                if left || right {
+                    col = 1 - col;
+                }
+                let hover = pointer.pos.and_then(crate::game::menu::controls_hit);
+                if pointer.moved || pointer.clicked {
+                    if let Some(cell) = hover {
+                        (row, col) = cell;
                     }
-                    if line.starts_with('<') {
-                        continue;
-                    }
-                    s.push_str(line);
-                    s.push('\n');
+                }
+                flow.controls_sel = (row, col);
+                if enter || (pointer.clicked && hover.is_some()) {
+                    flow.rebinding = true;
+                    click = true;
+                } else if esc {
+                    flow.state = FlowState::Title;
+                    flow.ticks = 0;
                 }
             }
-            if s.is_empty() {
-                s = "DEIMOS RISING\n\nSWOOP SOFTWARE\nAMBROSIA SOFTWARE".into();
-            }
-            s.push_str("\n\nPRESS ANY KEY");
-            s
         }
-        FlowState::Playing => String::new(),
+    }
+
+    if click {
+        if let Some(audio) = audio.as_deref_mut() {
+            let rid = assets.sound_ids.entries.get(2).map(|(_, r)| *r);
+            if let Some(sound) = rid.and_then(|r| assets.sound(r)) {
+                audio.play_sfx(&crate::assets::Sound {
+                    samples: sound.samples.clone(),
+                    channels: sound.channels,
+                    sample_rate: sound.sample_rate,
+                });
+            }
+        }
     }
 }
 
-/// Spawn/despawn the full-screen menu backdrop + logo.
-pub fn sync_menu(
-    mut commands: Commands,
-    flow: Res<Flow>,
-    mut assets: ResMut<GameAssets>,
-    mut images: ResMut<Assets<Image>>,
-    mut book: ResMut<TextureBook>,
-    mut bg_q: Query<(Entity, &MenuBg, &mut Sprite, &mut Transform)>,
-    mut logo_q: Query<(Entity, &MenuLogo, &mut Sprite, &mut Transform), Without<MenuBg>>,
-) {
-    let in_menu = flow.state != FlowState::Playing;
-    // Backdrop: level preview during briefing, menu TGA otherwise.
-    let bg_rid = if flow.state == FlowState::Briefing {
-        flow.level_ids
-            .get(flow.sector)
-            .and_then(|r| assets.levels.get(r))
-            .map(|l| l.preview_image)
-            .filter(|r| *r != crate::pak::NONE_ID)
-            .unwrap_or_else(|| crate::pak::id("menu"))
-    } else {
-        crate::pak::id("menu")
-    };
-    if in_menu {
-        let handle = image16_handle(&mut *assets, &mut *images, &mut *book, bg_rid);
-        let center = to_world(SCREEN_W * 0.5, SCREEN_H * 0.5);
-        if let Some(h) = handle {
-            if let Some((_, _, mut sprite, mut transform)) = bg_q.iter_mut().next() {
-                sprite.image = h;
-                transform.translation = center;
-            } else {
-                commands.spawn((
-                    Sprite::from_image(h),
-                    Transform::from_translation(center),
-                    MenuBg,
-                ));
-            }
-        }
-        // Logo on title/credits.
-        let show_logo = matches!(flow.state, FlowState::Title | FlowState::Credits);
-        if show_logo {
-            if let Some(h) = frame_image(&mut *assets, &mut *images, &mut *book, crate::pak::id("galo"), 0) {
-                let pos = to_world(SCREEN_W * 0.5, 90.0);
-                if let Some((_, _, mut sprite, mut transform)) = logo_q.iter_mut().next() {
-                    sprite.image = h;
-                    transform.translation = pos;
-                } else {
-                    commands.spawn((
-                        Sprite::from_image(h),
-                        Transform::from_translation(pos),
-                        MenuLogo,
-                    ));
-                }
-            }
-        }
+/// Idle ticks on the title screen before attract mode starts.
+const ATTRACT_IDLE_TICKS: u32 = 60 * 20;
+/// Ticks the briefing stays up without a key press.
+const BRIEFING_TICKS: u32 = 180;
+/// Ticks the game-over notice plays before the score table.
+const GAME_OVER_TICKS: u32 = 240;
+/// Longest name the score table accepts.
+const NAME_MAX_CHARS: usize = 16;
+
+/// The character a key types into the name field, if it types one.
+fn typed_char(key: KeyCode, shift: bool) -> Option<char> {
+    let name = format!("{:?}", key);
+    if let Some(letter) = name.strip_prefix("Key").filter(|l| l.len() == 1) {
+        let c = letter.chars().next()?;
+        return Some(if shift { c } else { c.to_ascii_lowercase() });
     }
-    if !in_menu || !matches!(flow.state, FlowState::Title | FlowState::Credits) {
-        for (e, _, _, _) in logo_q.iter() {
-            commands.entity(e).despawn();
-        }
+    if let Some(digit) = name.strip_prefix("Digit").filter(|d| d.len() == 1) {
+        return digit.chars().next();
     }
-    if !in_menu {
-        for (e, _, _, _) in bg_q.iter() {
-            commands.entity(e).despawn();
-        }
+    match key {
+        KeyCode::Space => Some(' '),
+        KeyCode::Minus => Some('-'),
+        KeyCode::Period => Some('.'),
+        _ => None,
     }
 }
 
@@ -2165,8 +2174,11 @@ pub struct ShotConfig {
     pub film: Option<ResId>,
     /// Input script to replay; with neither the ship sits still tapping fire.
     pub script: Option<DemoRec>,
-    /// Capture the title screen instead of gameplay.
-    pub title: bool,
+    /// Capture a menu screen instead of gameplay: `title`, `sectors`,
+    /// `briefing`, `scores`, `name`, `credits` or `controls`.
+    pub screen: Option<String>,
+    /// Sector (0-based) shown on the sector and briefing screens.
+    pub sector: usize,
 }
 
 /// Live screenshot-mode state: frame counter and capture cursor.
@@ -2220,7 +2232,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
     let mut demo = Demo::default();
     let mut initial_state = FlowState::Title;
     let mut shot = shot;
-    if let Some(cfg) = shot.as_mut().filter(|c| !c.title) {
+    if let Some(cfg) = shot.as_mut().filter(|c| c.screen.is_none()) {
         let last = cfg.frames.iter().copied().max().unwrap_or(0) as usize;
         let pb = match (cfg.script.take(), cfg.film) {
             (Some(mut script), _) => {
@@ -2275,6 +2287,8 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
             }),
     );
     let shot_mode = shot.is_some();
+    let shot_screen = shot.as_ref().and_then(|c| c.screen.clone());
+    let shot_sector = shot.as_ref().map(|c| c.sector).unwrap_or(0);
     if let Some(cfg) = shot {
         std::fs::create_dir_all(&cfg.out_dir).expect("create screenshot dir");
         let mut frames = cfg.frames;
@@ -2291,6 +2305,44 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
             last_request: 0,
         });
     }
+    let mut flow = Flow {
+        state: initial_state,
+        sector: 0,
+        players: players.clamp(1, 2),
+        ticks: 0,
+        tick_acc: 0.0,
+        level_ids,
+        paused: false,
+        pending_scores: Vec::new(),
+        name_text: String::new(),
+        score_hilite: None,
+        menu_sel: 0,
+        controls_sel: (0, 0),
+        rebinding: false,
+        credits_page: 0,
+        game_over_at: None,
+        restricted: false,
+        progress: load_progress(),
+        carry: None,
+        levels_played: 0,
+    };
+    // Screenshot mode can open straight on a menu screen.
+    match shot_screen.as_deref() {
+        Some("sectors") => flow.state = FlowState::Sectors,
+        Some("briefing") => flow.state = FlowState::Briefing,
+        Some("scores") => flow.state = FlowState::Scores,
+        Some("credits") => flow.state = FlowState::Credits,
+        Some("controls") => flow.state = FlowState::Controls,
+        Some("name") => {
+            flow.state = FlowState::NameEntry;
+            flow.name_text = "Linus".into();
+            flow.pending_scores = vec![PendingScore { score: 23150, level: "Mariner Valley".into() }];
+        }
+        _ => {}
+    }
+    if shot_screen.is_some() {
+        flow.sector = shot_sector.min(flow.level_ids.len().saturating_sub(1));
+    }
     app.insert_resource(assets)
         .insert_resource(GameSim(sim))
         .insert_resource(TextureBook::default())
@@ -2301,24 +2353,10 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
             level_index: 0,
         })
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.05)))
-        .insert_resource(Flow {
-            state: initial_state,
-            sector: 0,
-            players: players.clamp(1, 2),
-            ticks: 0,
-            tick_acc: 0.0,
-            level_ids,
-            paused: false,
-            pending_scores: Vec::new(),
-            name_buf: ['A', 'A', 'A'],
-            name_idx: 0,
-            restricted: false,
-            progress: load_progress(),
-            carry: None,
-            levels_played: 0,
-        })
+        .insert_resource(flow)
         .insert_resource(HighScores::load())
         .insert_resource(crate::game::input::KeyBindings::load())
+        .insert_resource(MenuPointer::default())
         .insert_resource(demo)
         .insert_resource(ScoreBars::default())
         .insert_resource(Particles::default())
@@ -2332,16 +2370,16 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
     if shot_mode {
         app.add_systems(PreUpdate, shot_mute_input.after(bevy::input::InputSystems));
     }
-    app.add_systems(Startup, (setup, setup_menu))
+    app.add_systems(Startup, setup)
         .add_systems(
             Update,
             (
                 gather_input,
+                crate::game::menu::gather_pointer,
                 flow_system,
                 sim_system,
                 crate::game::audio::drain_events,
-                sync_menu,
-                endtext_system,
+                crate::game::menu::sync_menu,
                 sync_terrain,
                 sync_frame,
                 sync_particles,
@@ -2367,7 +2405,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
 // sprite, one frame per character, laid out by a `tefo` text format.
 
 /// Font sprite used for all text (`g_textSpriteIDs[0]`).
-const FONT: &str = "tesm";
+pub(crate) const FONT: &str = "tesm";
 
 /// Font frame for a character: the jump table at VA 0x43eb70. Anything
 /// outside `!`..=`~`, the space included, gets the blank frame 90.
@@ -2392,17 +2430,17 @@ fn font_frame(c: char) -> i64 {
 }
 
 /// One character placed by `layout_text`.
-struct Glyph {
-    frame: i64,
+pub(crate) struct Glyph {
+    pub(crate) frame: i64,
     /// Sprite centre, in the coordinate space of the format's location.
-    center: Vec2,
+    pub(crate) center: Vec2,
 }
 
 /// Lay a string out the way `G_Text_Priv_0x43e4e0` does. `pos` is the
 /// text's top-left for `LEFT`; `RIGH` ends there, `CENT` centres on it,
 /// `CEGA` centres in the 416-px game area, `CEBU` in the 640-px screen.
 /// Monospaced text gives every character the widest digit's width.
-fn layout_text(
+pub(crate) fn layout_text(
     assets: &mut GameAssets,
     text: &str,
     pos: Vec2,
@@ -2554,136 +2592,68 @@ pub fn sync_hud_text(
     }
 }
 
-/// Centered menu text block (hidden during play).
-pub fn setup_menu(mut commands: Commands) {
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                right: Val::Px(0.0),
-                top: Val::Px(0.0),
-                bottom: Val::Px(0.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-        ))
-        .with_child((
-            Text::new(""),
-            TextFont {
-                font_size: bevy::text::FontSize::Px(20.0),
-                ..default()
-            },
-            TextColor(Color::srgb(0.9, 0.95, 1.0)),
-            TextLayout {
-                justify: bevy::text::Justify::Center,
-                ..default()
-            },
-            MenuText,
-        ));
-    // Level-end bonus breakdown (hidden except during Phase::LevelEnd).
-    commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                left: Val::Px(0.0),
-                right: Val::Px(0.0),
-                top: Val::Px(0.0),
-                bottom: Val::Px(0.0),
-                justify_content: JustifyContent::Center,
-                align_items: AlignItems::Center,
-                ..default()
-            },
-        ))
-        .with_child((
-            Text::new(""),
-            TextFont {
-                font_size: bevy::text::FontSize::Px(18.0),
-                ..default()
-            },
-            TextColor(Color::srgb(0.9, 0.95, 1.0)),
-            TextLayout {
-                justify: bevy::text::Justify::Center,
-                ..default()
-            },
-            EndText,
-        ));
-}
-
-/// Fill the level-end breakdown text while the sim runs its end sequence
-/// (sub_020d90 states + MoneyCounter tally), matching the retail strings:
+/// The level-end breakdown, one line per entry, while the sim runs its
+/// end sequence (sub_020d90 states + MoneyCounter tally). Retail strings:
 /// "All Mission Targets Destroyed!!!", "Ground Accuracy:", "   Bonus:",
-/// "Coin Bonus:", "  x", "  =".
-pub fn endtext_system(
-    sim_res: Res<GameSim>,
-    flow: Res<Flow>,
-    assets: Res<GameAssets>,
-    mut q: Query<&mut Text, With<EndText>>,
-) {
-    let sim = &sim_res.0;
-    let active = flow.state == FlowState::Playing
-        && sim.phase == crate::game::sim::Phase::LevelEnd;
-    for mut text in q.iter_mut() {
-        if !active {
-            text.0 = String::new();
-            continue;
-        }
-        let mut s = String::new();
-        match sim.end_seq_state {
-            // Banner hold: only the destroyed banner (string 0xa).
-            1 => s.push_str("    All Mission Targets Destroyed!!!"),
-            // Perfect-campaign sequence: the original shows the banner on
-            // state 9 and blanks the buffer on state 10 (format 0x4e4de7
-            // is an empty string) — a blinking banner while awarding.
-            9 => s.push_str("    All Mission Targets Destroyed!!!"),
-            10 => {}
-            _ => {
-                s.push_str("    All Mission Targets Destroyed!!!\n\n");
-                s.push_str(&format!("Ground Accuracy: {}%\n", sim.end_bonus_percent));
-                if sim.end_seq_state >= 3 {
-                    if sim.end_bonus_total > 0 {
-                        // During the drain the original counts the bonus
-                        // down live; afterwards it shows the full amount.
-                        let shown = if sim.end_seq_state == 6 {
-                            sim.end_bonus_remaining
-                        } else {
-                            sim.end_bonus_total
-                        };
-                        s.push_str(&format!("   Bonus: {}\n", shown));
+/// "Coin Bonus:", "  x", "  =". Empty outside the level-end phase.
+pub(crate) fn end_text_lines(sim: &Sim, assets: &GameAssets) -> Vec<String> {
+    if sim.phase != crate::game::sim::Phase::LevelEnd {
+        return Vec::new();
+    }
+    let mut s = String::new();
+    match sim.end_seq_state {
+        // Banner hold: only the destroyed banner (string 0xa).
+        1 => s.push_str("    All Mission Targets Destroyed!!!"),
+        // Perfect-campaign sequence: the original shows the banner on
+        // state 9 and blanks the buffer on state 10 (format 0x4e4de7
+        // is an empty string) — a blinking banner while awarding.
+        9 => s.push_str("    All Mission Targets Destroyed!!!"),
+        10 => {}
+        _ => {
+            s.push_str("    All Mission Targets Destroyed!!!\n\n");
+            s.push_str(&format!("Ground Accuracy: {}%\n", sim.end_bonus_percent));
+            if sim.end_seq_state >= 3 {
+                if sim.end_bonus_total > 0 {
+                    // During the drain the original counts the bonus
+                    // down live; afterwards it shows the full amount.
+                    let shown = if sim.end_seq_state == 6 {
+                        sim.end_bonus_remaining
                     } else {
-                        s.push_str("   Bonus:None!\n");
-                    }
+                        sim.end_bonus_total
+                    };
+                    s.push_str(&format!("   Bonus: {}\n", shown));
                 } else {
-                    s.push_str("   Bonus:\n");
+                    s.push_str("   Bonus:None!\n");
                 }
-                // Coin Bonus lines appear once the MoneyCounter tallies arm.
-                let factor = crate::game::sim::pf(&assets, 0xab) as i64;
-                for p in sim.players.iter().flatten() {
-                    let purse = if p.money_tally.purse > 0 {
-                        p.money_tally.purse
-                    } else {
-                        p.money
-                    };
-                    if purse <= 0 && p.money_tally.remaining <= 0 {
-                        continue;
-                    }
-                    // "= N" counts down live during the drain; before the
-                    // tally arms it shows the full purse x factor total.
-                    let remaining = if p.money_tally.phase != 0 {
-                        p.money_tally.remaining
-                    } else {
-                        purse * factor
-                    };
-                    s.push_str(&format!(
-                        "Coin Bonus: {}  x  {}  =  {}\n",
-                        purse, factor, remaining
-                    ));
+            } else {
+                s.push_str("   Bonus:\n");
+            }
+            // Coin Bonus lines appear once the MoneyCounter tallies arm.
+            let factor = crate::game::sim::pf(&assets, 0xab) as i64;
+            for p in sim.players.iter().flatten() {
+                let purse = if p.money_tally.purse > 0 {
+                    p.money_tally.purse
+                } else {
+                    p.money
+                };
+                if purse <= 0 && p.money_tally.remaining <= 0 {
+                    continue;
                 }
+                // "= N" counts down live during the drain; before the
+                // tally arms it shows the full purse x factor total.
+                let remaining = if p.money_tally.phase != 0 {
+                    p.money_tally.remaining
+                } else {
+                    purse * factor
+                };
+                s.push_str(&format!(
+                    "Coin Bonus: {}  x  {}  =  {}\n",
+                    purse, factor, remaining
+                ));
             }
         }
-        text.0 = s;
     }
+    s.lines().map(|l| l.trim().to_string()).collect()
 }
 
 // ---------------------------------------------------------------------------

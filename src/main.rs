@@ -850,7 +850,8 @@ fn main() {
         .map(|s| pak::id(s))
         .unwrap_or_else(|| pak::id("le01"));
     // --shot <dir> [--at f1,f2,...] [--film <rid-hex> | --input <file>]
-    // [--title]: save screenshots of the given frames to <dir>, then exit.
+    // [--screen <menu screen> [--sector N]]: save screenshots of the given
+    // frames to <dir>, then exit.
     let shot = args.iter().position(|a| a == "--shot").map(|i| {
         let out_dir = PathBuf::from(args.get(i + 1).expect("--shot needs a directory"));
         let frames = args
@@ -869,7 +870,12 @@ fn main() {
             frames,
             film,
             script: load_input_script(&args, level),
-            title: args.iter().any(|a| a == "--title"),
+            screen: arg_value(&args, "--screen")
+                .or_else(|| args.iter().any(|a| a == "--title").then(|| "title".to_string())),
+            sector: arg_value(&args, "--sector")
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|n| n.saturating_sub(1))
+                .unwrap_or(0),
         }
     });
     game::render::run(assets, level, players, shot);
