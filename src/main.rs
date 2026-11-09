@@ -732,6 +732,25 @@ fn test_defs() {
         }
     }
     println!("PARTICLES destruct={} hit={} state={} stateRepeat={}", dp,hp,sp,spr);
+    // Shield level-scaling census: base/inc/max per unit.
+    let mut sh_pos=0; let mut sh_neg=0; let mut sh_zero=0;
+    for (rid,u) in &a.units {
+        if u.shields_base != 0.0 || u.shields_level_increment != 0.0 {
+            if u.shields_level_increment > 0.0 {sh_pos+=1} else if u.shields_level_increment < 0.0 {sh_neg+=1} else {sh_zero+=1}
+            if sh_pos+sh_neg+sh_zero <= 15 {
+                println!("SHIELD {:08x} {} base={} inc={} max={}", rid, u.name, u.shields_base, u.shields_level_increment, u.shields_max);
+            }
+        }
+    }
+    println!("SHIELDS inc+={} inc-={} inc0={}", sh_pos,sh_neg,sh_zero);
+    // on_counter census: how many states chain after N entries.
+    let mut oc=0; let mut oc1=0;
+    for u in a.units.values() { for st in &u.states {
+        if st.on_counter > 0 { oc+=1; if st.on_counter == 1 {oc1+=1;}
+            if oc <= 12 { println!("ONCNT {}.{} n={} -> {}", u.name, st.name, st.on_counter, st.on_counter_change_to); }
+        }
+    }}
+    println!("ONCOUNTER states={} ofWhich1={}", oc, oc1);
     // Notice census.
     let mut dn=0; let mut en=0; let mut ed=0;
     for u in a.units.values() {
