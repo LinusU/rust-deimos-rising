@@ -84,21 +84,16 @@ impl Crand {
 
 /// `U_Utils_RandomInt(min, max)` = `min + rand() % (max - min + 1)`.
 fn rand_int(rng: &mut Crand, min: i64, max: i64) -> i64 {
-    if min == max {
-        min
-    } else {
-        min + (rng.rand() % (max - min + 1) as u32) as i64
-    }
+    // U_Utils_RandomInt always draws rand(), even when min == max —
+    // skipping the draw would desync the whole stream.
+    min + (rng.rand() % (max - min + 1) as u32) as i64
 }
 
 /// `U_Utils_RandomFloat(low, high)` = `rand() * (high - low) / 32767 + min`.
 fn rand_float(rng: &mut Crand, low: f64, high: f64) -> f64 {
-    if low == high {
-        low
-    } else {
-        let min = if low > high { high } else { low };
-        rng.rand() as f64 * (high - low) / 32767.0 + min
-    }
+    // Always draws rand() like the original, including low == high.
+    let min = if low > high { high } else { low };
+    rng.rand() as f64 * (high - low) / 32767.0 + min
 }
 
 // ---------------------------------------------------------------------------
@@ -951,14 +946,50 @@ impl Sim {
         }
         let state_idx = req.state.unwrap_or(0).min(def.states.len() - 1);
         let state = &def.states[state_idx];
-        // sub_01c540 runs before sub_01c840: the unit def's xOffset/yOffset
-        // min/max jitter each spawned entity around the request point; equal
-        // bounds are a fixed offset, and the original's polar mode only
-        // applies when both axes carry a range.
-        let pos = if def.x_offset_min != def.x_offset_max
-            || def.y_offset_min != def.y_offset_max
-        {
-            let jx = if def.x_offset_min != def.x_offset_max {
+        // sub_41a990 heading block — runs BEFORE sub_41c540 scatter.
+        // Facing (+0x130): forced requests (f13) use the request heading
+        // plus a tolerance roll when initialHeadingTolerance != 0;
+        // everything else faces the unit def's initialHeading with no roll
+        // (initialHeadingSetInEditor does not affect facing).
+        let tol = def.initial_heading_tolerance;
+        let half_tol = if tol >= 0 { (tol + 1) >> 1 } else { tol >> 1 };
+        let mut facing = if req.heading_forced {
+            let mut h = req.heading.unwrap_or(0.0);
+            if tol != 0 {
+                h += rand_int(&mut self.rng, -half_tol, half_tol) as f32;
+                if h < 0.0 {
+                    h += 360.0;
+                } else if h > 359.0 {
+                    h -= 360.0;
+                }
+                if h < 0.0 || h > 359.0 {
+                    h = 0.0;
+                }
+            }
+            h
+        } else {
+            def.initial_heading as f32
+        };
+        // sub_41c540 position scatter: when BOTH offset axes carry a
+        // range the original uses polar scatter — a RandomInt(0,359)
+        // angle plus a RandomFloat radius (two rand() draws, same count
+        // as the independent-axis rolls). Single-axis ranges roll only
+        // that axis; equal bounds are a fixed offset with no draw.
+        let xr = def.x_offset_min != def.x_offset_max;
+        let yr = def.y_offset_min != def.y_offset_max;
+        let pos = if xr && yr {
+            let angle = rand_int(&mut self.rng, 0, 0x167) as f32;
+            let radius = def
+                .x_offset_min
+                .abs()
+                .max(def.x_offset_max.abs())
+                .max(def.y_offset_min.abs())
+                .max(def.y_offset_max.abs());
+            let r = rand_float(&mut self.rng, 0.0, radius) as f32;
+            let ar = angle.to_radians();
+            req.pos + Vec2::new(ar.sin() * r, ar.cos() * r)
+        } else if xr || yr {
+            let jx = if xr {
                 let (lo, hi) = if def.x_offset_min <= def.x_offset_max {
                     (def.x_offset_min, def.x_offset_max)
                 } else {
@@ -968,7 +999,7 @@ impl Sim {
             } else {
                 def.x_offset_min as f32
             };
-            let jy = if def.y_offset_min != def.y_offset_max {
+            let jy = if yr {
                 let (lo, hi) = if def.y_offset_min <= def.y_offset_max {
                     (def.y_offset_min, def.y_offset_max)
                 } else {
@@ -989,19 +1020,52 @@ impl Sim {
         } else {
             rand_float(&mut self.rng, def.initial_speed_min as f64, def.initial_speed_max as f64) as f32
         };
-        // sub_01a890 heading resolution: arg4 = heading_forced(f13!=0) ? 1
-        // : initialHeadingSetInEditor; arg5 = request heading (spawn-set
-        // angle via f14, level headingDegrees via f16, else 0). arg4 →
-        // heading = arg5 + tolerance jitter, rolled only when
-        // initialHeadingTolerance != 0 and wrapped to [0,360); !arg4 →
-        // heading = the unit def's initialHeading with no roll.
-        let tol = def.initial_heading_tolerance;
-        let arg4 = req.heading_forced || def.initial_heading_set_in_editor;
-        let arg5 = req.heading.unwrap_or(0.0);
-        let heading = if arg4 {
+        // sub_01c840 velocity init. Stationary entities early-return
+        // before the speed roll, leaving every velocity field zero.
+        // Otherwise speed = RandomFloat(initialSpeedMin, initialSpeedMax)
+        // (always draws), then the heading branch picks a direction:
+        //   forced || initialHeadingSetInEditor → raw request heading
+        //   initiallyHuntsClosestPlayer        → unit vector toward the
+        //     closest active player (screen-centre reference), no roll
+        //   otherwise                          → initialHeading plus a
+        //     tolerance roll when != 0; the rolled value overwrites the
+        //     facing stored at +0x130.
+        // doBurst/doImplode/useOwnerHeading have no retail units.
+        // Velocity uses U_Math_InvertAngle(heading) like the original.
+        let vel = if req.stationary {
+            Vec2::ZERO
+        } else if req.heading_forced || def.initial_heading_set_in_editor {
+            let a = invert_angle(req.heading.unwrap_or(0.0)).to_radians();
+            Vec2::new(a.sin() * speed, a.cos() * speed)
+        } else if def.initially_hunts_closest_player {
+            let reference = Vec2::new(pf(assets, pf::VISIBLE_GAME_WIDTH) as f32 / 2.0, 0.0);
+            let mut best: Option<Vec2> = None;
+            let mut best_d = f32::MAX;
+            for p in self.players.iter().flatten() {
+                if matches!(p.phase, PlayerPhase::Dead | PlayerPhase::Dying) {
+                    continue;
+                }
+                let d = (p.screen - reference).length_squared();
+                if d < best_d {
+                    best_d = d;
+                    best = Some(Vec2::new(
+                        p.screen.x + self.cam_x - WORLD_TO_SCREEN_X,
+                        self.scroll + SCREEN_H - p.screen.y,
+                    ));
+                }
+            }
+            let target = best.unwrap_or(Vec2::new(reference.x, -100.0));
+            let d = target - pos;
+            let l = d.length();
+            if l > 0.0001 {
+                d / l * speed
+            } else {
+                Vec2::ZERO
+            }
+        } else {
+            let mut h = def.initial_heading as f32;
             if tol != 0 {
-                let half = (tol + 1 - if tol < 0 { 1 } else { 0 }) >> 1;
-                let mut h = arg5 + rand_int(&mut self.rng, -half, half) as f32;
+                h += rand_int(&mut self.rng, -half_tol, half_tol) as f32;
                 if h < 0.0 {
                     h += 360.0;
                 } else if h > 359.0 {
@@ -1010,36 +1074,21 @@ impl Sim {
                 if h < 0.0 || h > 359.0 {
                     h = 0.0;
                 }
-                h
-            } else {
-                arg5
             }
-        } else {
-            def.initial_heading as f32
-        };
-        // Spawn velocity uses the INVERTED heading (sub_01c840 calls
-        // U_Math_InvertAngle before GetVectorFromAngleAndSpeed); the stored
-        // heading (entity+0x130) keeps the uninverted facing. The
-        // initiallyHuntsClosestPlayer branch never writes the velocity
-        // fields, so those entities spawn with zero velocity and let
-        // DoMovementAI acquire a target.
-        let hr = invert_angle(heading).to_radians();
-        let vel = if req.stationary || def.initially_hunts_closest_player {
-            Vec2::ZERO
-        } else {
-            Vec2::new(hr.sin() * speed, hr.cos() * speed)
+            facing = h;
+            let a = invert_angle(h).to_radians();
+            Vec2::new(a.sin() * speed, a.cos() * speed)
         };
         let shields = if def.shields_max > 0.0 { def.shields_max } else { def.shields_base };
-        // ChangeState's rand consumption, in order: the on_timer roll is
-        // UNCONDITIONAL (RandomInt(0,0) still draws rand()), then the
-        // inFlag1(scale) block rolls initialScalePercentTolerance.
+        // sub_4135a0 draws RandomInt(onTimerMin, onTimerMax) for the initial
+        // state's timer — unconditional, equal bounds still consume rand().
         let timer_target = rand_int(
             &mut self.rng,
-            state.on_timer_min as i64,
-            state.on_timer_max.max(state.on_timer_min) as i64,
+            state.on_timer_min,
+            state.on_timer_max.max(state.on_timer_min),
         ) as u32;
         let scale_roll = if def.initial_scale_percent_tolerance != 0 {
-            let half = def.initial_scale_percent_tolerance / 2;
+            let half = (def.initial_scale_percent_tolerance + 1) >> 1;
             rand_int(&mut self.rng, -half, half)
         } else {
             0
@@ -1070,12 +1119,24 @@ impl Sim {
             unit: req.unit,
             pos,
             vel,
-            heading,
+            heading: facing,
             state: state_idx,
             state_time: 0,
             state_timer_target: timer_target,
             age: 0,
-            frame: state.sprite_frame_min,
+            // sub_4135a0: non-editor-heading units draw a random initial
+            // sprite frame; initialHeadingSetInEditor units derive the
+            // frame from the heading instead (no draw). U_Utils_RandomInt
+            // consumes rand() even when min == max.
+            frame: if def.initial_heading_set_in_editor {
+                state.sprite_frame_min
+            } else {
+                rand_int(
+                    &mut self.rng,
+                    state.sprite_frame_min,
+                    state.sprite_frame_max.max(state.sprite_frame_min),
+                )
+            },
             frame_timer: 0,
             dir_index: -1,
             shields,
@@ -1135,7 +1196,8 @@ impl Sim {
         }
         let has_link = state.lock_to_owner_loc || state.link_to_owner_loc || state.orbit_owner;
         self.cache_owner_link(idx, has_link, state.orbit_owner);
-        self.state_velocity_init(idx, state, true);
+        // No ChangeState at spawn: sub_01c840 already set vel = tvel and
+        // vdelta = 0, matching the original's field init exactly.
         self.scatter_cyclic_spawn(assets, idx);
         self.set_visual_targets(idx, state);
         // Initial state entry sound.
