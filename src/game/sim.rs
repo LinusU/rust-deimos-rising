@@ -4877,6 +4877,13 @@ impl Sim {
             if !pdef.player_projectile {
                 continue;
             }
+            // Entity-vs-entity collision (sub_41b920) only runs for an
+            // entity whose own state collides. A plasma bomb's flight
+            // state does not: it can only hit once it reaches its target.
+            let pstate = self.entities[i].state;
+            if !pdef.states.get(pstate).map(|s| s.collides).unwrap_or(false) {
+                continue;
+            }
             let (pew, peh) = entity_half_extents(assets, &self.entities[i]);
             for j in 0..self.entities.len() {
                 if i == j || self.entities[j].dead || self.entities[j].activate_in > 0 {
@@ -4890,6 +4897,15 @@ impl Sim {
                     continue;
                 }
                 if !tdef.can_be_hit_by_player_projectile {
+                    continue;
+                }
+                // Both must be the same class ('grnd' or 'air ' type code,
+                // set from isGroundBased): bombs hit ground units only,
+                // air weapons air units only. They must also be on opposite
+                // sides (harmlessToPlayers set on exactly one).
+                if tdef.is_ground_based != pdef.is_ground_based
+                    || tdef.harmless_to_players == pdef.harmless_to_players
+                {
                     continue;
                 }
                 // Entity-vs-entity collision requires stateCollides (0x343).
