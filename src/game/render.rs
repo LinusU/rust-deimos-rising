@@ -670,6 +670,8 @@ pub struct BlurFx {
 #[derive(Resource, Default)]
 pub struct Blurs {
     pub list: Vec<BlurFx>,
+    /// Sim tick the afterimages were last faded at.
+    last_tick: u32,
 }
 
 /// Advance blurs one tick and sync their sprites.
@@ -677,7 +679,7 @@ pub fn sync_blurs(
     mut commands: Commands,
     mut blurs: ResMut<Blurs>,
     flow: Res<Flow>,
-    time: Res<Time>,
+    sim_res: Res<GameSim>,
     mut assets: ResMut<GameAssets>,
     mut images: ResMut<Assets<Image>>,
     mut book: ResMut<TextureBook>,
@@ -688,11 +690,14 @@ pub fn sync_blurs(
             commands.entity(e).despawn();
         }
         blurs.list.clear();
+        blurs.last_tick = 0;
         return;
     }
-    // Fade at ~60 Hz like the original's per-tick process.
-    let ticks = (time.delta_secs() * 60.0) as u32;
-    for _ in 0..ticks.min(4) {
+    // Fade once per sim tick, like the original's per-tick process.
+    let now = sim_res.0.game_time;
+    let ticks = now.saturating_sub(blurs.last_tick);
+    blurs.last_tick = now;
+    for _ in 0..ticks.min(8) {
         blurs.list.retain_mut(|b| {
             b.vis -= b.vis_d / 100.0;
             b.vis > 0.0
