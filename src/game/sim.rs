@@ -1269,7 +1269,9 @@ impl Sim {
             fleeing: state.flee_id != NONE_ID,
             stationary: req.stationary,
             flee_target: None,
-            vis: 100.0,
+            // Entities start at the unit's own visibility; effect
+            // spawners such as `bsdt` are defined at 0% and never drawn.
+            vis: def.initial_visibility_percent as f32,
             vis_req: 100.0,
             vis_delta: 0.0,
             tint: 0.0,
