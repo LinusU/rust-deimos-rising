@@ -952,13 +952,14 @@ pub fn decode_aiff_ima4(data: &[u8]) -> Option<Sound> {
     let mut chan_buf = vec![0i16; 64];
     let mut block_idx = 0usize;
     while block_idx + channels <= usable {
-        // Decode one round: `channels` consecutive 34-byte blocks.
+        // Decode one round: `channels` consecutive 34-byte blocks, which
+        // together make 64 interleaved frames.
+        let base = out.len();
+        out.resize(base + 64 * channels, 0);
         for ch in 0..channels {
             let off = (block_idx + ch) * block;
             decode_ima4_block(&ssnd[off..off + block], &mut chan_buf);
             // Scatter this channel's 64 samples into the interleaved output.
-            let base = out.len();
-            out.resize(base + 64 * channels, 0);
             for k in 0..64 {
                 out[base + k * channels + ch] = chan_buf[k];
             }
@@ -992,5 +993,57 @@ fn read_ieee80(b: &[u8]) -> f64 {
         -v
     } else {
         v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal AIFF-C `ima4` file with `packets` 34-byte blocks per channel.
+    fn ima4_aifc(channels: u16, packets: u32) -> Vec<u8> {
+        let mut comm = Vec::new();
+        comm.extend_from_slice(&channels.to_be_bytes());
+        comm.extend_from_slice(&packets.to_be_bytes());
+        comm.extend_from_slice(&16u16.to_be_bytes());
+        // 22050 Hz as an 80-bit extended float.
+        comm.extend_from_slice(&[0x40, 0x0D, 0xAC, 0x44, 0, 0, 0, 0, 0, 0]);
+        comm.extend_from_slice(b"ima4");
+        let mut ssnd = vec![0u8; 8];
+        for block in 0..packets * channels as u32 {
+            // Preamble predictor differs per channel so they can be told apart.
+            let predictor: i16 = if block % channels as u32 == 0 { 0x1000 } else { -0x1000 };
+            ssnd.extend_from_slice(&(predictor as u16).to_be_bytes());
+            ssnd.extend_from_slice(&[0u8; 32]);
+        }
+        let mut body = b"AIFC".to_vec();
+        for (id, chunk) in [(b"COMM", &comm), (b"SSND", &ssnd)] {
+            body.extend_from_slice(id);
+            body.extend_from_slice(&(chunk.len() as u32).to_be_bytes());
+            body.extend_from_slice(chunk);
+        }
+        let mut file = b"FORM".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        file.extend_from_slice(&body);
+        file
+    }
+
+    #[test]
+    fn stereo_ima4_interleaves_64_frames_per_packet() {
+        let sound = decode_aiff_ima4(&ima4_aifc(2, 3)).expect("decode");
+        assert_eq!(sound.channels, 2);
+        assert_eq!(sound.sample_rate, 22050);
+        // 3 packets of 64 frames, two samples per frame.
+        assert_eq!(sound.samples.len(), 3 * 64 * 2);
+        // Every frame carries both channels: left positive, right negative.
+        for frame in sound.samples.chunks_exact(2) {
+            assert!(frame[0] > 0 && frame[1] < 0, "frame {:?}", frame);
+        }
+    }
+
+    #[test]
+    fn mono_ima4_decodes_64_samples_per_packet() {
+        let sound = decode_aiff_ima4(&ima4_aifc(1, 2)).expect("decode");
+        assert_eq!(sound.samples.len(), 2 * 64);
     }
 }
