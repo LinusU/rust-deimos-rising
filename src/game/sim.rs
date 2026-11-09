@@ -4421,6 +4421,9 @@ impl Sim {
         // perm floats 0xd1..0xd9/0xda/0xdb → object_ids[0x19..0x22].
         if def.destruct_release_random_bonus {
             if let Some(bonus) = self.roll_random_bonus(assets) {
+                if std::env::var("DEIMOS_BONUSLOG").is_ok() {
+                    eprintln!("t={} bonusdrop unit={:08x} -> {:08x}", self.game_time, self.entities[idx].unit, bonus);
+                }
                 self.request_spawn(assets, SpawnReq {
                     unit: bonus,
                     pos: epos,

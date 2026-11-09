@@ -287,6 +287,14 @@ fn film_test() {
             }
         }
         println!("fire_frames={fire_frames} bomb_frames={bomb_frames} / {n}");
+        println!(
+            "final: scroll={:.0}/{:.0} complete={} phase={:?} score={} money={} endseq={}",
+            sim.scroll, sim.max_scroll(), sim.level_complete,
+            sim.players[0].as_ref().map(|p| p.phase),
+            sim.players[0].as_ref().map(|p| p.score).unwrap_or(0),
+            sim.players[0].as_ref().map(|p| p.money).unwrap_or(0),
+            sim.end_seq_state,
+        );
         return;
     }
     let players = if film.frames[1] > 0 { 2 } else { 1 };
