@@ -525,6 +525,10 @@ fn main() {
         test_defs();
         return;
     }
+    if args.iter().any(|a| a == "--mediacheck") {
+        test_media();
+        return;
+    }
     if args.iter().any(|a| a == "--test-floats") {
         test_floats();
         return;
@@ -547,6 +551,85 @@ fn main() {
     }
     if args.iter().any(|a| a == "--test-sim") {
         test_sim();
+        return;
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--rawim16") {
+        let rid = args.get(pos + 1).map(|s| pak::id(s)).unwrap_or_else(|| pak::id("cat1"));
+        let dir = data_dir();
+        let mut a = assets::GameAssets::open(&dir).expect("open");
+        a.load_all_data();
+        let raw = a.set.read_raw(pak::Tag::Im16, rid).expect("im16 rid");
+        println!("im16 {:08x}: {} bytes", rid, raw.len());
+        println!("header: {:02x?}", &raw[..raw.len().min(18)]);
+        // TGA: idlen(0) cmaptype(1) imgtype(2) cmap(3..7) x(8..9) y(10..11)
+        // w(12..13) h(14..15) bpp(16) desc(17)
+        if raw.len() >= 18 {
+            let idlen = raw[0] as usize;
+            let cmap = u16::from_le_bytes([raw[5], raw[6]]);
+            let ityp = raw[2];
+            let w = u16::from_le_bytes([raw[12], raw[13]]);
+            let h = u16::from_le_bytes([raw[14], raw[15]]);
+            let bpp = raw[16];
+            let desc = raw[17];
+            println!("idlen={} cmaplen={} imgtype={} w={} h={} bpp={} desc={:#04x}",
+                idlen, cmap, ityp, w, h, bpp, desc);
+            let data_off = 18 + idlen + cmap as usize * (if raw[7] == 1 { raw[6] as usize / 8 } else { 0 });
+            println!("data_off={} first64={:02x?}", data_off, &raw[data_off..(data_off + 64).min(raw.len())]);
+            // u16 pixel census of first rows
+            let px = &raw[data_off..];
+            let mut hist: std::collections::BTreeMap<u16, usize> = Default::default();
+            for chunk in px.chunks_exact(2).take(20000) {
+                *hist.entry(u16::from_le_bytes([chunk[0], chunk[1]])).or_insert(0) += 1;
+            }
+            for (v, c) in hist.iter().take(15) { println!("  px {:#06x}: {}", v, c); }
+            // full-image census of marker pixels + bounding box
+            let wpx = w as usize; let hpx = h as usize;
+            let mut minx = usize::MAX; let mut maxx = 0usize;
+            let mut miny = usize::MAX; let mut maxy = 0usize;
+            let mut count = 0usize;
+            let mut rowhist: std::collections::BTreeMap<usize, usize> = Default::default();
+            for y in 0..hpx {
+                for x in 0..wpx {
+                    let o = data_off + (y * wpx + x) * 2;
+                    if o + 2 > raw.len() { break; }
+                    let v = u16::from_le_bytes([raw[o], raw[o + 1]]);
+                    if v == 0x1f {
+                        count += 1;
+                        minx = minx.min(x); maxx = maxx.max(x);
+                        miny = miny.min(y); maxy = maxy.max(y);
+                        *rowhist.entry(y).or_insert(0) += 1;
+                    }
+                }
+            }
+            println!("  0x1f count={} bbox x[{},{}] y[{},{}] rows={}",
+                count, minx, maxx, miny, maxy, rowhist.len());
+            for (y, c) in rowhist.iter().take(10) { println!("    row {}: {}", y, c); }
+            // Orientation check: decode the level bg via image16 and
+            // profile blue-dominant (water) pixels per 40px band, then
+            // compare with the 0x1f band under both row orders.
+            let bg_rid = a.levels.values()
+                .find(|l| l.media_mask == rid)
+                .map(|l| l.background_image);
+            println!("  level bg rid: {:?}", bg_rid.map(|r| format!("{:08x}", r)));
+            if let Some(brid) = bg_rid {
+                if let Some(bg) = a.image16(brid).map(|i| (i.0, i.1, i.2.clone())) {
+                    let (bw, bh, rgba) = bg;
+                    println!("  bg {}x{}", bw, bh);
+                    for band in 0..(bh as usize / 40) {
+                        let mut blue = 0usize; let mut tot = 0usize;
+                        for y in band * 40..(band + 1) * 40 {
+                            for x in 0..bw as usize {
+                                let o = (y * bw as usize + x) * 4;
+                                let (r, g, b) = (rgba[o] as i32, rgba[o + 1] as i32, rgba[o + 2] as i32);
+                                if b > r + 30 && b > g + 30 { blue += 1; }
+                                tot += 1;
+                            }
+                        }
+                        if blue * 20 > tot { println!("    bgband {} (y {}..{}): {}/{} blue", band, band * 40, band * 40 + 39, blue, tot); }
+                    }
+                }
+            }
+        }
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--objdump") {
@@ -824,6 +907,31 @@ fn test_defs() {
     println!("HARMFUL units={}", hurts.len());
     for n in hurts.iter().take(25) { println!("  {}", n); }
     for (r,n) in grp_units.iter().take(20) { println!("  grp {:08x} {}", r, n); }
+    // media-gate census: CanSpawnOnMedia applies when isGroundBased &&
+    // !doDeathSpawnOnAnyMedia && destructSpawn != none.
+    let mut mg = 0; let mut mg_any = 0; let mut mis_hist: std::collections::BTreeMap<ResId, usize> = Default::default();
+    for (rid,u) in &a.units {
+        if u.is_ground_based {
+            mg += 1;
+            if u.do_death_spawn_on_any_media { mg_any += 1; }
+            if !u.do_death_spawn_on_any_media && u.destruct_spawn != pak::NONE_ID {
+                *mis_hist.entry(u.media_impact_size).or_insert(0) += 1;
+                println!("  MEDIA {:08x} {} mis={:08x} dsp={:08x}", rid, u.name, u.media_impact_size, u.destruct_spawn);
+            }
+        }
+    }
+    println!("MEDIA ground={} anyMedia={} gated={}", mg, mg_any, mis_hist.values().sum::<usize>());
+    for (k,v) in &mis_hist { println!("  mis {:08x}: {}", k, v); }
+    // ALL units' mediaImpactSize census (reap path reaches every dead entity)
+    let mut allmis: std::collections::BTreeMap<ResId, usize> = Default::default();
+    for (rid,u) in &a.units {
+        *allmis.entry(u.media_impact_size).or_insert(0) += 1;
+        if u.media_impact_size != pak::NONE_ID {
+            println!("  MISUNIT {:08x} {} mis={:08x} ground={} any={} dsp={:08x}",
+                rid, u.name, u.media_impact_size, u.is_ground_based, u.do_death_spawn_on_any_media, u.destruct_spawn);
+        }
+    }
+    for (k,v) in &allmis { println!("  allmis {:08x}: {}", k, v); }
     // le01 objects sample
     if let Some(l) = a.levels.get(&id("le01")) {
         println!("LEVEL le01 bg={:?} img={:08x} music={:08x} objs={}", l.background, l.background_image, l.music, l.objects.len());
@@ -1031,6 +1139,150 @@ fn test_unit(ridv: u32) {
         for (i,st) in u.states.iter().enumerate() {
             println!("  state[{}] '{}' spr={:08x} dirs={} fpd={} framedly={} maxspd={} delta={} rules={:?}", i, st.name, st.sprite_face, st.num_directions, st.frames_per_direction, st.frame_delay, st.max_speed, st.delta, st.rules.iter().map(|r|(r.name.clone(),r.unit_id,r.range,r.condition.clone(),r.action.clone())).collect::<Vec<_>>());
             for ss in &st.spawn_sets { println!("     spawnset '{}' id={:08x} x={} y={} rate={}-{} volley={}-{} delay={}-{} repeat={}", ss.name, ss.spawn_id, ss.x_offset, ss.y_offset, ss.rate_min, ss.rate_max, ss.volley_min, ss.volley_max, ss.delay_between_min, ss.delay_between_max, ss.repeat_spawns); }
+        }
+    }
+}
+
+/// Media-mask end-to-end check: spawn each media-impact ground unit on and
+/// off the le01 water band, destroy it, and verify the perm-object splash
+/// spawn (object_ids 6..=9) appears only on media.
+fn test_media() {
+    use game::sim::{PlayerInput, SpawnReq};
+    use glam::Vec2;
+    let dir = data_dir();
+    let mut assets = assets::GameAssets::open(&dir).expect("open");
+    assets.load_all_data();
+    let level_id = pak::id("le01");
+    let mut sim = game::render::start_level(&mut assets, level_id, 1, 1).expect("level");
+    let m = sim.media_mask.as_ref().expect("media mask").clone();
+    let tile = sim.media_tile_size.max(1) as u32;
+    let level_h = (sim.level.background[3] - sim.level.background[1]).max(1) as f32;
+    println!(
+        "mask {}x{} tile={} scroll={} level_h={}",
+        m.w, m.h, tile, sim.scroll, level_h
+    );
+    // Find a media tile (0x1f) and a dry tile, preferring mid-screen x.
+    // tile (tx,ty) -> loc=(tx*t+2, ty*t+2) -> pos=(loc_x-32, level_h-loc_y).
+    let mut media_tile = None;
+    let mut dry_tile = None;
+    'scan: for ty in 0..m.h {
+        for tx in 0..m.w {
+            let v = m.at(tx, ty);
+            if v == 0x1f && media_tile.is_none() && tx > m.w / 4 && tx < m.w * 3 / 4 {
+                media_tile = Some((tx, ty));
+            }
+            if v != 0x1f && dry_tile.is_none() && tx > m.w / 4 && tx < m.w * 3 / 4 {
+                dry_tile = Some((tx, ty));
+            }
+            if media_tile.is_some() && dry_tile.is_some() {
+                break 'scan;
+            }
+        }
+    }
+    let tile_to_pos = |(tx, ty): (u32, u32)| -> (Vec2, f32) {
+        let loc_x = (tx * tile + tile / 2) as f32;
+        let loc_y = (ty * tile + tile / 2) as f32;
+        let pos = Vec2::new(loc_x - 32.0, level_h - loc_y);
+        // Park scroll so pos.y sits mid-view.
+        let scroll = (pos.y - 240.0).clamp(0.0, sim.max_scroll());
+        (pos, scroll)
+    };
+    let (media_pos, media_scroll) = media_tile.map(tile_to_pos).unwrap_or((Vec2::ZERO, 0.0));
+    let (dry_pos, dry_scroll) = dry_tile.map(tile_to_pos).unwrap_or((Vec2::ZERO, 0.0));
+    println!(
+        "media_tile={media_tile:?} pos={media_pos:?} scroll={media_scroll} | dry_tile={dry_tile:?} pos={dry_pos:?} scroll={dry_scroll}"
+    );
+    let mut media_rids = std::collections::HashSet::new();
+    for s in 6..=9usize {
+        if let Some((name, rid)) = assets.object_ids.entries.get(s) {
+            println!(
+                "  obj[{}] {:08x} {} unit_def={}",
+                s,
+                rid,
+                name,
+                assets.units.contains_key(rid)
+            );
+            media_rids.insert(*rid);
+        }
+    }
+    let count_media = |sim: &game::sim::Sim| -> Vec<ResId> {
+        sim.entities
+            .iter()
+            .filter(|e| !e.dead && media_rids.contains(&e.unit))
+            .map(|e| e.unit)
+            .collect()
+    };
+    for unit in [0x72746174u32, 0x72636f62, pak::id("plbo")] {
+        let uname = assets
+            .units
+            .get(&unit)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| format!("{:08x}", unit));
+        if let Some(d) = assets.units.get(&unit) {
+            println!(
+                "  {uname}: states={} grp={}-{} appears={}% ponly={} notype={} ground={}",
+                d.states.len(),
+                d.num_in_group_min,
+                d.num_in_group_max,
+                d.appears_percent,
+                d.spawn_only_when_players_active,
+                d.do_not_spawn_if_type_exists,
+                d.is_ground_based
+            );
+        }
+        for (label, pos, scroll) in [
+            ("media", media_pos, media_scroll),
+            ("dry", dry_pos, dry_scroll),
+        ] {
+            let before = count_media(&sim).len();
+            // Entities outside the visible window [scroll, scroll+480]
+            // are culled on the first step — park the camera so the test
+            // position is on-screen. The media lookup is scroll-invariant.
+            sim.scroll = scroll;
+            // roll_spawn_count can legitimately return 0 — retry until one
+            // materialises (each attempt re-rolls).
+            let mut idx = None;
+            'spawn: for _attempt in 0..12 {
+                let n0 = sim.entities.len();
+                sim.request_spawn(
+                    &assets,
+                    SpawnReq {
+                        unit,
+                        pos,
+                        heading: None,
+                        heading_forced: false,
+                        owner: usize::MAX,
+                        spawner_player: -1,
+                        stationary: true,
+                        state: None,
+                    },
+                );
+                // request_spawn is synchronous — the entity is already in
+                // the list; take the newest match so retries don't alias.
+                if let Some(i) = sim.entities[n0..]
+                    .iter()
+                    .rposition(|e| e.unit == unit && !e.dead)
+                    .map(|r| n0 + r)
+                {
+                    idx = Some(i);
+                    break 'spawn;
+                }
+            }
+            let Some(idx) = idx else {
+                println!("{uname} @{label}: spawn FAILED");
+                continue;
+            };
+            sim.destroy_entity(&assets, idx, -1);
+            // reap sweep runs inside step(); the media spawn queues behind it.
+            for _ in 0..3 {
+                sim.step(&assets, &PlayerInput::default());
+            }
+            let spawned = count_media(&sim);
+            println!(
+                "{uname} @{label}: media_spawns={} {:?}",
+                spawned.len().saturating_sub(before),
+                spawned
+            );
         }
     }
 }
