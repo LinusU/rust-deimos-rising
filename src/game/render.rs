@@ -75,6 +75,8 @@ pub struct Flow {
     pub players: usize,
     /// Ticks spent in the current state.
     pub ticks: u32,
+    /// Fraction of a 60 Hz tick carried between frames.
+    pub tick_acc: f32,
     /// Level rids in mission order (sorted le01..le12).
     pub level_ids: Vec<ResId>,
     /// Pause toggle (original: Caps Lock).
@@ -1562,8 +1564,20 @@ pub fn flow_system(
     mut demo: ResMut<Demo>,
     mut audio: Option<ResMut<crate::game::audio::AudioEngine>>,
     mut menu_q: Query<&mut Text, With<MenuText>>,
+    time: Res<Time>,
+    shot: Option<Res<ShotPlan>>,
 ) {
-    flow.ticks += 1;
+    // Flow timers are in 60 Hz ticks whatever the display's refresh rate;
+    // screenshot mode counts one per frame.
+    let ticks = if shot.is_some() {
+        1
+    } else {
+        flow.tick_acc += time.delta_secs() * crate::game::sim::TICK_HZ;
+        let n = flow.tick_acc.floor().min(8.0);
+        flow.tick_acc -= n;
+        n as u32
+    };
+    flow.ticks += ticks;
     // Any key aborts attract playback back to the title.
     if demo.playback.is_some() && flow.state == FlowState::Playing {
         if keys.get_just_pressed().next().is_some() {
@@ -2298,6 +2312,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
             sector: 0,
             players: players.clamp(1, 2),
             ticks: 0,
+            tick_acc: 0.0,
             level_ids,
             paused: false,
             pending_scores: Vec::new(),
