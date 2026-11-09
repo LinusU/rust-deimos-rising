@@ -2390,26 +2390,6 @@ fn bar_rect(assets: &GameAssets, player: usize, name: &str) -> Option<crate::dat
     assets.rect_list.as_ref()?.get(&full)
 }
 
-/// Screen-space center + size for a score-bar element rect.
-fn bar_pos(r: crate::data::Rect) -> (Vec3, Vec2) {
-    let cx = SCOREBAR_X + (r.left + r.right) as f32 * 0.5;
-    let cy = (r.top + r.bottom) as f32 * 0.5;
-    (
-        to_world(cx, cy),
-        Vec2::new((r.right - r.left) as f32, (r.bottom - r.top) as f32),
-    )
-}
-
-/// Pixel-space clip rect keeping the left `frac` of an image (Sprite.rect
-/// is in image pixels).
-fn clip_left(images: &Assets<Image>, handle: &Handle<Image>, frac: f32) -> bevy::math::Rect {
-    let (w, h) = images
-        .get(handle)
-        .map(|i| (i.width() as f32, i.height() as f32))
-        .unwrap_or((96.0, 13.0));
-    bevy::math::Rect::new(0.0, 0.0, (w * frac).max(0.0), h)
-}
-
 /// Sync score-bar sprites to sim state (Playing only).
 #[allow(clippy::too_many_arguments)]
 fn sync_scorebar(
@@ -2426,50 +2406,86 @@ fn sync_scorebar(
     let dt = time.delta_secs() * 60.0; // meter rates are per-frame at 60fps
     let active = flow.state == FlowState::Playing;
 
-    // Desired elements: (player, elem) -> sprite/frame/rect/clip/dim/scale.
+    // Desired elements; `center` is the sprite centre on screen.
     struct Want {
         player: usize,
         elem: BarElem,
         rid: ResId,
         frame: i64,
-        rect: String,
-        clip: Option<f32>,
-        dim: bool,
+        center: Vec2,
+        /// Screen x at which the sprite is cut off on the right (meter fill).
+        clip_right: Option<f32>,
+        alpha: f32,
         scale: f32,
     }
     let mut wants: Vec<Want> = Vec::new();
 
     if active {
+        use crate::game::sim::pf;
         let sim = &sim_res.0;
         let pdef_rid = [crate::pak::id("pl01"), crate::pak::id("pl02")];
+        // Perm floats place sprite centres in front-buffer space, where the
+        // playfield starts at x=0; on screen it starts at PLAY_LEFT.
+        let at = |assets: &GameAssets, xi: usize, yi: usize| {
+            Vec2::new(pf(assets, xi) + PLAY_LEFT, pf(assets, yi))
+        };
+        // Depleted meter section: the original overlays a black colour
+        // strip letting `ColorStrip_BlendAmount`/32 of the meter through
+        // (text formats `sbsh`/`sbpm`).
+        let depleted_alpha = |assets: &GameAssets, fmt: &str| {
+            assets
+                .text_formats
+                .get(&crate::pak::id(fmt))
+                .map(|t| t.get_int("ColorStrip_BlendAmount_0To32") as f32 / 32.0)
+                .unwrap_or(0.25)
+        };
+        let weapon_alpha = [
+            1.0 - pf(&assets, 0x8d) / 32.0, // ScoreBar_Weapons_BlendAmount_Selected
+            1.0 - pf(&assets, 0x8c) / 32.0, // ..._NonSelected
+        ];
+        let weapon_scale = pf(&assets, 0x8e); // NonSelectedScaleFactor
         for slot in 0..2 {
-            let Some(p) = sim.players[slot].as_ref() else { continue };
-            if p.phase == crate::game::sim::PlayerPhase::Dead {
-                continue;
-            }
+            let player = sim.players[slot]
+                .as_ref()
+                .filter(|p| p.phase != crate::game::sim::PlayerPhase::Dead);
+            let in_game = player.is_some();
             // Ease meter fill toward the live 0..100 values.
-            ease(&mut bars.shield[slot], p.shields as f32, dt, 2.0, 3.0);
-            ease(&mut bars.power[slot], p.power as f32, dt, 2.0, 4.0);
-            let shield_pct = bars.shield[slot] / 100.0;
-            let power_pct = bars.power[slot] / 100.0;
+            let (shields, power) = player
+                .map(|p| (p.shields as f32, p.power as f32))
+                .unwrap_or((0.0, 0.0));
+            ease(&mut bars.shield[slot], shields, dt, 2.0, 3.0);
+            ease(&mut bars.power[slot], power, dt, 2.0, 4.0);
 
             let Some(def) = assets.players.get(&pdef_rid[slot]) else { continue };
+            let life = (def.sprite_score_bar, def.sprite_score_bar_frame);
+            let meters = [
+                (def.sprite_score_bar_shield, def.sprite_score_bar_shield_frame, bars.shield[slot], "Shields", "sbsh", 0x74, BarElem::ShieldTrack, BarElem::ShieldFill),
+                (def.sprite_score_bar_power, def.sprite_score_bar_power_frame, bars.power[slot], "Power", "sbpm", 0x7a, BarElem::PowerTrack, BarElem::PowerFill),
+            ];
+            // P2's perm floats follow P1's as the next (x, y) pair.
+            let o = slot * 2;
 
-            if def.sprite_score_bar != crate::pak::NONE_ID {
-                wants.push(Want { player: slot, elem: BarElem::LifeIcon, rid: def.sprite_score_bar, frame: def.sprite_score_bar_frame, rect: "Life Symbol".into(), clip: None, dim: false, scale: 1.0 });
+            if life.0 != crate::pak::NONE_ID {
+                // A player not in the game gets a half-blended life symbol.
+                wants.push(Want { player: slot, elem: BarElem::LifeIcon, rid: life.0, frame: life.1, center: at(&assets, 0x70 + o, 0x71 + o), clip_right: None, alpha: if in_game { 1.0 } else { 0.5 }, scale: 1.0 });
             }
-            if def.sprite_score_bar_shield != crate::pak::NONE_ID {
-                wants.push(Want { player: slot, elem: BarElem::ShieldTrack, rid: def.sprite_score_bar_shield, frame: def.sprite_score_bar_shield_frame, rect: "Shields".into(), clip: None, dim: true, scale: 1.0 });
-                wants.push(Want { player: slot, elem: BarElem::ShieldFill, rid: def.sprite_score_bar_shield, frame: def.sprite_score_bar_shield_frame, rect: "Shields".into(), clip: Some(shield_pct), dim: false, scale: 1.0 });
-            }
-            if def.sprite_score_bar_power != crate::pak::NONE_ID {
-                wants.push(Want { player: slot, elem: BarElem::PowerTrack, rid: def.sprite_score_bar_power, frame: def.sprite_score_bar_power_frame, rect: "Power".into(), clip: None, dim: true, scale: 1.0 });
-                wants.push(Want { player: slot, elem: BarElem::PowerFill, rid: def.sprite_score_bar_power, frame: def.sprite_score_bar_power_frame, rect: "Power".into(), clip: Some(power_pct), dim: false, scale: 1.0 });
+            for (rid, frame, pct, rect, fmt, xi, track, fill) in meters {
+                if rid == crate::pak::NONE_ID {
+                    continue;
+                }
+                let center = at(&assets, xi + o, xi + 1 + o);
+                wants.push(Want { player: slot, elem: track, rid, frame, center, clip_right: None, alpha: depleted_alpha(&assets, fmt), scale: 1.0 });
+                // The filled part ends `pct` of the way across the meter's rect.
+                if let Some(r) = bar_rect(&assets, slot, rect) {
+                    let edge = SCOREBAR_X + r.left as f32 + (pct / 100.0).clamp(0.0, 1.0) * (r.right - r.left) as f32;
+                    wants.push(Want { player: slot, elem: fill, rid, frame, center, clip_right: Some(edge), alpha: 1.0, scale: 1.0 });
+                }
             }
 
             // Weapon preview chain: current + next two PEAA weapons
             // (AirWeapon_GetScoreBarInfo). Slots whose preview duplicates an
             // earlier slot are blanked, like the original.
+            let Some(p) = player else { continue };
             let chain = crate::game::sim::weapon_chain(&assets, crate::pak::id("PEAA"), sim.level_number);
             let mut previews: [Option<ResId>; 3] = [None; 3];
             if let Some(c) = chain.iter().position(|&w| w == p.air_weapon) {
@@ -2487,6 +2503,8 @@ fn sync_scorebar(
             } else {
                 previews[0] = Some(p.air_weapon);
             }
+            // ScoreBar_P1Weapons_1..3 at 0x80.., P2's at 0x86..
+            let wbase = 0x80 + slot * 6;
             for (i, w) in previews.iter().enumerate() {
                 let Some(w) = w else { continue };
                 let Some(wd) = assets.weapons.get(w) else { continue };
@@ -2499,10 +2517,10 @@ fn sync_scorebar(
                     elem: BarElem::Weapon(i),
                     rid: wd.score_bar_preview_face,
                     frame: wd.score_bar_preview_frame,
-                    rect: format!("Weapon {}", i + 1),
-                    clip: None,
-                    dim: !selected,
-                    scale: if selected { 1.0 } else { 0.7 },
+                    center: at(&assets, wbase + i * 2, wbase + i * 2 + 1),
+                    clip_right: None,
+                    alpha: weapon_alpha[if selected { 0 } else { 1 }],
+                    scale: if selected { 1.0 } else { weapon_scale },
                 });
             }
         }
@@ -2514,38 +2532,45 @@ fn sync_scorebar(
 
     for w in &wants {
         let key = (w.player, w.elem);
-        let Some(r) = bar_rect(&assets, w.player, &w.rect) else { continue };
-        let (pos, size) = bar_pos(r);
         let Some(handle) = frame_image(&mut assets, &mut images, &mut book, w.rid, w.frame)
         else {
             continue;
         };
-        let color = if w.dim {
-            Color::srgba(1.0, 1.0, 1.0, 0.45)
-        } else {
-            Color::WHITE
+        let size = images
+            .get(&handle)
+            .map(|i| Vec2::new(i.width() as f32, i.height() as f32))
+            .unwrap_or(Vec2::ZERO);
+        // Meter fill: keep only the part of the image left of `clip_right`.
+        let left = w.center.x - size.x * 0.5;
+        let shown = match w.clip_right {
+            Some(edge) => (edge - left).clamp(0.0, size.x).floor(),
+            None => size.x,
         };
-        let rect = w.clip.map(|f| clip_left(&images, &handle, f));
+        let rect = w.clip_right.map(|_| bevy::math::Rect::new(0.0, 0.0, shown, size.y));
+        // Tracks sit under fills.
+        let z = Z_SCOREBAR + if w.clip_right.is_some() { 1.0 } else { 0.0 };
+        let pos = to_world_z(left + shown * 0.5, w.center.y, z);
+        let color = Color::srgba(1.0, 1.0, 1.0, if shown > 0.0 { w.alpha } else { 0.0 });
+        let scale = Vec3::splat(w.scale);
         match existing.remove(&key) {
             Some(e) => {
                 if let Ok((_, _, mut sprite, mut tf)) = q.get_mut(e) {
                     sprite.image = handle;
-                    sprite.custom_size = Some(size * w.scale);
                     sprite.color = color;
                     sprite.rect = rect;
                     tf.translation = pos;
+                    tf.scale = scale;
                 }
             }
             None => {
                 commands.spawn((
                     Sprite {
                         image: handle,
-                        custom_size: Some(size * w.scale),
                         color,
                         rect,
                         ..default()
                     },
-                    Transform::from_translation(pos),
+                    Transform::from_translation(pos).with_scale(scale),
                     Visibility::default(),
                     ScoreBarSprite { player: w.player, elem: w.elem },
                 ));
