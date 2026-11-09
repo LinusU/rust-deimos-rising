@@ -29,10 +29,13 @@ pub const PLAY_LEFT: f32 = 32.0;
 pub const PLAY_RIGHT: f32 = PLAY_LEFT + 416.0;
 /// Horizontal centre of the playfield on screen.
 pub const PLAY_CENTER_X: f32 = PLAY_LEFT + 208.0;
-/// World→screen x offset. The background is blitted from terrain column
-/// `cam_x + 32` to game-buffer column 0 (`G_Bgnd_CopyToFrontBuffer`), and
-/// the game buffer sits 32 px into the window, so the two cancel out.
-pub const WORLD_TO_SCREEN_X: f32 = 0.0;
+/// World→screen x offset. Entity x is the original's game-area x (`m_x`,
+/// 0..416 visible at rest): `G_GameObject` draws at `m_x - sideScroll` in
+/// the game buffer, which sits `PLAY_LEFT` px into the window. The terrain
+/// is blitted from image column `sideScroll + 32`, so `m_x` lies over
+/// column `m_x + 32`; ground level objects are stored as image columns and
+/// get `x -= 32` on load (sub_41a5b0).
+pub const WORLD_TO_SCREEN_X: f32 = PLAY_LEFT;
 /// Player top game-area limit (perm float 0xb7 = Player_TopGameAreaLimit).
 pub const PLAYER_TOP_LIMIT: f32 = 13.0;
 /// Player bottom limit.
@@ -2886,7 +2889,7 @@ impl Sim {
             let sx = e.pos.x - self.cam_x + WORLD_TO_SCREEN_X;
             let off = e.pos.y < -80.0
                 || e.pos.y > self.level_height() + 80.0
-                || sx < PLAY_LEFT - 192.0 || sx > PLAY_RIGHT + 192.0
+                || sx < PLAY_LEFT - 160.0 || sx > PLAY_RIGHT + 224.0
                 || sy < -320.0 || sy > SCREEN_H + 320.0;
             if off {
                 self.entities[i].dead = true;

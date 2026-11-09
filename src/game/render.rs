@@ -468,9 +468,10 @@ impl Particles {
 
 /// Advance particles one 60 Hz tick (G_Particle_Process).
 fn particle_tick(p: &mut Particles, scroll_delta: f32) {
-    // Bounds in screen space (original: x[-32,448] y[0,480] of the
-    // 480-wide world view → mapped into the 640-wide display).
-    const BX1: f32 = 592.0;
+    // Bounds (G_Particle: game-area x in [-32, 448], with a 32-px margin
+    // above and below), in window space.
+    const BX0: f32 = PLAY_LEFT - 32.0;
+    const BX1: f32 = PLAY_LEFT + 448.0;
     const BY0: f32 = -32.0;
     const BY1: f32 = 512.0;
     p.groups.retain_mut(|g| {
@@ -484,7 +485,7 @@ fn particle_tick(p: &mut Particles, scroll_delta: f32) {
             }
             pt.vel *= 0.96; // pf(0x90)
             pt.pos += pt.vel;
-            if pt.pos.x < -32.0 || pt.pos.x + 7.0 > BX1 || pt.pos.y < BY0 || pt.pos.y + 7.0 > BY1 {
+            if pt.pos.x < BX0 || pt.pos.x + 7.0 > BX1 || pt.pos.y < BY0 || pt.pos.y + 7.0 > BY1 {
                 pt.active = false;
                 continue;
             }
