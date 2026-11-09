@@ -932,6 +932,22 @@ fn test_defs() {
         }
     }
     for (k,v) in &allmis { println!("  allmis {:08x}: {}", k, v); }
+    // deletionSpawn / destructSpawn census — CanSpawnOnMedia gates both.
+    let mut ndel = 0; let mut ndsp_ground = 0;
+    for (rid,u) in &a.units {
+        if u.deletion_spawn != pak::NONE_ID { ndel += 1; }
+        if u.destruct_spawn != pak::NONE_ID && u.is_ground_based { ndsp_ground += 1; }
+        if u.deletion_spawn != pak::NONE_ID && u.media_impact_size != pak::NONE_ID {
+            println!("  DEL+MEDIA {:08x} {} del={:08x} mis={:08x}", rid, u.name, u.deletion_spawn, u.media_impact_size);
+        }
+    }
+    println!("deletionSpawn units={} groundDestructSpawn={}", ndel, ndsp_ground);
+    let ncoin = a.units.values().filter(|u| u.destruct_coin != pak::NONE_ID).count();
+    let ngoins = a.units.values().filter(|u| u.destruct_coin_on_group_kill != pak::NONE_ID).count();
+    println!("destructCoin units={} groupKillCoin={}", ncoin, ngoins);
+    for (rid,u) in a.units.iter().filter(|(_,u)| u.destruct_coin != pak::NONE_ID).take(4) {
+        println!("  COIN {:08x} {} coin={:08x} n={} gid-kill={:08x}", rid, u.name, u.destruct_coin, u.destruct_num_coins, u.destruct_coin_on_group_kill);
+    }
     // le01 objects sample
     if let Some(l) = a.levels.get(&id("le01")) {
         println!("LEVEL le01 bg={:?} img={:08x} music={:08x} objs={}", l.background, l.background_image, l.music, l.objects.len());
@@ -1135,7 +1151,7 @@ fn test_unit(ridv: u32) {
     if let Some(u) = a.units.get(&ridv) {
         println!("UNIT {:08x} {}", ridv, u.name);
         println!("  init_speed {}..{} heading {} tol {}", u.initial_speed_min, u.initial_speed_max, u.initial_heading, u.initial_heading_tolerance);
-        println!("  shields {}/{}+{} dmg {} score {} pickup={:08x} destruct_spawn={:08x}", u.shields_base,u.shields_max,u.shields_level_increment,u.damage,u.score,u.pickup_type,u.destruct_spawn);
+        println!("  shields {}/{}+{} dmg {} score {} pickup={:08x} destruct_spawn={:08x} deletion_spawn={:08x}", u.shields_base,u.shields_max,u.shields_level_increment,u.damage,u.score,u.pickup_type,u.destruct_spawn,u.deletion_spawn);
         for (i,st) in u.states.iter().enumerate() {
             println!("  state[{}] '{}' spr={:08x} dirs={} fpd={} framedly={} maxspd={} delta={} rules={:?}", i, st.name, st.sprite_face, st.num_directions, st.frames_per_direction, st.frame_delay, st.max_speed, st.delta, st.rules.iter().map(|r|(r.name.clone(),r.unit_id,r.range,r.condition.clone(),r.action.clone())).collect::<Vec<_>>());
             for ss in &st.spawn_sets { println!("     spawnset '{}' id={:08x} x={} y={} rate={}-{} volley={}-{} delay={}-{} repeat={}", ss.name, ss.spawn_id, ss.x_offset, ss.y_offset, ss.rate_min, ss.rate_max, ss.volley_min, ss.volley_max, ss.delay_between_min, ss.delay_between_max, ss.repeat_spawns); }
@@ -1284,6 +1300,59 @@ fn test_media() {
                 spawned
             );
         }
+    }
+
+    // Coin release (sub_01ae10 at reap): Twin Gun drops 'slac' x1, but
+    // only when the killer is a real player (killer != -1).
+    let coin_rid = 0x736c6163u32; // 'slac'
+    let count_coins = |sim: &game::sim::Sim| {
+        sim.entities
+            .iter()
+            .filter(|e| !e.dead && e.unit == coin_rid)
+            .count()
+    };
+    for killer in [0i32, -1] {
+        let unit = 0x75677774u32; // 'ugwt' Twin Gun
+        let pos = Vec2::new(200.0, 240.0);
+        sim.scroll = 0.0;
+        let mut idx = None;
+        'cs: for _ in 0..12 {
+            let n0 = sim.entities.len();
+            sim.request_spawn(
+                &assets,
+                SpawnReq {
+                    unit,
+                    pos,
+                    heading: None,
+                    heading_forced: false,
+                    owner: usize::MAX,
+                    spawner_player: -1,
+                    stationary: true,
+                    state: None,
+                },
+            );
+            if let Some(i) = sim.entities[n0..]
+                .iter()
+                .rposition(|e| e.unit == unit && !e.dead)
+                .map(|r| n0 + r)
+            {
+                idx = Some(i);
+                break 'cs;
+            }
+        }
+        let Some(idx) = idx else {
+            println!("Twin Gun: spawn FAILED");
+            continue;
+        };
+        let before = count_coins(&sim);
+        sim.destroy_entity(&assets, idx, killer);
+        for _ in 0..3 {
+            sim.step(&assets, &PlayerInput::default());
+        }
+        println!(
+            "Twin Gun killer={killer}: coin_spawns={}",
+            count_coins(&sim).saturating_sub(before)
+        );
     }
 }
 
