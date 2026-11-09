@@ -425,7 +425,7 @@ const SCREEN_CENTER: Vec2 = Vec2::new(320.0, 240.0);
 /// Title screen (G_Interface): the `menu` backdrop, the game logo, the
 /// button column, then the web address and copyright lines.
 fn title(p: &mut Painter, flow: &Flow) {
-    p.image(id("menu"), SCREEN_CENTER);
+    p.image(id("back"), SCREEN_CENTER);
     let logo = text_style(p.assets, "ingl");
     p.sprite(id("galo"), 0, Vec2::new(CENTER_X, logo.pos.y), 1.0, 0);
     for (i, (frame, _)) in TITLE_ITEMS.iter().enumerate() {
