@@ -767,7 +767,29 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(|s| pak::id(s))
         .unwrap_or_else(|| pak::id("le01"));
-    game::render::run(assets, level, players);
+    // --shot <dir> [--at f1,f2,...] [--film <rid-hex>] [--title]: save
+    // screenshots of the given frames to <dir>, then exit.
+    let shot = args.iter().position(|a| a == "--shot").map(|i| {
+        let out_dir = PathBuf::from(args.get(i + 1).expect("--shot needs a directory"));
+        let frames = args
+            .iter()
+            .position(|a| a == "--at")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.split(',').filter_map(|f| f.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![120, 600]);
+        let film = args
+            .iter()
+            .position(|a| a == "--film")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| u32::from_str_radix(s, 16).expect("--film takes a hex resource id"));
+        game::render::ShotConfig {
+            out_dir,
+            frames,
+            film,
+            title: args.iter().any(|a| a == "--title"),
+        }
+    });
+    game::render::run(assets, level, players, shot);
 }
 
 fn test_sprites() {

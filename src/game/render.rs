@@ -1203,6 +1203,7 @@ fn sim_system(
     mut sim: ResMut<GameSim>,
     mut demo: ResMut<Demo>,
     assets: Res<GameAssets>,
+    shot: Option<Res<ShotPlan>>,
 ) {
     if flow.state != FlowState::Playing || flow.paused {
         return;
@@ -1226,7 +1227,14 @@ fn sim_system(
     } else {
         demo.frame += 1;
     }
-    sim.0.advance(&*assets, &input, time.delta_secs());
+    // Screenshot mode steps exactly one tick per rendered frame so a given
+    // frame number always shows the same sim state.
+    let dt = if shot.is_some() {
+        1.0 / crate::game::sim::TICK_HZ
+    } else {
+        time.delta_secs()
+    };
+    sim.0.advance(&*assets, &input, dt);
 }
 
 /// Centered level-end breakdown text (G_GameInterface's 0x4e487a buffer).
@@ -1828,28 +1836,130 @@ pub fn start_level(
 }
 
 /// Run the game. `assets` must already be opened + `load_all_data()` called.
-pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
+/// Screenshot mode (`--shot`): run deterministically, save PNGs of chosen
+/// frames, then exit. Lets a change be checked by looking at its output.
+pub struct ShotConfig {
+    /// Directory the `frameNNNNN.png` files are written to.
+    pub out_dir: std::path::PathBuf,
+    /// Frame numbers to capture (one sim tick per frame while playing).
+    pub frames: Vec<u32>,
+    /// Retail film to replay; without one the level runs with fire held.
+    pub film: Option<ResId>,
+    /// Capture the title screen instead of gameplay.
+    pub title: bool,
+}
+
+/// Live screenshot-mode state: frame counter and capture cursor.
+#[derive(Resource)]
+pub struct ShotPlan {
+    out_dir: std::path::PathBuf,
+    frames: Vec<u32>,
+    next: usize,
+    frame: u32,
+    last_request: u32,
+}
+
+/// Frames to keep running after the last capture so its PNG gets written.
+const SHOT_EXIT_DELAY: u32 = 20;
+
+/// Screenshot mode ignores the keyboard, so a stray key press cannot abort
+/// the replay being captured.
+fn shot_mute_input(mut keys: ResMut<ButtonInput<KeyCode>>) {
+    keys.reset_all();
+}
+
+fn shot_system(
+    mut commands: Commands,
+    plan: Option<ResMut<ShotPlan>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+    let Some(mut plan) = plan else { return };
+    plan.frame += 1;
+    if plan.next < plan.frames.len() && plan.frames[plan.next] <= plan.frame {
+        let path = plan.out_dir.join(format!("frame{:05}.png", plan.frames[plan.next]));
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path));
+        plan.next += 1;
+        plan.last_request = plan.frame;
+    }
+    if plan.next == plan.frames.len() && plan.frame > plan.last_request + SHOT_EXIT_DELAY {
+        exit.write(AppExit::Success);
+    }
+}
+
+pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<ShotConfig>) {
     let mut assets = assets;
     let mut level_ids = mission_sorted_level_ids(&assets);
     if level_ids.is_empty() {
         level_ids.push(level_id);
     }
-    let sim = start_level(&mut assets, level_id, players, 0xC0FFEE)
+    let mut sim = start_level(&mut assets, level_id, players, 0xC0FFEE)
         .expect("level not found");
+    let mut demo = Demo::default();
+    let mut initial_state = FlowState::Title;
+    if let Some(cfg) = shot.as_ref().filter(|c| !c.title) {
+        let last = cfg.frames.iter().copied().max().unwrap_or(0) as usize;
+        let pb = match cfg.film {
+            Some(rid) => DemoRec::from_film(&assets.film(rid).expect("film not found")),
+            None => {
+                let fire = DemoRec::pack(&SlotInput { fire: true, ..default() });
+                DemoRec {
+                    level: Some(level_id),
+                    seed: 0xC0FFEE,
+                    p1: vec![fire; last + SHOT_EXIT_DELAY as usize + 60],
+                    p2: Vec::new(),
+                }
+            }
+        };
+        let lid = pb.level.unwrap_or(level_id);
+        sim = start_level(&mut assets, lid, players, pb.seed).expect("level not found");
+        demo.playback = Some(pb);
+        initial_state = FlowState::Playing;
+    }
 
+    // Screenshot mode renders 1:1 (no HiDPI scaling) and as fast as it can.
+    let window = if shot.is_some() {
+        Window {
+            resolution: WindowResolution::new(640, 480).with_scale_factor_override(1.0),
+            present_mode: bevy::window::PresentMode::AutoNoVsync,
+            title: "Deimos Rising".into(),
+            ..default()
+        }
+    } else {
+        Window {
+            resolution: WindowResolution::new(640, 480),
+            title: "Deimos Rising".into(),
+            ..default()
+        }
+    };
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
             .set(bevy::image::ImagePlugin::default_nearest())
             .set(WindowPlugin {
-                primary_window: Some(Window {
-                    resolution: WindowResolution::new(640, 480),
-                    title: "Deimos Rising".into(),
-                    ..default()
-                }),
+                primary_window: Some(window),
                 ..default()
             }),
     );
+    let shot_mode = shot.is_some();
+    if let Some(cfg) = shot {
+        std::fs::create_dir_all(&cfg.out_dir).expect("create screenshot dir");
+        let mut frames = cfg.frames;
+        frames.sort_unstable();
+        frames.dedup();
+        app.insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_secs_f64(1.0 / 60.0),
+        ))
+        .insert_resource(ShotPlan {
+            out_dir: cfg.out_dir,
+            frames,
+            next: 0,
+            frame: 0,
+            last_request: 0,
+        });
+    }
     app.insert_resource(assets)
         .insert_resource(GameSim(sim))
         .insert_resource(TextureBook::default())
@@ -1861,7 +1971,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
         })
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.05)))
         .insert_resource(Flow {
-            state: FlowState::Title,
+            state: initial_state,
             sector: 0,
             players: players.clamp(1, 2),
             ticks: 0,
@@ -1876,14 +1986,19 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
             levels_played: 0,
         })
         .insert_resource(HighScores::load())
-        .insert_resource(Demo::default())
+        .insert_resource(demo)
         .insert_resource(ScoreBars::default())
         .insert_resource(Particles::default())
         .insert_resource(Blurs::default());
-    if let Some(engine) = crate::game::audio::AudioEngine::new() {
-        app.insert_resource(engine);
+    if !shot_mode {
+        if let Some(engine) = crate::game::audio::AudioEngine::new() {
+            app.insert_resource(engine);
+        }
     }
 
+    if shot_mode {
+        app.add_systems(PreUpdate, shot_mute_input.after(bevy::input::InputSystems));
+    }
     app.add_systems(Startup, (setup, setup_hud, setup_menu))
         .add_systems(
             Update,
@@ -1903,6 +2018,7 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize) {
                 sync_players,
                 sync_scorebar,
                 hud_system,
+                shot_system,
             )
                 .chain(),
         );
