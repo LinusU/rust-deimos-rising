@@ -2588,8 +2588,9 @@ pub fn hud_system(
             continue;
         };
         text.0 = match hud.kind {
-            HudKind::Score => format!("{:>7}", p.score),
-            HudKind::Lives => format!("{}", p.lives.max(0)),
+            // "%0.7i" score; lives shown are those in reserve (lives - 1).
+            HudKind::Score => format!("{:07}", p.score),
+            HudKind::Lives => format!("{}", (p.lives - 1).clamp(0, 9)),
         };
     }
 }
