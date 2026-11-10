@@ -1623,10 +1623,7 @@ impl Sim {
                             self.players[slot].as_ref().map(|p| p.power).unwrap_or(0.0)
                         };
                         if pd.powerup_overload_sound.id != NONE_ID {
-                            self.consume_sound_rand(
-                                pd.powerup_overload_sound.min_volume,
-                                pd.powerup_overload_sound.max_volume,
-                            );
+                            self.consume_sound_rand(pd.powerup_overload_sound.min_pitch, pd.powerup_overload_sound.max_pitch);
                             self.events.push(SimEvent::Sound(pd.powerup_overload_sound.id));
                         }
                     }
@@ -1683,10 +1680,7 @@ impl Sim {
                                 if rt.ovl_count >= pd.powerup_overload_num_warnings {
                                     self.destroy_player(assets, slot);
                                 } else if pd.powerup_overload_sound.id != NONE_ID {
-                                    self.consume_sound_rand(
-                                        pd.powerup_overload_sound.min_volume,
-                                        pd.powerup_overload_sound.max_volume,
-                                    );
+                                    self.consume_sound_rand(pd.powerup_overload_sound.min_pitch, pd.powerup_overload_sound.max_pitch);
                                     self.events
                                         .push(SimEvent::Sound(pd.powerup_overload_sound.id));
                                 }
@@ -3258,13 +3252,13 @@ impl Sim {
         e.scale_delta = (st.scale_delta_percent as f32 / 100.0).abs();
     }
 
-    /// `U_Sound_Play(U_Sound_Settings*)` consumes one rand draw when the
-    /// volume range is non-degenerate: RandomFloat(minVolume,maxVolume).
-    /// The channel roll RandomInt(channel,channel) early-returns with no
-    /// draw, and pitch is applied outside this path. Values are
-    /// audio-only, so the result is discarded — only the draw matters.
-    fn consume_sound_rand(&mut self, min_volume: i64, max_volume: i64) {
-        let _ = rand_float(&mut self.rng, min_volume as f64, max_volume as f64);
+    /// `U_Sound_Play(U_Sound_Settings*)` (0x44f5f0) rolls the pitch with
+    /// RandomFloat(minPitch, maxPitch), which draws unless the bounds are
+    /// equal; its volume roll RandomInt(v, v) never draws. The pitch only
+    /// matters to audio, so only the draw is kept.
+    #[track_caller]
+    fn consume_sound_rand(&mut self, min_pitch: f64, max_pitch: f64) {
+        let _ = rand_float(&mut self.rng, min_pitch as f32 as f64, max_pitch as f32 as f64);
     }
 
     /// Emit a spark burst at an entity's screen position. `scroll` marks
@@ -4164,7 +4158,7 @@ impl Sim {
             def.shield_sound
         };
         if snd.id != NONE_ID {
-            self.consume_sound_rand(snd.min_volume, snd.max_volume);
+            self.consume_sound_rand(snd.min_pitch, snd.max_pitch);
             self.events.push(SimEvent::Sound(snd.id));
         }
         // hitParticles burst on non-lethal hits (G_Entity::Hit).
@@ -4612,10 +4606,7 @@ impl Sim {
             });
         }
         if def.destruct_sound.id != NONE_ID {
-            self.consume_sound_rand(
-                def.destruct_sound.min_volume,
-                def.destruct_sound.max_volume,
-            );
+            self.consume_sound_rand(def.destruct_sound.min_pitch, def.destruct_sound.max_pitch);
             self.events.push(SimEvent::Sound(def.destruct_sound.id));
         }
 
