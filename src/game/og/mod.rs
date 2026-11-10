@@ -1,0 +1,4 @@
+//! A faithful port of the original game logic, structured like the
+//! original's modules. See docs/faithful-port.md.
+
+pub mod token;
