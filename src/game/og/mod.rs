@@ -7,3 +7,5 @@ pub mod unitdef;
 pub mod mem;
 pub mod playerdef;
 pub mod wepdef;
+pub mod g;
+pub mod pixbuf;
