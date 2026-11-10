@@ -97,7 +97,8 @@ pub fn G_Bgnd_Load(g: &mut G, level: u32) {
     // Media mask: the original loads image [level+0x280] (or 'none' when
     // it is missing) into a U_Image at 0x4de716.
     let mut mask_id = g.m.r32(level + 0x280);
-    if !g.host.has_image(mask_id) {
+    // 0x40ff82: U_Pak_Tag_IsInIndex('im16', id); `has_image` would test 'im08'.
+    if !g.host.has_tag(0x36316d69, mask_id) {
         mask_id = super::unitdef::NONE;
     }
     let mask = pixbuf::new(&mut g.m);
