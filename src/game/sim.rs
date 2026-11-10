@@ -102,6 +102,47 @@ pub fn rand_log_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("DEIMOS_RANDLOG").is_some())
 }
 
+/// A retail film being replayed (G_Film playback): each player's pad
+/// bytes, read one per Active tick by that player's own cursor.
+#[derive(Clone)]
+pub struct FilmPlayback {
+    pub pads: [Vec<u8>; 2],
+    pub total: [usize; 2],
+    pub cursor: [usize; 2],
+}
+
+impl FilmPlayback {
+    pub fn new(pads: [Vec<u8>; 2], total: [usize; 2]) -> Self {
+        Self { pads, total, cursor: [0, 0] }
+    }
+
+    /// G_Film::GetInputs: decode the next pad byte (bit0 left, bit1 right,
+    /// bit2 up, bit3 down, bit4 ground weapon, bit5 air weapon, bit6
+    /// cycle). Past the recorded frames the inputs stay clear.
+    pub fn next(&mut self, slot: usize) -> SlotInput {
+        let c = self.cursor[slot];
+        if c > self.total[slot] {
+            return SlotInput::default();
+        }
+        self.cursor[slot] += 1;
+        let b = self.pads[slot].get(c).copied().unwrap_or(0);
+        SlotInput {
+            left: b & 0x01 != 0,
+            right: b & 0x02 != 0,
+            up: b & 0x04 != 0,
+            down: b & 0x08 != 0,
+            bomb: b & 0x10 != 0,
+            fire: b & 0x20 != 0,
+            cycle: b & 0x40 != 0,
+        }
+    }
+
+    /// G_Film::IsFinished: player 1's cursor has run past its frames.
+    pub fn is_finished(&self) -> bool {
+        self.cursor[0] > self.total[0]
+    }
+}
+
 /// `U_Utils_RandomInt(min, max)` = `min + rand() % (max - min + 1)`.
 /// The original early-returns `min` with NO rand() draw when min == max
 /// (0x40f7ee jne skips the rand call) — matching that is essential for
@@ -485,8 +526,8 @@ pub struct Player {
     pub fire_timer: u32,
     /// Ticks of invulnerability remaining.
     pub invuln: u32,
-    /// Ticks in current phase.
-    pub phase_time: u32,
+    /// Game time the current phase began (G_Player m_stateData).
+    pub state_data: u32,
     /// Ground-weapon auto-burst shots remaining (G_WeaponHandler
     /// m_field_0x87). Armed by a bomb press after the recharge interval,
     /// drained one shot per delayBetweenLoadLaunches ticks.
@@ -645,6 +686,8 @@ pub struct Sim {
     groups: std::collections::HashMap<u32, GroupBook>,
     limit_message_shown: bool,
     pub rng: Crand,
+    /// Retail film being replayed; overrides live input while set.
+    pub film: Option<FilmPlayback>,
     /// Level-start notice banner deferred until the initial level objects
     /// have been queued, matching sub_41fc80's order (G_Bgnd_
     /// DoInitialMapSpawns runs before the Notice_Level_XX RequestSpawn).
@@ -818,6 +861,7 @@ impl Sim {
             groups: std::collections::HashMap::new(),
             limit_message_shown: false,
             rng: Crand::new(seed as u32),
+            film: None,
             events: Vec::new(),
             debris: Vec::new(),
             accuracy_targets: 0,
@@ -890,7 +934,7 @@ impl Sim {
             ground_weapon: id("plbo"), // Plasma Bomb
             fire_timer: 0,
             invuln: def.entry_invulnerability_time as u32,
-            phase_time: 0,
+            state_data: 0,
             bomb_burst: 0,
             bomb_last: 0,
             prev_bomb: false,
@@ -2255,11 +2299,18 @@ impl Sim {
     }
 
     fn step_player(&mut self, assets: &GameAssets, slot: usize, input: &PlayerInput) {
+        let now = self.game_time;
+        if slot == 0 && rand_log_enabled() {
+            // Same spot as a breakpoint on G_Player::Process in the original.
+            if let Some(p) = self.players[0].as_ref() {
+                eprintln!("T {} ({:.4},{:.4}) score={}", now, p.screen.x - WORLD_TO_SCREEN_X + self.cam_x, p.screen.y, p.score);
+            }
+        }
         let def: PlayerDef = match self.players[slot].as_ref() {
             Some(p) => assets.players.get(&p.def_id).cloned().unwrap_or_default(),
             None => return,
         };
-        let inp = input.for_slot(slot);
+        let live_inp = input.for_slot(slot);
         let two_p = self.two_player_active();
         let p = self.players[slot].as_mut().unwrap();
         p.age += 1;
@@ -2272,10 +2323,11 @@ impl Sim {
 
         match p.phase {
             PlayerPhase::Entering => {
-                p.phase_time += 1;
-                if p.phase_time >= def.entry_initial_delay as u32 {
+                // Priv_ProcessState state 2: appear once the game time
+                // passes the entry delay.
+                if now as i64 > def.entry_initial_delay + p.state_data as i64 {
                     p.phase = PlayerPhase::Active;
-                    p.phase_time = 0;
+                    p.state_data = now;
                     // Entry effect ("plen") is requested when the player
                     // appears — after the initial object batch, like the
                     // original's first-frame Priv_Appear.
@@ -2295,11 +2347,11 @@ impl Sim {
                             state: None,
                         });
                     }
+                } else {
+                    return;
                 }
-                return;
             }
             PlayerPhase::Dying => {
-                p.phase_time += 1;
                 // Priv_ProcessState state 3: finalDyingTime on the last
                 // life, dyingTime otherwise. The life is consumed when the
                 // death anim completes, not at the hit.
@@ -2308,7 +2360,7 @@ impl Sim {
                 } else {
                     def.dying_time
                 };
-                if p.phase_time >= dur.max(1) as u32 {
+                if now as i64 > dur + p.state_data as i64 {
                     p.lives = (p.lives - 1).max(0);
                     if p.lives > 0 {
                         // Priv_Appear: reposition, reset shields and weapon
@@ -2323,7 +2375,7 @@ impl Sim {
                         p.vel = Vec2::ZERO;
                         p.shields = def.default_shield_percentage as f64;
                         p.invuln = def.entry_invulnerability_time as u32;
-                        p.phase_time = 0;
+                        p.state_data = now;
                         p.air_power = PowerupRt::default();
                         p.gnd_power = PowerupRt::default();
                         p.power = 0.0;
@@ -2348,15 +2400,25 @@ impl Sim {
                         }
                     } else {
                         p.phase = PlayerPhase::Dead;
-                        p.phase_time = 0;
+                        p.state_data = now;
                         self.events.push(SimEvent::PlayerEvent(slot, "dead"));
+                        return;
                     }
+                } else {
+                    return;
                 }
-                return;
             }
             PlayerPhase::Dead => return,
             PlayerPhase::Active => {}
         }
+        // Priv_GetInputs runs after the state update, so a player that
+        // appears this tick already reads input. A film frame is consumed
+        // only on Active ticks.
+        let inp = match self.film.as_mut() {
+            Some(f) => f.next(slot),
+            None => live_inp,
+        };
+        let p = self.players[slot].as_mut().unwrap();
 
         if p.invuln > 0 { p.invuln -= 1; }
         if p.fire_timer > 0 { p.fire_timer -= 1; }
@@ -4734,7 +4796,7 @@ impl Sim {
             self.events.push(SimEvent::PlayerEvent(slot, "shield_break"));
             // State 3 (dying); the life is consumed when the anim ends.
             p.phase = PlayerPhase::Dying;
-            p.phase_time = 0;
+            p.state_data = self.game_time;
         } else if amount > 0.0 && !p.shield_warned
             && (p.shields as i64) <= pdef.shield_warning_percentage
             && pdef.active_shield_warning_object != NONE_ID

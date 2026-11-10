@@ -217,6 +217,7 @@ fn trace_replay(
     args: &[String],
 ) {
     let mut sim = game::render::start_level(a, level, players, seed).expect("level");
+    sim.film = rec.film.clone();
     let a = &*a;
     let ent_at = args
         .iter()

@@ -224,6 +224,9 @@ pub struct DemoRec {
     pub seed: u64,
     pub p1: Vec<u8>,
     pub p2: Vec<u8>,
+    /// A retail film: replayed inside the sim per Active tick, not per
+    /// frame, so `p1`/`p2` stay empty.
+    pub film: Option<crate::game::sim::FilmPlayback>,
 }
 
 impl DemoRec {
@@ -232,7 +235,7 @@ impl DemoRec {
     /// `up down left right fire bomb cycle`, for player 1 unless written
     /// `p2:<key>`. Spans may overlap; `#` starts a comment.
     pub fn from_script(text: &str, level: ResId, seed: u64) -> Result<DemoRec, String> {
-        let mut rec = DemoRec { level: Some(level), seed, p1: Vec::new(), p2: Vec::new() };
+        let mut rec = DemoRec { level: Some(level), seed, p1: Vec::new(), p2: Vec::new(), film: None };
         for (ln, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -300,6 +303,9 @@ impl DemoRec {
         }
     }
     pub fn frames(&self) -> usize {
+        if let Some(f) = &self.film {
+            return f.total[0].max(f.total[1]);
+        }
         self.p1.len().max(self.p2.len())
     }
     fn save(&self) {
@@ -331,7 +337,7 @@ impl DemoRec {
             return None;
         }
         let p2 = buf[20 + n1..20 + n1 + n2].to_vec();
-        Some(DemoRec { level: Some(lvl), seed, p1, p2 })
+        Some(DemoRec { level: Some(lvl), seed, p1, p2, film: None })
     }
 
     /// Build a playback stream from a retail `film` resource, translating
@@ -340,25 +346,13 @@ impl DemoRec {
     /// into our SlotInput packing. This is what the original's attract
     /// mode replays; the seed/level come straight from the film header.
     pub fn from_film(film: &crate::assets::FilmData) -> Self {
-        let tr = |b: u8| -> u8 {
-            let mut s = SlotInput::default();
-            if b & 0x01 != 0 { s.left = true; }
-            if b & 0x02 != 0 { s.right = true; }
-            if b & 0x04 != 0 { s.up = true; }
-            if b & 0x08 != 0 { s.down = true; }
-            if b & 0x10 != 0 { s.bomb = true; }
-            if b & 0x20 != 0 { s.fire = true; }
-            if b & 0x40 != 0 { s.cycle = true; }
-            DemoRec::pack(&s)
-        };
-        let n = film.frames[0].max(film.frames[1]);
-        let p1 = (0..n)
-            .map(|t| film.inputs[0].get(t).map(|&b| tr(b)).unwrap_or(0))
-            .collect();
-        let p2 = (0..n)
-            .map(|t| film.inputs[1].get(t).map(|&b| tr(b)).unwrap_or(0))
-            .collect();
-        DemoRec { level: Some(film.level_id), seed: film.seed as u64, p1, p2 }
+        DemoRec {
+            level: Some(film.level_id),
+            seed: film.seed as u64,
+            p1: Vec::new(),
+            p2: Vec::new(),
+            film: Some(crate::game::sim::FilmPlayback::new(film.inputs.clone(), film.frames)),
+        }
     }
 }
 
@@ -1629,7 +1623,8 @@ pub fn flow_system(
         let pb = pb_opt.or_else(DemoRec::load);
         if let Some(pb) = pb {
             if let Some(lid) = pb.level {
-                if let Some(new_sim) = start_level(&mut *assets, lid, 1, pb.seed) {
+                if let Some(mut new_sim) = start_level(&mut *assets, lid, 1, pb.seed) {
+                    new_sim.film = pb.film.clone();
                     sim.0 = new_sim;
                     demo.playback = Some(pb);
                     demo.frame = 0;
@@ -1818,6 +1813,7 @@ pub fn flow_system(
                             seed: 0xC0FFEE,
                             p1: Vec::new(),
                             p2: Vec::new(),
+                            film: None,
                         };
                         demo.playback = None;
                         demo.frame = 0;
@@ -1856,7 +1852,10 @@ pub fn flow_system(
             // below from overriding the transition (and skips it entirely
             // while a demo is running).
             if in_playback {
-                let frames_done = demo.frame >= demo.playback.as_ref().unwrap().frames();
+                let frames_done = match &sim.0.film {
+                    Some(f) => f.is_finished(),
+                    None => demo.frame >= demo.playback.as_ref().unwrap().frames(),
+                };
                 let level_done = sim.0.level_end_complete;
                 let any_alive = sim
                     .0
@@ -2275,11 +2274,13 @@ pub fn run(assets: GameAssets, level_id: ResId, players: usize, shot: Option<Sho
                     seed: 0xC0FFEE,
                     p1: (0..len).map(|f| if f % 12 < 4 { fire } else { 0 }).collect(),
                     p2: Vec::new(),
+                    film: None,
                 }
             }
         };
         let lid = pb.level.unwrap_or(level_id);
         sim = start_level(&mut assets, lid, players, pb.seed).expect("level not found");
+        sim.film = pb.film.clone();
         demo.playback = Some(pb);
         initial_state = FlowState::Playing;
     }
