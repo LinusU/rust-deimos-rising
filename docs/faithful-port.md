@@ -13,13 +13,16 @@ tick, checked against complete Drydock traces with
 `tools/oracle/cmpog.py`): Demo 01 to 25050, Demo 02 to 116180, Demo 03 to
 57520, Demo 04 to 24670. The game window (live play, attract demos,
 `--shot`) runs on the port (`src/game/ogplay.rs`); Demo 01 screenshots
-match the original's within a few hundred pixels. `sim.rs` only remains
-for old debug flags (`--filmtest`, `--trace`, `--entities-at`) and input
-scripts.
+match the original's within a few hundred pixels. The old remake
+simulation (`sim.rs`) is gone; the headless debug tools run on the port:
+`--og-film <id>` (film replay trace), `--og-live-test <ticks>` and
+`--trace --input <script>` (live play, with `--entities-at` for raw entity
+dumps).
 
 ## Why a port and not more fixes
 
-`src/game/sim.rs` was written from the decompilation's names but not its
+The remake's first simulation (`src/game/sim.rs`, since removed) was
+written from the decompilation's names but not its
 details. Tracing Demo 01 against the original showed differences at every
 level, not just bugs:
 
@@ -54,8 +57,8 @@ keeping the original's structure, field offsets and float types:
 - The film oracle (rand/state/spawn/position trace from Drydock) checks
   each step; the first divergent tick is the next thing to port or fix.
 
-Once the port replays the demos, the renderer switches from `sim.rs` to it
-and `sim.rs` goes away.
+Once the port replayed the demos, the renderer switched to it and `sim.rs`
+was removed.
 
 ## Tick order (sub_020280)
 
