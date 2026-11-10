@@ -64,6 +64,10 @@ pub struct OgGame {
     /// `copilot_on` set.
     pub copilot: Option<crate::rl::copilot::CoPilot>,
     pub copilot_on: bool,
+    /// Draw between ticks at the display's rate (see `lerp_frame`).
+    pub smooth: bool,
+    /// The frame before the latest tick, for `smooth`.
+    prev: Option<FrameView>,
 }
 
 impl OgGame {
@@ -92,6 +96,8 @@ impl OgGame {
             music: 0,
             copilot: None,
             copilot_on: false,
+            smooth: true,
+            prev: None,
         })
     }
 
@@ -110,6 +116,7 @@ impl OgGame {
         self.cycle_latch = [false; 2];
         self.dirty = true;
         self.music = 0;
+        self.prev = None;
         if let Some(c) = self.copilot.as_mut() {
             c.reset();
         }
@@ -159,6 +166,9 @@ impl OgGame {
     /// Runs one tick and keeps the background buffer current.
     fn tick(&mut self, assets: &mut GameAssets, inputs: [[bool; 7]; 2]) {
         let Some(s) = self.session.as_mut() else { return };
+        if self.smooth {
+            self.prev = Some(s.frame().clone());
+        }
         s.tick(inputs);
         self.ticks += 1;
         if let Some(t) = std::env::var("OG_ITEMS").ok().and_then(|v| v.parse::<i32>().ok()) {
@@ -538,14 +548,20 @@ fn draw_score_bars(assets: &mut GameAssets, t: &mut Target, fv: &FrameView) {
 }
 
 /// The whole screen for the session's current frame, RGBA8 640x480.
-fn render(og: &mut OgGame, assets: &mut GameAssets, out: &mut Vec<u8>) {
+/// Composites the latest frame, or with `between` = Some(a) the frame a
+/// (0..1) of the way from the previous tick's to the latest's.
+fn render(og: &mut OgGame, assets: &mut GameAssets, out: &mut Vec<u8>, between: Option<f32>) {
     out.clear();
     out.resize(SCREEN_W * SCREEN_H * 4, 0);
     for px in out.chunks_exact_mut(4) {
         px[3] = 255;
     }
     let Some(s) = og.session.as_ref() else { return };
-    let fv = s.frame();
+    let blended = match (between, og.prev.as_ref()) {
+        (Some(a), Some(prev)) => lerp_frame(prev, s.frame(), a),
+        _ => None,
+    };
+    let fv = blended.as_ref().unwrap_or(s.frame());
     let bgd = &fv.background;
     let (vw, vh) = (bgd.view_w.max(0), bgd.view_h.max(0));
     let mut gpx = vec![0u8; (vw * vh * 4) as usize];
@@ -733,9 +749,11 @@ pub fn og_system(
         ));
         og.dirty = true;
     }
-    if og.dirty {
+    let smooth = og.smooth && shot.is_none();
+    if og.dirty || smooth {
         let mut buf = Vec::new();
-        render(og, &mut assets, &mut buf);
+        let between = smooth.then_some(og.acc.clamp(0.0, 1.0));
+        render(og, &mut assets, &mut buf, between);
         if let Some(mut img) = images.get_mut(og.handle.as_ref().unwrap()) {
             img.data = Some(buf);
         }
@@ -743,13 +761,73 @@ pub fn og_system(
     }
 }
 
+/// Above this many pixels a move between ticks is a jump (a respawn, a
+/// wrap), drawn where it lands.
+const LERP_MAX_STEP: i32 = 48;
+
+/// The frame `a` (0..1) of the way from tick frame `prev` to `cur`, for
+/// display rates above the game's 30 ticks a second. Only where things
+/// are drawn changes: the scroll, and each sprite or particle that was
+/// also drawn last tick (paired by the object that drew it). Positions are
+/// blended relative to the scroll, so ground objects stay put on the
+/// terrain. Everything else (frames, fades, texts, the score bars) is the
+/// latest tick's. None when the scroll jumped (a new level).
+fn lerp_frame(prev: &FrameView, cur: &FrameView, a: f32) -> Option<FrameView> {
+    let (pb, cb) = (&prev.background, &cur.background);
+    if (cb.scroll_y - pb.scroll_y).abs() > LERP_MAX_STEP || (cb.side_scroll - pb.side_scroll).abs() > LERP_MAX_STEP {
+        return None;
+    }
+    let mix = |p: f32, c: f32| p + (c - p) * a;
+    let sy = mix(pb.scroll_y as f32, cb.scroll_y as f32).round() as i32;
+    let sx = mix(pb.side_scroll as f32, cb.side_scroll as f32).round() as i32;
+    // A position relative to the terrain, blended, back on screen.
+    let place = |p: i32, ps: i32, c: i32, cs: i32, s: i32| -> i32 {
+        if (c - p).abs() > LERP_MAX_STEP + (cs - ps).abs() {
+            return c;
+        }
+        mix((p + ps) as f32, (c + cs) as f32).round() as i32 - s
+    };
+    let mut out = cur.clone();
+    out.background.scroll_y = sy;
+    out.background.side_scroll = sx;
+    out.background.src_left = (sx + 0x20).max(0);
+    // Pair items by (obj, kind, n-th such draw of that owner).
+    let mut seen: std::collections::HashMap<(u32, u8, u32), u32> = Default::default();
+    let mut prev_at: std::collections::HashMap<(u32, u8, u32), (i32, i32)> = Default::default();
+    for it in prev.items.iter().filter(|i| i.obj != 0 && !i.to_terrain) {
+        let n = seen.entry((it.obj, it.kind as u8, 0)).or_insert(0);
+        prev_at.insert((it.obj, it.kind as u8, *n), (it.x, it.y));
+        *n += 1;
+    }
+    seen.clear();
+    for it in out.items.iter_mut().filter(|i| i.obj != 0 && !i.to_terrain) {
+        let n = seen.entry((it.obj, it.kind as u8, 0)).or_insert(0);
+        if let Some(&(px, py)) = prev_at.get(&(it.obj, it.kind as u8, *n)) {
+            it.x = place(px, pb.side_scroll, it.x, cb.side_scroll, sx);
+            it.y = place(py, pb.scroll_y, it.y, cb.scroll_y, sy);
+        }
+        *n += 1;
+    }
+    let prev_p: std::collections::HashMap<u32, (i32, i32)> = prev.particles.iter().map(|p| (p.id, (p.ix, p.iy))).collect();
+    for p in out.particles.iter_mut() {
+        if let Some(&(px, py)) = prev_p.get(&p.id) {
+            p.ix = place(px, pb.side_scroll, p.ix, cb.side_scroll, sx);
+            p.iy = place(py, pb.scroll_y, p.iy, cb.scroll_y, sy);
+        }
+    }
+    Some(out)
+}
+
 /// `--og-png <dir> --film <id> --at f1,f2,...`: replays a film without a
 /// window and writes the composited screen of each listed frame to
 /// `<dir>/frameNNNNN.png`. Frames count like `--shot --at` (the original's
 /// game tick N is frame N+30); same pixels as the window, no GPU involved.
-pub fn film_pngs(mut assets: GameAssets, paks: PathBuf, film: ResId, frames: &[u32], out_dir: &std::path::Path) -> Result<(), String> {
+/// With `between` = Some(a) each frame is drawn a (0..1) of the way from
+/// the frame before it, as the window does between ticks.
+pub fn film_pngs(mut assets: GameAssets, paks: PathBuf, film: ResId, frames: &[u32], between: Option<f32>, out_dir: &std::path::Path) -> Result<(), String> {
     let bytes = assets.set.read_raw(pak::Tag::Film, film).ok_or("film not found")?;
     let mut og = OgGame::new(paks)?;
+    og.smooth = between.is_some();
     og.start_film(film, &bytes)?;
     std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
     let last = frames.iter().copied().max().unwrap_or(0);
@@ -757,7 +835,7 @@ pub fn film_pngs(mut assets: GameAssets, paks: PathBuf, film: ResId, frames: &[u
     while og.ticks < last && og.session.as_ref().map(|s| s.is_playing()).unwrap_or(false) {
         og.tick(&mut assets, [[false; 7]; 2]);
         if frames.contains(&og.ticks) {
-            render(&mut og, &mut assets, &mut buf);
+            render(&mut og, &mut assets, &mut buf, between);
             let path = out_dir.join(format!("frame{:05}.png", og.ticks));
             image::save_buffer(&path, &buf, SCREEN_W as u32, SCREEN_H as u32, image::ExtendedColorType::Rgba8)
                 .map_err(|e| e.to_string())?;

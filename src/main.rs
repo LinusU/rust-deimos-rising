@@ -511,7 +511,7 @@ fn main() {
         let dir = data_dir();
         let mut a = assets::GameAssets::open(&dir).expect("open retail data");
         a.load_all_data();
-        if let Err(e) = game::ogplay::film_pngs(a, dir, film, &frames, std::path::Path::new(&out)) {
+        if let Err(e) = game::ogplay::film_pngs(a, dir, film, &frames, arg_value(&args, "--between").and_then(|v| v.parse().ok()), std::path::Path::new(&out)) {
             eprintln!("og-png: {e}");
             std::process::exit(1);
         }

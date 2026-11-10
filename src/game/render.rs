@@ -1008,6 +1008,9 @@ pub fn run(
         level_ids.push(level_id);
     }
     let mut og = OgGame::new(data_dir).expect("port game");
+    // `--no-smooth`: show each game tick as it is, the way the original's
+    // capped frame rate does, instead of drawing between ticks.
+    og.smooth = !std::env::args().any(|a| a == "--no-smooth");
     og.warm().expect("port game data");
     let mut copilot_default = false;
     if let Some((c, d)) = copilot {
