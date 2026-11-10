@@ -3015,6 +3015,10 @@ impl Sim {
         if let Some(def) = assets.units.get(&unit_id) {
             if let Some(ns) = find_state(def, name) {
                 self.change_state(idx, ns, def, assets, false);
+            } else if rand_log_enabled() {
+                // The original still enters ChangeState, which finds no
+                // such state and returns.
+                eprintln!("C {} force=0 name={:?} (no such state)", rid_str(def.id), name);
             }
         }
     }
