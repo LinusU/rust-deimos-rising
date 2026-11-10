@@ -1033,7 +1033,7 @@ fn main() {
                 .unwrap_or(0),
         }
     });
-    game::render::run(assets, level, players, shot);
+    game::render::run(assets, dir, level, players, shot);
 }
 
 fn test_sprites() {

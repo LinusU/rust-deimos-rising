@@ -11,7 +11,7 @@
 
 use super::input::{key_label, KeyBindings, ACTIONS};
 use super::render::{
-    frame_image_blend, image16_handle, layout_text, to_world_z, Blit, Flow, FlowState, GameSim,
+    frame_image_blend, image16_handle, layout_text, to_world_z, Blit, Flow, FlowState,
     HighScores, TextureBook, FONT,
 };
 use super::sim::{pf, PLAY_LEFT};
@@ -369,7 +369,6 @@ pub struct MenuSprite(usize);
 pub fn sync_menu(
     mut commands: Commands,
     flow: Res<Flow>,
-    sim_res: Res<GameSim>,
     scores: Res<HighScores>,
     bindings: Res<KeyBindings>,
     pointer: Res<MenuPointer>,
@@ -386,7 +385,7 @@ pub fn sync_menu(
         FlowState::Scores | FlowState::NameEntry => score_table(&mut p, &flow, &scores),
         FlowState::Credits => credits(&mut p, &flow),
         FlowState::Controls => controls(&mut p, &flow, &bindings),
-        FlowState::Playing => overlay(&mut p, &flow, &sim_res),
+        FlowState::Playing => overlay(&mut p, &flow),
     }
     let draws = p.out;
 
@@ -662,18 +661,12 @@ fn controls(p: &mut Painter, flow: &Flow, bindings: &KeyBindings) {
     p.text(&hint, text);
 }
 
-/// Text drawn over the game: the level-end tally and the pause notice,
+/// Text drawn over the game: the pause notice,
 /// centred in the game area with the game-notice format (`gano`).
-fn overlay(p: &mut Painter, flow: &Flow, sim_res: &GameSim) {
+fn overlay(p: &mut Painter, flow: &Flow) {
     let notice = text_style(p.assets, "gano");
     // Game-area text formats are in front-buffer space.
     let style = TextStyle { pos: notice.pos + Vec2::new(PLAY_LEFT, 0.0), ..notice };
-    let gap = pf(p.assets, 0x4b);
-    let lines = super::render::end_text_lines(&sim_res.0, p.assets);
-    let top = style.pos.y - gap * lines.len().saturating_sub(1) as f32 * 0.5;
-    for (i, line) in lines.iter().enumerate() {
-        game_area_text(p, &style.at_y(top + gap * i as f32), line);
-    }
     if flow.paused {
         // Game string 0: "Press Caps Lock".
         let text = p.string("pgsl", 0);
