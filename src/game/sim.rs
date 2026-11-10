@@ -1775,12 +1775,13 @@ impl Sim {
 
     /// Advance the simulation by one 60 Hz tick.
     pub fn step(&mut self, assets: &GameAssets, input: &PlayerInput) {
+        self.step_tick(assets, input);
+        // G_Game_Play bumps the game time after the tick, so the first
+        // tick runs at time 0.
         self.game_time += 1;
-        if rand_log_enabled() {
-            let p = self.players[0].as_ref();
-            eprintln!("T {} ({:?}) state={:08x}", self.game_time,
-                p.map(|p| (p.screen.x, p.screen.y)), self.rng.state);
-        }
+    }
+
+    fn step_tick(&mut self, assets: &GameAssets, input: &PlayerInput) {
 
         // --- scrolling ---
         if !self.scroll_paused && !self.entity_scroll_pause && self.phase == Phase::Playing {
