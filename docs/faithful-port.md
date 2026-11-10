@@ -11,8 +11,11 @@ All four demo films replay through `src/game/og` tick for tick like the
 original (rand() stream, player 1's position, state and score on every
 tick, checked against complete Drydock traces with
 `tools/oracle/cmpog.py`): Demo 01 to 25050, Demo 02 to 116180, Demo 03 to
-57520, Demo 04 to 24670. Remaining: the renderer and live play still run
-on `sim.rs`.
+57520, Demo 04 to 24670. The game window (live play, attract demos,
+`--shot`) runs on the port (`src/game/ogplay.rs`); Demo 01 screenshots
+match the original's within a few hundred pixels. `sim.rs` only remains
+for old debug flags (`--filmtest`, `--trace`, `--entities-at`) and input
+scripts.
 
 ## Why a port and not more fixes
 
