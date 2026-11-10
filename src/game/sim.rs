@@ -3025,6 +3025,10 @@ impl Sim {
             def.states[e.state.min(def.states.len() - 1)].sprite_face
         };
         let epos = self.entities[idx].pos;
+        if rand_log_enabled() {
+            eprintln!("C {} force={} name={:?} at=({:.2},{:.2})", rid_str(def.id), force as u8,
+                def.states[ns].name, epos.x, epos.y);
+        }
         let e = &mut self.entities[idx];
         e.state = ns;
         e.state_start = self.game_time;
