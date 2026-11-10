@@ -1049,8 +1049,18 @@ pub fn G_Player_Priv_GetInputs(g: &mut G, this: u32, a0: u32, a1: i32) {
 pub fn G_Player_Process(g: &mut G, this: u32, a0: bool, a1: bool, a2: i32, a3: u32, a4: i32, a5: bool) {
     // Licence check block.
     if g.m.rb(this + 0x233) && a2 == g.m.ri32(this + 0x22b) {
+        // The block (0x43285b..0x433f89) checks the licence code against the
+        // name and the copies and a table of 20 blacklisted codes; a failure
+        // calls G_Level_HackTest_Fux0r (0x433f5c). Only the valid outcome is
+        // ported (the check itself needs the RT3 library): the check counter
+        // +0x22f goes up and the first time the next check is scheduled at
+        // twice this tick (0x433f63..0x433f83).
         let _ = G_Level_HackTest_Fux0r;
-        todo!("G_Player::Process registration check 0x43285b..0x433f89 (registered build only)");
+        let n = g.m.ri32(this + 0x22f).wrapping_add(1);
+        g.m.wi32(this + 0x22f, n);
+        if n == 1 {
+            g.m.wi32(this + 0x22b, a2.wrapping_add(a2));
+        }
     }
 
     if !g.m.rb(this + 0xb8) {
