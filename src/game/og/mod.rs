@@ -2,3 +2,4 @@
 //! original's modules. See docs/faithful-port.md.
 
 pub mod token;
+pub mod umath;
