@@ -80,7 +80,13 @@ impl Crand {
     pub fn srand(&mut self, seed: u32) {
         self.state = seed;
     }
+    #[track_caller]
     pub fn rand(&mut self) -> u32 {
+        if rand_log_enabled() {
+            let l = std::panic::Location::caller();
+            eprintln!("R {}:{} {:08x}", l.file().rsplit('/').next().unwrap_or(""), l.line(),
+                self.state.wrapping_mul(1103515245).wrapping_add(12345));
+        }
         self.state = self
             .state
             .wrapping_mul(1103515245)
@@ -89,10 +95,18 @@ impl Crand {
     }
 }
 
+/// `DEIMOS_RANDLOG=1` prints every `rand()` draw with its call site and
+/// the new generator state, to line up against the original's stream.
+pub fn rand_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DEIMOS_RANDLOG").is_some())
+}
+
 /// `U_Utils_RandomInt(min, max)` = `min + rand() % (max - min + 1)`.
 /// The original early-returns `min` with NO rand() draw when min == max
 /// (0x40f7ee jne skips the rand call) — matching that is essential for
 /// stream parity since many state fields share equal min/max bounds.
+#[track_caller]
 fn rand_int(rng: &mut Crand, min: i64, max: i64) -> i64 {
     if min == max {
         return min;
@@ -103,6 +117,7 @@ fn rand_int(rng: &mut Crand, min: i64, max: i64) -> i64 {
 /// `U_Utils_RandomFloat(low, high)` = `rand() * (high - low) / 32767 + min`.
 /// Equal bounds early-return with no draw; reversed bounds roll downward
 /// from the smaller value, matching the original's signed-range math.
+#[track_caller]
 fn rand_float(rng: &mut Crand, low: f64, high: f64) -> f64 {
     if low == high {
         return low;
@@ -1765,6 +1780,11 @@ impl Sim {
     /// Advance the simulation by one 60 Hz tick.
     pub fn step(&mut self, assets: &GameAssets, input: &PlayerInput) {
         self.game_time += 1;
+        if rand_log_enabled() {
+            let p = self.players[0].as_ref();
+            eprintln!("T {} ({:?}) state={:08x}", self.game_time,
+                p.map(|p| (p.screen.x, p.screen.y)), self.rng.state);
+        }
 
         // --- scrolling ---
         if !self.scroll_paused && !self.entity_scroll_pause && self.phase == Phase::Playing {
