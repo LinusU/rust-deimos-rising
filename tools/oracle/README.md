@@ -14,5 +14,9 @@ can be compared tick by tick. See `docs/faithful-port.md`.
   the original and their comparison. The port side comes from
   `OG_ENTS=t1,t2 deimos --og-film ...` or `deimos --trace --input FILE
   --entities-at t1,t2`.
+- `spritedims.py TICK`: every loaded sprite's frame sizes from the
+  original's memory; compare with `deimos --sprite-dims <id>`.
+- `plates.py OUTDIR`: the 8-bit plates the original hands U_SpritePlate
+  during level load, as raw bytes.
 - `x86dis.py EXE ADDR N`, `xref.py EXE ADDR`: disassemble, find callers.
   Run them with `uv run` inside `scratch/deimos-rising-decomp` (capstone).
