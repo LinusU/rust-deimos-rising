@@ -840,10 +840,6 @@ impl Sim {
             media_mask: None,
             media_tile_size: 0,
         };
-        // G_Game_Play's first act after film srand: startTime =
-        // RandomInt(400,2000) — an attract-mode timer that still consumes
-        // a draw from the seeded stream before any level-init rolls.
-        rand_int(&mut sim.rng, 0x190, 0x7d0);
         sim
     }
 
