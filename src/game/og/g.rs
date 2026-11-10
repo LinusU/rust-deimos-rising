@@ -27,6 +27,21 @@ pub trait Host {
     fn sound_is_playing(&self, _id: u32) -> bool {
         false
     }
+    /// The text of pak entry (`tag`, `id`) as the parsers see it:
+    /// decrypted (`U_Utils_String_Encrypt`), without a terminator.
+    fn read_text(&self, _tag: u32, _id: u32) -> Option<Vec<u8>> {
+        None
+    }
+    /// Ids of every entry with `tag`, in the order the original's tag
+    /// index enumerates them (`U_Pak_GetPtrToNextTagData(index, tag)`:
+    /// pak files by name, entries in zip order).
+    fn ids_of_tag(&self, _tag: u32) -> Vec<u32> {
+        Vec::new()
+    }
+    /// `U_Pak_Tag_IsInIndex(tag, id)`.
+    fn has_tag(&self, _tag: u32, _id: u32) -> bool {
+        false
+    }
 }
 
 /// A host with no assets, for tests.

@@ -27,3 +27,4 @@ pub mod unitdefs;
 pub mod weaponhandler;
 pub mod wepdefs;
 pub mod pixbuf;
+pub mod load;
