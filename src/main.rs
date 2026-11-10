@@ -625,6 +625,25 @@ fn main() {
         std::fs::write(&args[pos + 2], &d.img).expect("write");
         return;
     }
+    // --og-wepdef <id> <out> / --og-playerdef <id> <out>: the ported
+    // G_WepDef / G_PlayerDef images.
+    for (flag, tag) in [("--og-wepdef", Tag::Wede), ("--og-playerdef", Tag::Plde)] {
+        if let Some(pos) = args.iter().position(|a| a == flag) {
+            let mut set = PakSet::open_dir(&data_dir()).expect("open paks");
+            let rid = id(&args[pos + 1]);
+            let text = set.read_text(tag, rid).expect("definition not found");
+            let has_image = |r: u32| set.find(Tag::Im16, r).is_some() || set.find(Tag::Im08, r).is_some();
+            let mut t = text.into_bytes();
+            t.push(0);
+            let img = if tag == Tag::Wede {
+                game::og::wepdef::WepDef::parse(rid, &t, &has_image).img
+            } else {
+                game::og::playerdef::PlayerDef::parse(rid, &t, &has_image).img
+            };
+            std::fs::write(&args[pos + 2], &img).expect("write");
+            return;
+        }
+    }
     if let Some(part) = arg_value(&args, "--ls") {
         let set = PakSet::open_dir(&data_dir()).expect("open paks");
         for (path, pak) in &set.paks {

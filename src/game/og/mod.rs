@@ -5,3 +5,5 @@ pub mod token;
 pub mod umath;
 pub mod unitdef;
 pub mod mem;
+pub mod playerdef;
+pub mod wepdef;
