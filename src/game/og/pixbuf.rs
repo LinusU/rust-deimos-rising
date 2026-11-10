@@ -11,6 +11,11 @@ pub fn new(m: &mut Mem) -> u32 {
 
 /// Size the buffer and allocate 16-bit pixels.
 pub fn create(m: &mut Mem, b: u32, w: i32, h: i32) {
+    // Re-creating a buffer (a new level's background) releases the old pixels.
+    let old = m.r32(b + 8);
+    if old != 0 {
+        m.free(old);
+    }
     m.wi32(b, w);
     m.wi32(b + 4, h);
     let row = w.max(0) * 2;

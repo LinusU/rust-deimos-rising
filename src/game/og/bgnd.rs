@@ -101,6 +101,13 @@ pub fn G_Bgnd_Load(g: &mut G, level: u32) {
     if !g.host.has_tag(0x36316d69, mask_id) {
         mask_id = super::unitdef::NONE;
     }
+    // The previous level's mask buffer is released.
+    let old_mask = g.m.r32(MEDIA_MASK);
+    if old_mask != 0 {
+        let base = g.m.r32(old_mask + 8);
+        g.m.free(base);
+        g.m.free(old_mask);
+    }
     let mask = pixbuf::new(&mut g.m);
     match g.host.image_pixels16(mask_id) {
         Some((w, h, px)) => {
