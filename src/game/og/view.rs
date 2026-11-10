@@ -342,7 +342,9 @@ pub fn particle_blob(w: u32) -> [[BlobPixel; 7]; 7] {
     let row1 = [f(outer), f(mid), f(inner), f(inner), f(inner), f(mid), f(outer)];
     let row2 = [f(mid), f(inner), f(w), n(w), f(w), f(inner), f(mid)];
     let row3 = [f(mid), f(inner), n(w), n(center), n(w), f(inner), f(mid)];
-    let row4 = [f(mid), f(inner), n(w), n(w), n(w), f(inner), f(mid)];
+    // The decompilation has the near colour on three pixels here; the
+    // original's blob is the symmetric plus (checked against screenshots).
+    let row4 = row2;
     [row0, row1, row2, row3, row4, row1, row0]
 }
 
