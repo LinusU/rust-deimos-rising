@@ -145,6 +145,64 @@ impl KeyBindings {
     }
 }
 
+/// Game controllers, read the way the original reads joysticks
+/// (G_Input_CachePlayerInputs with the U_Prefs defaults): the first
+/// connected pad plays player 1, the second player 2. The left stick
+/// counts past 20% of its travel (`JoystickSetDigital(.., 20)`) and the
+/// D-pad (the original's POV hat) moves too; button 1 (A) fires the air
+/// weapon, button 2 (B) the ground weapon and button 3 (X) selects the
+/// air weapon.
+#[derive(Resource, Default)]
+pub struct Pads {
+    /// Per player, per action in `ACTIONS` order: held this frame.
+    pub now: [[bool; 7]; 2],
+    /// The same for the previous frame.
+    pub prev: [[bool; 7]; 2],
+    /// Start pressed this frame, any pad.
+    pub start: bool,
+}
+
+/// Stick deflection the original counts as a press.
+const STICK_THRESHOLD: f32 = 0.2;
+
+impl Pads {
+    pub fn pressed(&self, slot: usize, action: usize) -> bool {
+        self.now[slot][action]
+    }
+
+    pub fn just_pressed(&self, slot: usize, action: usize) -> bool {
+        self.now[slot][action] && !self.prev[slot][action]
+    }
+
+    /// Any pad's action newly pressed.
+    pub fn any_just_pressed(&self, action: usize) -> bool {
+        (0..2).any(|s| self.just_pressed(s, action))
+    }
+}
+
+/// Samples the connected pads once a frame.
+pub fn read_pads(mut pads: ResMut<Pads>, q: Query<(Entity, &Gamepad)>) {
+    pads.prev = pads.now;
+    pads.now = [[false; 7]; 2];
+    pads.start = false;
+    let mut list: Vec<(Entity, &Gamepad)> = q.iter().collect();
+    list.sort_by_key(|(e, _)| *e);
+    for (slot, (_, pad)) in list.iter().take(2).enumerate() {
+        let x = pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0);
+        let y = pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0);
+        let mut a = [false; 7];
+        a[UP] = y > STICK_THRESHOLD || pad.pressed(GamepadButton::DPadUp);
+        a[DOWN] = y < -STICK_THRESHOLD || pad.pressed(GamepadButton::DPadDown);
+        a[LEFT] = x < -STICK_THRESHOLD || pad.pressed(GamepadButton::DPadLeft);
+        a[RIGHT] = x > STICK_THRESHOLD || pad.pressed(GamepadButton::DPadRight);
+        a[FIRE] = pad.pressed(GamepadButton::South);
+        a[BOMB] = pad.pressed(GamepadButton::East);
+        a[CYCLE] = pad.pressed(GamepadButton::West);
+        pads.now[slot] = a;
+        pads.start |= pad.just_pressed(GamepadButton::Start);
+    }
+}
+
 /// Keys that may be bound. Escape, Enter and the function keys are left
 /// out: the menus and the game's own shortcuts use them.
 const BINDABLE: &[KeyCode] = &[

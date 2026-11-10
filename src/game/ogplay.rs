@@ -14,7 +14,7 @@
 //! time increment).
 
 use crate::assets::{GameAssets, GifFrame};
-use crate::game::input::{KeyBindings, BOMB, CYCLE, DOWN, FIRE, LEFT, RIGHT, UP};
+use crate::game::input::{KeyBindings, Pads, BOMB, CYCLE, DOWN, FIRE, LEFT, RIGHT, UP};
 use crate::game::og::session::Session;
 use crate::game::og::view::{DrawItem, DrawMode, FrameView, TextItem};
 use crate::game::render::{layout_text, Flow, FlowState, ShotPlan, FONT};
@@ -617,22 +617,15 @@ fn render(og: &mut OgGame, assets: &mut GameAssets, out: &mut Vec<u8>) {
 #[derive(Component)]
 pub struct OgScreen;
 
-fn slot_inputs(keys: &ButtonInput<KeyCode>, b: &KeyBindings, latch: &mut [bool; 2], first: bool) -> [[bool; 7]; 2] {
+fn slot_inputs(keys: &ButtonInput<KeyCode>, b: &KeyBindings, pads: &Pads, latch: &mut [bool; 2], first: bool) -> [[bool; 7]; 2] {
     let mut out = [[false; 7]; 2];
     for p in 0..2 {
         let k = &b.keys[p];
-        if keys.just_pressed(k[CYCLE]) {
+        let held = |a: usize| keys.pressed(k[a]) || pads.pressed(p, a);
+        if keys.just_pressed(k[CYCLE]) || pads.just_pressed(p, CYCLE) {
             latch[p] = true;
         }
-        out[p] = [
-            keys.pressed(k[UP]),
-            keys.pressed(k[RIGHT]),
-            keys.pressed(k[DOWN]),
-            keys.pressed(k[LEFT]),
-            keys.pressed(k[BOMB]),
-            keys.pressed(k[FIRE]),
-            first && latch[p],
-        ];
+        out[p] = [held(UP), held(RIGHT), held(DOWN), held(LEFT), held(BOMB), held(FIRE), first && latch[p]];
         if first {
             latch[p] = false;
         }
@@ -650,6 +643,7 @@ pub fn og_system(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     bindings: Res<KeyBindings>,
+    pads: Res<crate::game::input::Pads>,
     flow: Res<Flow>,
     shot: Option<Res<ShotPlan>>,
     mut assets: ResMut<GameAssets>,
@@ -685,7 +679,7 @@ pub fn og_system(
                 let t = og.ticks as usize;
                 sc.og_inputs(t)
             } else {
-                slot_inputs(&keys, &bindings, &mut og.cycle_latch, i == 0)
+                slot_inputs(&keys, &bindings, &pads, &mut og.cycle_latch, i == 0)
             };
             let mut inputs = inputs;
             if og.copilot_flying() {

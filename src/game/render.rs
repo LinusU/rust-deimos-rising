@@ -462,6 +462,7 @@ use crate::game::menu::{MenuPointer, SectorHit, TitleItem, TITLE_ITEMS};
 /// cleared/game-over → credits using the retail `lgsp`/`cred` strings.
 pub fn flow_system(
     keys: Res<ButtonInput<KeyCode>>,
+    pads: Res<crate::game::input::Pads>,
     mut flow: ResMut<Flow>,
     mut og: NonSendMut<OgGame>,
     mut assets: ResMut<GameAssets>,
@@ -530,14 +531,21 @@ pub fn flow_system(
             a.adjust_volume(0.1);
         }
     }
-    let enter = keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::NumpadEnter);
+    // A pad drives the menus like the keyboard: D-pad or stick for the
+    // arrows, A or Start for Enter, B for Esc (a remake convenience; the
+    // original's menus took the mouse).
+    use crate::game::input::{BOMB, DOWN, FIRE, LEFT, RIGHT, UP};
+    let enter = keys.just_pressed(KeyCode::Enter)
+        || keys.just_pressed(KeyCode::NumpadEnter)
+        || pads.any_just_pressed(FIRE)
+        || pads.start;
     let space = keys.just_pressed(KeyCode::Space);
     let any = enter || space || pointer.clicked;
-    let up = keys.just_pressed(KeyCode::ArrowUp);
-    let down = keys.just_pressed(KeyCode::ArrowDown);
-    let left = keys.just_pressed(KeyCode::ArrowLeft);
-    let right = keys.just_pressed(KeyCode::ArrowRight);
-    let esc = keys.just_pressed(KeyCode::Escape);
+    let up = keys.just_pressed(KeyCode::ArrowUp) || pads.any_just_pressed(UP);
+    let down = keys.just_pressed(KeyCode::ArrowDown) || pads.any_just_pressed(DOWN);
+    let left = keys.just_pressed(KeyCode::ArrowLeft) || pads.any_just_pressed(LEFT);
+    let right = keys.just_pressed(KeyCode::ArrowRight) || pads.any_just_pressed(RIGHT);
+    let esc = keys.just_pressed(KeyCode::Escape) || pads.any_just_pressed(BOMB);
     // Set when a menu choice should play the button sound (perm sound 2).
     let mut click = false;
 
@@ -1130,6 +1138,7 @@ pub fn run(
         .insert_resource(flow)
         .insert_resource(HighScores::load())
         .insert_resource(crate::game::input::KeyBindings::load())
+        .insert_resource(crate::game::input::Pads::default())
         .insert_resource(MenuPointer::default())
         .insert_resource(demo)
 ;
@@ -1146,6 +1155,7 @@ pub fn run(
     app.add_systems(Startup, setup).add_systems(
         Update,
         (
+            crate::game::input::read_pads.run_if(|s: Option<Res<ShotPlan>>| s.is_none()),
             crate::game::menu::gather_pointer,
             flow_system,
             crate::game::ogplay::og_system,
