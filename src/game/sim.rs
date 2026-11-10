@@ -658,6 +658,8 @@ pub struct Sim {
     entity_scroll_pause: bool,
     /// Pixels per tick the world scrolls.
     pub scroll_speed: f32,
+    /// How far the map scrolled this tick (g_bgndVerticalScrollingThisFrame).
+    pub scroll_this_frame: f32,
     /// Level finished scrolling.
     pub level_complete: bool,
     /// Debug counters (hits landed / entities destroyed).
@@ -853,6 +855,7 @@ impl Sim {
             scroll_paused: false,
             entity_scroll_pause: false,
             scroll_speed: 1.0,
+            scroll_this_frame: 0.0,
             level_complete: false,
             stat_hits: 0,
             stat_kills: 0,
@@ -1880,6 +1883,7 @@ impl Sim {
 
         // --- G_Bgnd_Process: scroll, then the row spawns ---
         // sub_020280 runs it after the players and before G_EG_Process.
+        let scroll_before = self.scroll;
         // --- scrolling ---
         if !self.scroll_paused && !self.entity_scroll_pause && self.phase == Phase::Playing {
             self.scroll += self.scroll_speed;
@@ -2059,6 +2063,9 @@ impl Sim {
             }
         }
 
+
+        // g_bgndVerticalScrollingThisFrame.
+        self.scroll_this_frame = self.scroll - scroll_before;
 
         // --- entities ---
         self.step_entities(assets);
@@ -2947,9 +2954,17 @@ impl Sim {
                 }
             }
             // Position integration (G_GameObject::MoveAndCheckPosition):
-            // m_x += m_prevX; m_y += m_prevY.
+            // m_y += scrolled this frame, unless the object is 'air '-class
+            // (m_some19, set for every non-ground unit); then m_x += m_prevX;
+            // m_y += m_prevY. Our world y is fixed to the map, so ground
+            // units need nothing and air units hold their screen y.
             {
+                let air = !assets.units.get(&self.entities[i].unit).map(|d| d.is_ground_based).unwrap_or(false);
+                let scrolled = self.scroll_this_frame;
                 let e = &mut self.entities[i];
+                if air {
+                    e.pos.y += scrolled;
+                }
                 e.pos += e.vel;
                 if e.vel.length_squared() > 0.0001 {
                     e.heading = vector_to_heading(e.vel);
