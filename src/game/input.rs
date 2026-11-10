@@ -59,19 +59,20 @@ impl Default for KeyBindings {
     fn default() -> Self {
         KeyBindings {
             keys: [
-                // Player 1: arrows to move, Z / X / C for air weapon,
+                // The Windows exe's defaults (U_Prefs, tables written at VA
+                // 0x408f12 and 0x408f47, read by G_Input_CachePlayerInputs).
+                // Player 1: arrows, LCtrl / LAlt / LShift for air weapon,
                 // ground weapon, weapon select.
                 [
                     KeyCode::ArrowUp,
                     KeyCode::ArrowDown,
                     KeyCode::ArrowLeft,
                     KeyCode::ArrowRight,
-                    KeyCode::KeyZ,
-                    KeyCode::KeyX,
-                    KeyCode::KeyC,
+                    KeyCode::ControlLeft,
+                    KeyCode::AltLeft,
+                    KeyCode::ShiftLeft,
                 ],
-                // Player 2: the Windows exe's defaults (table written at
-                // VA 0x408f47): Numpad 8/5/4/6, End, Delete, PageDown.
+                // Player 2: KPad 8/5/4/6, End, Delete, PgDn.
                 [
                     KeyCode::Numpad8,
                     KeyCode::Numpad5,
@@ -241,10 +242,10 @@ mod tests {
     #[test]
     fn binding_a_used_key_swaps_it() {
         let mut b = KeyBindings::default();
-        // X is player 1's ground weapon; give it to the air weapon.
-        b.bind(0, FIRE, KeyCode::KeyX);
-        assert_eq!(b.keys[0][FIRE], KeyCode::KeyX);
-        assert_eq!(b.keys[0][BOMB], KeyCode::KeyZ);
+        // LAlt is player 1's ground weapon; give it to the air weapon.
+        b.bind(0, FIRE, KeyCode::AltLeft);
+        assert_eq!(b.keys[0][FIRE], KeyCode::AltLeft);
+        assert_eq!(b.keys[0][BOMB], KeyCode::ControlLeft);
     }
 
     #[test]
