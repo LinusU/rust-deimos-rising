@@ -63,13 +63,22 @@ pub struct G {
     /// MSL `rand` state (per-thread data in the original).
     pub rand_state: u32,
     pub host: Box<dyn Host>,
-    /// Optional trace of every draw, for the film oracle.
-    pub rand_log: Option<Vec<(u32, &'static str)>>,
+    /// Optional trace for the film oracle: `R` lines for rand() draws
+    /// (new state, caller) plus whatever `trace` records.
+    pub rand_log: Option<Vec<String>>,
 }
 
 impl G {
     pub fn new(m: Mem, host: Box<dyn Host>) -> G {
         G { m, rand_state: 1, host, rand_log: None }
+    }
+
+    /// Record an oracle trace line (only while tracing).
+    pub fn trace(&mut self, f: impl FnOnce(&Self) -> String) {
+        if self.rand_log.is_some() {
+            let line = f(self);
+            self.rand_log.as_mut().unwrap().push(line);
+        }
     }
 
     /// `srand` (0x461620).
@@ -82,7 +91,9 @@ impl G {
     pub fn rand(&mut self) -> i32 {
         self.rand_state = self.rand_state.wrapping_mul(0x41c64e6d).wrapping_add(0x3039);
         if let Some(log) = self.rand_log.as_mut() {
-            log.push((self.rand_state, std::panic::Location::caller().file()));
+            let l = std::panic::Location::caller();
+            let f = l.file().rsplit('/').next().unwrap_or("");
+            log.push(format!("R {:08x} {}:{}", self.rand_state, f, l.line()));
         }
         ((self.rand_state >> 16) & 0x7fff) as i32
     }

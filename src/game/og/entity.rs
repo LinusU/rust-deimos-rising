@@ -269,6 +269,12 @@ pub fn G_Entity_ChangeToWeaponPowerupReleaseState(g: &mut G, this: u32, a0: i32)
 /// The frame data (`+0x4e`) is a token, see `sprite_get_ptr_to_sprite_frame`.
 pub fn G_Entity_ChangeState(g: &mut G, this: u32, a0: bool, a1: u32, a2: i32, a3: u32, a4: u32) {
     let sp = g.m.sp;
+    g.trace(|g| {
+        let def = g.m.r32(this + 0x8a);
+        let unit = g.m.bytes(def + 4, 4).to_vec();
+        format!("C {} force={} name='{}' at=({:.2},{:.2})", String::from_utf8_lossy(&unit), a0 as u8,
+            String::from_utf8_lossy(g.m.cstr(a1)), g.m.rf32(this), g.m.rf32(this + 4))
+    });
     change_state_impl(g, this, a0, a1, a2, a3, a4);
     g.m.pop_to(sp);
 }

@@ -91,11 +91,23 @@ pub fn startup(exe: &[u8], paks: &Path) -> Result<G, String> {
     Ok(g)
 }
 
+/// `OG_ENTS=t1,t2,...`: dump raw entities at the start of those ticks.
+fn ents_dump_tick(t: i32) -> bool {
+    static TICKS: std::sync::OnceLock<Vec<i32>> = std::sync::OnceLock::new();
+    TICKS
+        .get_or_init(|| {
+            std::env::var("OG_ENTS")
+                .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                .unwrap_or_default()
+        })
+        .contains(&t)
+}
+
 /// Writes the `R` lines for the draws since the last call.
 fn flush_rand(g: &mut G, out: &mut dyn Write) {
     if let Some(log) = g.rand_log.as_mut() {
-        for (state, _) in log.drain(..) {
-            let _ = writeln!(out, "R {state:08x}");
+        for line in log.drain(..) {
+            let _ = writeln!(out, "{line}");
         }
     }
 }
@@ -215,6 +227,19 @@ pub fn play_film(
         let st = g.m.ri32(p0 + 0xba);
         let t = g.m.ri32(GAME_TIME);
         let _ = writeln!(out, "T {t} ({x:.4},{y:.4}) score={score} st={st}");
+        if ents_dump_tick(t) {
+            // Same walk as tools/oracle/entraw.py: groups, then children.
+            let groups = list::objects(&g.m, g.m.r32(0x4e0d70));
+            for (gi, grp) in groups.iter().enumerate() {
+                let kids = list::objects(&g.m, g.m.r32(grp + 0xa6));
+                for (ci, e) in kids.iter().enumerate() {
+                    let def = g.m.r32(e + 0x8a);
+                    let unit = String::from_utf8_lossy(g.m.bytes(def + 4, 4)).into_owned();
+                    let hex: String = g.m.bytes(*e, 0x1e4).iter().map(|b| format!("{b:02x}")).collect();
+                    let _ = writeln!(out, "E {t} {gi} {ci} {unit} {hex}");
+                }
+            }
+        }
 
         // Process_StartFrame says: run a frame.
         if g.m.r8(FLAG_4854) == 0 {

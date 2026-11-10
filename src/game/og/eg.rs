@@ -547,6 +547,9 @@ pub fn sub_41b820(g: &mut G, id: u32, arg: i32, flag: u8) {
 /// `G_EG_RequestSpawn` (0x417a90).
 pub fn G_EG_RequestSpawn(g: &mut G, a0: u32, a1: u32, a2: u32) {
     let req = a0;
+    g.trace(|g| {
+        format!("S {} at=({:.2},{:.2})", String::from_utf8_lossy(g.m.bytes(req, 4)), g.m.rf32(req + 4), g.m.rf32(req + 8))
+    });
     if g.m.r32(req) == NONE {
         // U_Assert_DataFailure("inRequestPtr->id not_eq kG_GameObject_ID_None")
     }
