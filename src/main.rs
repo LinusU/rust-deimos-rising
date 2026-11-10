@@ -609,8 +609,77 @@ fn og_film(args: &[String], pos: usize) {
     }
 }
 
+/// `--og-live-test <ticks>`: a 1-player game at level 1 on the ported game
+/// with no input; per tick the number of draw items and player 0's state.
+fn og_live_test(args: &[String], pos: usize) {
+    let ticks: u32 = args.get(pos + 1).and_then(|s| s.parse().ok()).expect("--og-live-test needs a tick count");
+    let dir = data_dir();
+    let exe_path = [dir.join("../../DeimosRising.exe"), PathBuf::from("retail/DeimosRising.exe")]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("DeimosRising.exe not found next to the data directory");
+    let exe = std::fs::read(exe_path).expect("read exe");
+    let mut s = game::og::session::Session::new(&exe, &dir).expect("session");
+    let seed: u32 = arg_value(args, "--seed").and_then(|v| v.parse().ok()).unwrap_or(12345);
+    let level: i32 = arg_value(args, "--level").and_then(|v| v.parse().ok()).unwrap_or(1);
+    s.start_game(1, level, seed).expect("start_game");
+    println!(
+        "start: level {} items={} texts={} bg scroll_y={} view={}x{} buffer={}x{}",
+        s.level_number(),
+        s.frame().items.len(),
+        s.frame().texts.len(),
+        s.frame().background.scroll_y,
+        s.frame().background.view_w,
+        s.frame().background.view_h,
+        s.frame().background.width,
+        s.frame().background.height
+    );
+    for _ in 0..ticks {
+        if !s.is_playing() {
+            println!("ended: {:?}", s.end_reason());
+            break;
+        }
+        let t = s.game_time();
+        if args.iter().any(|a| a == "--god") {
+            let p0 = s.g.m.r32(game::og::game::PLAYERS);
+            game::og::player::G_Player_Shields_SetPercentage(&mut s.g, p0, 100.0);
+        }
+        s.tick([[false; 7]; 2]);
+        let p = s.player(0);
+        let f = s.frame();
+        println!(
+            "t={} items={} texts={} particles={} p0: state={} pos=({:.1},{:.1}) score={} lives={} shields={:.1} money={} mult={} scroll_y={}",
+            t,
+            f.items.len(),
+            f.texts.len(),
+            f.particles.len(),
+            p.state,
+            p.x,
+            p.y,
+            p.score,
+            p.lives,
+            p.shields_pct,
+            p.money,
+            p.multiplier,
+            f.background.scroll_y
+        );
+        if args.iter().any(|a| a == "--items") {
+            for it in &f.items {
+                println!("    {:?}", it);
+            }
+            for it in &f.texts {
+                println!("    {:?}", it);
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(pos) = args.iter().position(|a| a == "--og-live-test") {
+        og_live_test(&args, pos);
+        return;
+    }
     if args.iter().any(|a| a == "--dump-data") {
         dump_data();
         return;
