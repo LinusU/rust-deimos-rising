@@ -179,50 +179,73 @@ pub fn key_from_name(name: &str) -> Option<KeyCode> {
     BINDABLE.iter().copied().find(|k| format!("{:?}", k) == name)
 }
 
-/// Short name for a key, as shown on the Controls screen.
+/// Name of a key on the Controls screen: the Windows exe's key name
+/// table (VA 0x503830, by scan code). It names scan code 0x1a, the `[`
+/// key, "]" and 0x1b "[", and so does this. The Mac's Command keys have
+/// no Windows scan code.
 pub fn key_label(key: KeyCode) -> String {
-    let name = format!("{:?}", key);
-    let fixed = match key {
-        KeyCode::ArrowUp => "Up",
-        KeyCode::ArrowDown => "Down",
-        KeyCode::ArrowLeft => "Left",
-        KeyCode::ArrowRight => "Right",
-        KeyCode::ShiftLeft => "Left Shift",
-        KeyCode::ShiftRight => "Right Shift",
-        KeyCode::ControlLeft => "Left Ctrl",
-        KeyCode::ControlRight => "Right Ctrl",
-        KeyCode::AltLeft => "Left Alt",
-        KeyCode::AltRight => "Right Alt",
-        KeyCode::SuperLeft => "Left Cmd",
-        KeyCode::SuperRight => "Right Cmd",
-        KeyCode::PageUp => "Page Up",
-        KeyCode::PageDown => "Page Down",
-        KeyCode::Comma => ",",
-        KeyCode::Period => ".",
-        KeyCode::Slash => "/",
-        KeyCode::Semicolon => ";",
-        KeyCode::Quote => "'",
-        KeyCode::BracketLeft => "(",
-        KeyCode::BracketRight => ")",
-        KeyCode::Backslash => "\\",
-        KeyCode::Minus => "-",
-        KeyCode::Equal => "=",
-        KeyCode::Backquote => "`",
+    use KeyCode::*;
+    let name = match key {
+        Escape => "Escape",
+        Minus => "-",
+        Equal => "=",
+        Backspace => "BakSpc",
+        Tab => "Tab",
+        BracketLeft => "]",
+        BracketRight => "[",
+        Semicolon => ";",
+        Quote => "'",
+        Backquote => "`",
+        Backslash => "\\",
+        Comma => ",",
+        Period => ".",
+        Slash => "/",
+        Enter => "Enter",
+        ControlLeft => "LCtrl",
+        ControlRight => "RCtrl",
+        ShiftLeft => "LShift",
+        ShiftRight => "RShift",
+        AltLeft => "LAlt",
+        AltRight => "RAlt",
+        SuperLeft => "LCmd",
+        SuperRight => "RCmd",
+        Space => "Space",
+        CapsLock => "CapLck",
+        NumLock => "NumLck",
+        ScrollLock => "ScrLck",
+        Pause => "Pause",
+        ArrowUp => "Up",
+        ArrowDown => "Down",
+        ArrowLeft => "Left",
+        ArrowRight => "Right",
+        Insert => "Insert",
+        Delete => "Delete",
+        Home => "Home",
+        End => "End",
+        PageUp => "PgUp",
+        PageDown => "PgDn",
+        PrintScreen => "PrtScn",
+        NumpadMultiply => "KPad*",
+        NumpadSubtract => "KPad-",
+        NumpadAdd => "KPad+",
+        NumpadDecimal => "KPad.",
+        NumpadDivide => "KPad/",
+        NumpadEnter => "KPdEnt",
         _ => "",
     };
-    if !fixed.is_empty() {
-        return fixed.to_string();
+    if !name.is_empty() {
+        return name.to_string();
     }
-    if let Some(letter) = name.strip_prefix("Key") {
-        return letter.to_string();
+    let debug = format!("{:?}", key);
+    for prefix in ["Key", "Digit"] {
+        if let Some(rest) = debug.strip_prefix(prefix) {
+            return rest.to_string();
+        }
     }
-    if let Some(digit) = name.strip_prefix("Digit") {
-        return digit.to_string();
+    if let Some(rest) = debug.strip_prefix("Numpad") {
+        return format!("KPad{rest}");
     }
-    if let Some(rest) = name.strip_prefix("Numpad") {
-        return format!("Num {}", rest);
-    }
-    name
+    debug
 }
 
 #[cfg(test)]
@@ -246,6 +269,14 @@ mod tests {
         b.bind(0, FIRE, KeyCode::AltLeft);
         assert_eq!(b.keys[0][FIRE], KeyCode::AltLeft);
         assert_eq!(b.keys[0][BOMB], KeyCode::ControlLeft);
+    }
+
+    #[test]
+    fn labels_use_the_original_names() {
+        assert_eq!(key_label(KeyCode::ControlLeft), "LCtrl");
+        assert_eq!(key_label(KeyCode::Numpad8), "KPad8");
+        assert_eq!(key_label(KeyCode::PageDown), "PgDn");
+        assert_eq!(key_label(KeyCode::KeyQ), "Q");
     }
 
     #[test]
