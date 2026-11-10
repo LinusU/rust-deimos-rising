@@ -505,6 +505,18 @@ fn main() {
         og_trace(&args, Some(ticks));
         return;
     }
+    if let Some(out) = arg_value(&args, "--og-png") {
+        let film = arg_value(&args, "--film").map(|s| u32::from_str_radix(&s, 16).expect("--film takes a hex resource id")).expect("--og-png needs --film");
+        let frames: Vec<u32> = arg_value(&args, "--at").map(|s| s.split(',').filter_map(|f| f.trim().parse().ok()).collect()).unwrap_or_default();
+        let dir = data_dir();
+        let mut a = assets::GameAssets::open(&dir).expect("open retail data");
+        a.load_all_data();
+        if let Err(e) = game::ogplay::film_pngs(a, dir, film, &frames, std::path::Path::new(&out)) {
+            eprintln!("og-png: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--trace") {
         og_trace(&args, None);
         return;

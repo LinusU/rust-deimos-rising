@@ -748,3 +748,27 @@ pub fn og_system(
         og.dirty = false;
     }
 }
+
+/// `--og-png <dir> --film <id> --at f1,f2,...`: replays a film without a
+/// window and writes the composited screen of each listed frame to
+/// `<dir>/frameNNNNN.png`. Frames count like `--shot --at` (the original's
+/// game tick N is frame N+30); same pixels as the window, no GPU involved.
+pub fn film_pngs(mut assets: GameAssets, paks: PathBuf, film: ResId, frames: &[u32], out_dir: &std::path::Path) -> Result<(), String> {
+    let bytes = assets.set.read_raw(pak::Tag::Film, film).ok_or("film not found")?;
+    let mut og = OgGame::new(paks)?;
+    og.start_film(film, &bytes)?;
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let last = frames.iter().copied().max().unwrap_or(0);
+    let mut buf = Vec::new();
+    while og.ticks < last && og.session.as_ref().map(|s| s.is_playing()).unwrap_or(false) {
+        og.tick(&mut assets, [[false; 7]; 2]);
+        if frames.contains(&og.ticks) {
+            render(&mut og, &mut assets, &mut buf);
+            let path = out_dir.join(format!("frame{:05}.png", og.ticks));
+            image::save_buffer(&path, &buf, SCREEN_W as u32, SCREEN_H as u32, image::ExtendedColorType::Rgba8)
+                .map_err(|e| e.to_string())?;
+            println!("{}", path.display());
+        }
+    }
+    Ok(())
+}
