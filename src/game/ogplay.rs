@@ -625,8 +625,9 @@ fn slot_inputs(keys: &ButtonInput<KeyCode>, b: &KeyBindings, latch: &mut [bool; 
     out
 }
 
-/// Steps the port (one tick per 1/60 s; exactly one per frame in
-/// screenshot mode) and keeps the screen image current.
+/// Steps the port (at the original's capped frame rate, 30 ticks a second;
+/// exactly one per frame in screenshot mode) and keeps the screen image
+/// current.
 #[allow(clippy::too_many_arguments)]
 pub fn og_system(
     mut commands: Commands,
@@ -653,7 +654,11 @@ pub fn og_system(
         let n = if shot.is_some() {
             1
         } else {
-            og.acc += time.delta_secs() * 60.0;
+            // G_GameInterface::Draw waits `FPS_Delay` (perm float 0x21 = 2)
+            // ticks of the 60 Hz U_App clock between frames, and each frame
+            // runs one game tick: 30 ticks a second.
+            let delay = crate::game::render::pf(&assets, 0x21).max(1.0);
+            og.acc += time.delta_secs() * 60.0 / delay;
             let n = og.acc.floor().min(8.0);
             og.acc -= n;
             n as u32
