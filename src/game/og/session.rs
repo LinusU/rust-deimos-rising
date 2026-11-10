@@ -77,6 +77,8 @@ pub struct Session {
     /// byte 2) of `G_Game_Play`.
     flags: u32,
     started: bool,
+    /// A film replay (`start_film`): the film supplies the inputs.
+    replay: bool,
     frame: FrameView,
 }
 
@@ -90,21 +92,12 @@ impl Session {
     pub fn new(exe: &[u8], paks: &Path) -> Result<Session, String> {
         let mut g = super::play::startup(exe, paks)?;
         let flags = g.m.alloc(4);
-        Ok(Session { g, film: 0, level: 0, flags, started: false, frame: FrameView::default() })
+        Ok(Session { g, film: 0, level: 0, flags, started: false, replay: false, frame: FrameView::default() })
     }
 
-    /// `G_Game_Play` up to the loop, for a new live game: `players` is the
-    /// game type (1 or 2), `first_level` the 1-based position in the level
-    /// list, `seed` what the original takes from the tick count.
-    pub fn start_game(&mut self, players: i32, first_level: i32, seed: u32) -> Result<(), String> {
+    /// The part of `G_Game_Play` before the film and level are chosen.
+    fn reset_state(&mut self) {
         let g = &mut self.g;
-        if !(1..=2).contains(&players) {
-            return Err(format!("players must be 1 or 2, not {players}"));
-        }
-        let n = level::G_Level_GetNumInLevelList(g);
-        if first_level < 1 || first_level > n {
-            return Err(format!("level {first_level} is not in the level list (1..={n})"));
-        }
         // startTime = U_Utils_RandomInt(0x190, 0x7d0) (recording path only;
         // still a draw), gRegistration.Is().
         let _start_time = g.random_int(0x190, 0x7d0);
@@ -146,6 +139,22 @@ impl Session {
         g.m.clear(self.flags, 4);
         self.film = g.m.alloc(FILM_SIZE);
         G_Film_G_Film(g, self.film);
+    }
+
+    /// `G_Game_Play` up to the loop, for a new live game: `players` is the
+    /// game type (1 or 2), `first_level` the 1-based position in the level
+    /// list, `seed` what the original takes from the tick count.
+    pub fn start_game(&mut self, players: i32, first_level: i32, seed: u32) -> Result<(), String> {
+        if !(1..=2).contains(&players) {
+            return Err(format!("players must be 1 or 2, not {players}"));
+        }
+        let n = level::G_Level_GetNumInLevelList(&mut self.g);
+        if first_level < 1 || first_level > n {
+            return Err(format!("level {first_level} is not in the level list (1..={n})"));
+        }
+        self.replay = false;
+        self.reset_state();
+        let g = &mut self.g;
         // The film id 0 of the start struct: not a replay, game mode 0.
         g.m.w32(GAME_MODE, 0);
         // The struct's level id / game type; recording starts here in the
@@ -185,6 +194,65 @@ impl Session {
         Ok(())
     }
 
+    /// `G_Game_Play` up to the loop for a replay of film `film_id` (the
+    /// resource's bytes in `film`), as `play::play_film` sets it up. Ticks
+    /// then take their inputs from the film; `tick`'s argument is ignored.
+    pub fn start_film(&mut self, film_id: u32, film: &[u8]) -> Result<(), String> {
+        self.replay = true;
+        self.started = false;
+        self.reset_state();
+        let g = &mut self.g;
+        let sp = g.m.sp;
+        let out_level = g.m.alloca(4);
+        g.m.w32(out_level, NONE);
+        g.m.w32(GAME_MODE, 1);
+        let film_obj = self.film;
+        if !G_Film_Load(g, film_obj, film_id as i32, Some(film)) {
+            g.m.pop_to(sp);
+            return Err("film failed to load".into());
+        }
+        let out_seed = g.m.alloca(4);
+        G_Film_StartPlayback(g, film_obj, out_level, 0x4e483e, out_seed);
+        let seed = g.m.r32(out_seed);
+        g.srand(seed);
+        let level_id = g.m.ri32(out_level);
+        g.m.pop_to(sp);
+        let level1 = g.m.alloc(LEVEL_SIZE);
+        level::G_Level_LoadByID(g, level_id, level1, 0);
+
+        g.m.w8(PLAYING, 1);
+        g.m.w8(NO_PLAYER_IN_GAME, 0);
+        g.m.w8(MONEY_DONE, 0);
+        g.m.w8(WAITING_FOR_LEVEL_END, 0);
+        g.m.wi32(LEVEL_ID, level_id);
+        let level_num = level::G_Level_Get1BasedNumForLevelID(g, level_id);
+        if level_num < 1 {
+            return Err(format!("film level {level_id:#x} is not in the level list"));
+        }
+        g.m.wi32(CURRENT_LEVEL, level_num);
+        let level2 = g.m.alloc(LEVEL_SIZE);
+        level::G_Level_LoadByLevelListNumber(g, level_num, level2, 0);
+        for i in 0..2u32 {
+            let p = g.m.r32(PLAYERS + i * 4);
+            let ty = g.m.ri32(0x4e483e);
+            let time = g.m.ri32(GAME_TIME);
+            G_Player_SetUpAtNewGameStart(g, p, i as i32, ty, time, level_num);
+        }
+        G_Input_AssumeControl(g, true);
+        sub_41fc80(g, true, level2 as i32);
+        self.level = level2;
+        self.started = true;
+        g.live_inputs = [0; 14];
+        g.draw_sink = Some(Vec::new());
+        self.frame = view::build_frame(g, level2);
+        Ok(())
+    }
+
+    /// The running game is a film replay.
+    pub fn is_replay(&self) -> bool {
+        self.replay
+    }
+
     /// One pass of `G_Game_Play`'s loop. `inputs[player]` is [up, right,
     /// down, left, ground weapon, air weapon, cycle]. Does nothing when the
     /// game is not running.
@@ -209,10 +277,24 @@ impl Session {
         }
         let proc_a = self.flags;
         let proc_c = self.flags + 2;
-        sub_420280(g, proc_a, 0, proc_c, self.film);
-        sub_4207f0_live(g, self.level);
-        let t = g.m.ri32(GAME_TIME).wrapping_add(1);
-        g.m.wi32(GAME_TIME, t);
+        if self.replay {
+            // `play_film`'s loop body: a replay stops when the money
+            // counters are done or the film is.
+            sub_420280(g, proc_a, 1, proc_c, self.film);
+            if g.m.r8(MONEY_DONE) != 0 {
+                g.m.w8(PLAYING, 0);
+            }
+            let t = g.m.ri32(GAME_TIME).wrapping_add(1);
+            g.m.wi32(GAME_TIME, t);
+            if G_Film_IsFinished(g, self.film) {
+                g.m.w8(PLAYING, 0);
+            }
+        } else {
+            sub_420280(g, proc_a, 0, proc_c, self.film);
+            sub_4207f0_live(g, self.level);
+            let t = g.m.ri32(GAME_TIME).wrapping_add(1);
+            g.m.wi32(GAME_TIME, t);
+        }
         self.frame = view::build_frame(g, self.level);
     }
 

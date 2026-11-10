@@ -34,6 +34,16 @@ use super::umath::ftol;
 use super::unitdefs::G_UnitDef_ResetResourceLoadingList;
 use crate::assets::GameAssets;
 
+/// While set, `U_Sound_Play` calls are queued for [`take_sounds`] (a
+/// renderer's audio); headless runs leave it off.
+pub static SOUND_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SOUNDS: std::sync::Mutex<Vec<(u32, i32, f32)>> = std::sync::Mutex::new(Vec::new());
+
+/// The sounds started since the last call: (`soun` id, volume, pitch).
+pub fn take_sounds() -> Vec<(u32, i32, f32)> {
+    std::mem::take(&mut *SOUNDS.lock().unwrap())
+}
+
 /// `sPriv_Info.playerPtrs[2]` lives at `PLAYERS`; the registration number
 /// `sub_4589c0` tests.
 const REGISTRATION: u32 = 0x52b688;
@@ -81,6 +91,14 @@ impl Host for AssetHost {
     }
     fn has_image(&self, id: u32) -> bool {
         self.sprite_num_frames(id) > 0
+    }
+    fn sound_play(&mut self, id: u32, volume: i32, pitch: f32) {
+        if SOUND_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut q = SOUNDS.lock().unwrap();
+            if q.len() < 256 {
+                q.push((id, volume, pitch));
+            }
+        }
     }
     fn image_size(&self, id: u32) -> Option<(i32, i32)> {
         let mut a = self.assets.borrow_mut();
