@@ -188,6 +188,8 @@ pub struct Entity {
     pub state_time: u32,
     /// Rolled on_timer delay for the current state (ticks).
     pub state_timer_target: u32,
+    /// Game time passed to the last ChangeState (entity +0x9a).
+    pub state_start: u32,
     /// Ticks since the entity spawned.
     pub age: u32,
     /// Current animation frame.
@@ -1296,6 +1298,7 @@ impl Sim {
             state: state_idx,
             state_time: 0,
             state_timer_target: 0,
+            state_start: 0,
             age: 0,
             // Placeholder — ChangeState(true) below rolls the initial
             // frame (or derives it from heading for editor-heading units).
@@ -2705,7 +2708,7 @@ impl Sim {
             // pass — it refreshes state and falls through to Animate /
             // ProcessRules / movement / SpawnControl this same tick; only
             // Delete/Destroy (dead) short-circuit via nextChild.
-            if state.on_timer_target_reached(&self.entities[i]) {
+            if state.on_timer_target_reached(&self.entities[i], self.game_time) {
                 self.apply_state_change(i, &state.on_timer_change_to, assets);
                 if self.entities[i].dead {
                     continue;
@@ -3024,6 +3027,7 @@ impl Sim {
         let epos = self.entities[idx].pos;
         let e = &mut self.entities[idx];
         e.state = ns;
+        e.state_start = self.game_time;
         let state_idx = e.state;
         // entity +0x144[state]: cumulative entry count for on_counter.
         if e.state_entry_count.len() < def.states.len() {
@@ -5347,17 +5351,10 @@ fn player_half_extents(assets: &GameAssets, p: &Player) -> (f32, f32) {
 }
 
 impl UnitState {
-    /// Whether the rolled on_timer delay has been reached.
-    ///
-    /// Retail fires on `inArg == entryTime + duration` — i.e. `duration`
-    /// frames AFTER the state-entry frame, so the entry frame itself is a
-    /// free processing pass (its spawn-set volley runs before any delete).
-    /// `state_time` counts processed ticks from 0, so `> target` lands on
-    /// processed-frame #(target+1), matching that absolute-time check.
-    fn on_timer_target_reached(&self, e: &Entity) -> bool {
-        (self.on_timer_min > 0 || self.on_timer_max > 0)
-            && e.state_timer_target > 0
-            && e.state_time > e.state_timer_target
+    /// G_EG_Process (0x418663): the on-timer fires on the one pass whose
+    /// game time equals the state's start time plus the rolled delay.
+    fn on_timer_target_reached(&self, e: &Entity, now: u32) -> bool {
+        now as i64 == e.state_start as i64 + e.state_timer_target as i64
     }
 }
 
