@@ -38,9 +38,16 @@ pub fn G_Input_Clear(g: &mut G) {
 
 /// `void __cdecl G_Input_CachePlayerInputs(void)` — 0x425bd0, 896 bytes, decomp: matching. 
 pub fn G_Input_CachePlayerInputs(g: &mut G) {
-    // Keyboard and joystick polling (U_Prefs key codes, KeyboardIsPressed,
-    // JoystickReadButtons) is not ported: the host has no input devices and
-    // the films supply the inputs, so the cache stays as G_Input_Clear left it.
+    // The original polls the keyboard and joystick (U_Prefs key codes,
+    // KeyboardIsPressed, JoystickReadButtons) and sets a byte of
+    // `g_inputCached` to 1 per pressed control. Here the host fills
+    // `g.live_inputs` (all zero during film replays, so the cache stays as
+    // G_Input_Clear left it) and the pressed controls are copied over.
+    for i in 0..14u32 {
+        if g.live_inputs[i as usize] != 0 {
+            g.m.w8(CACHED + i, 1);
+        }
+    }
 }
 
 /// `void __cdecl G_Input_GetCachedPlayerInputs(enum G_Game_PlayerNum, struct G_Input_PlayerInputs *)` — 0x425f50, 128 bytes, decomp: matching. 

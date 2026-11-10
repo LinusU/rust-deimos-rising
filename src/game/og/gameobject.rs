@@ -1,6 +1,7 @@
 //! Port of the original's gameobject module (G_GameObject, 0x423e30..0x424710).
-//! The drawing functions (`Draw`, `Priv_Draw`, `Priv_DrawShadow`) are not
-//! ported: the renderer draws from the object's fields.
+//! `Draw`, `Priv_Draw` and `Priv_DrawShadow` are ported down to the sprite
+//! settings they hand to `U_Sprite_RenderLists_Add`, which records them
+//! (view.rs); they do nothing unless `g.draw_sink` is set (live play).
 #![allow(non_snake_case, unused_variables, unused_mut, clippy::all)]
 
 use super::bgnd::G_Bgnd_GetVerticalScrollingThisFrame;
@@ -389,5 +390,245 @@ pub fn G_GameObject_MoveAndCheckPosition(g: &mut G, this: u32, a0: i32, a1: bool
     ret
 }
 
-// Draw, Priv_Draw and Priv_DrawShadow (0x424710..) are rendering and are not
-// ported: the renderer draws from the object's fields.
+// ---------------------------------------------------------------------
+// Drawing: the settings handed to U_Sprite_RenderLists_Add (view.rs).
+// ---------------------------------------------------------------------
+
+use super::bgnd::{G_Bgnd_GetSideScrolling, G_Bgnd_GetUpdateRectTop};
+use super::game::{G_Game_GameTime_Get, G_Game_GetShadowsOption};
+use super::view::{self, DrawKind, ObjInfo, Settings};
+
+/// `G_GameObject::Draw` — 0x424710. Draws when the visibility is not below
+/// or equal to 0: the shadow (if `+0x38` and the shadows option) then the
+/// sprite (if `+0x37`).
+pub fn G_GameObject_Draw(g: &mut G, this: u32) {
+    if g.draw_sink.is_none() {
+        return;
+    }
+    let vis = g.m.rf32(this + 0x62) as f64;
+    let zero = g.m.rf64(0x4e59b0);
+    if vis < zero || vis == zero {
+        return;
+    }
+    if g.m.rb(this + 0x38) && G_Game_GetShadowsOption(g) {
+        G_GameObject_Priv_DrawShadow(g, this);
+    }
+    if g.m.rb(this + 0x37) {
+        G_GameObject_Priv_Draw(g, this);
+    }
+}
+
+/// The render list layer for a material tag (`+0x4a`), as the switch at
+/// 0x4248f0 maps it; None for tags it does not list.
+fn layer_for_tag(tag: u32) -> Option<i32> {
+    Some(match tag {
+        0x20647568 => 0xf,         // 'hud '
+        0x65776c70 => 9,           // 'plwe'
+        0x66656c70 => 0xc,         // 'plef'
+        0x68736c70 => 0xb,         // 'plsh'
+        0x69686961 => 8,           // 'aihi'
+        0x69687267 => 5,           // 'grhi'
+        0x69756c70 => 0xd,         // 'plui'
+        0x6f6c6961 => 7,           // 'ailo'
+        0x6f6d7461 => 0xe,         // 'atmo'
+        0x756f7267 => 3,           // 'grou'
+        0x79616c70 => 0xa,         // 'play'
+        _ => return None,
+    })
+}
+
+/// `G_GameObject::Priv_Draw` — 0x424760: the sprite, the hit flash and the
+/// glow.
+pub fn G_GameObject_Priv_Draw(g: &mut G, this: u32) {
+    let terrain = g.m.rb(this + 0x36);
+    let mut hud = 0i32;
+    let mut rect_top = 0i32;
+    if terrain {
+        hud = 0x20;
+        rect_top = G_Bgnd_GetUpdateRectTop(g);
+    }
+    let mut side = 0i32;
+    if g.m.rb(this + 0x18) && !terrain {
+        side = G_Bgnd_GetSideScrolling(g);
+    }
+    let mut s = Settings::template(g);
+    s.frame_data = g.m.r32(this + 0x4e);
+    s.sprite = g.m.r32(this + 0x1c);
+    s.frame = g.m.ri32(this + 0x20);
+    s.x = ftol(g.m.rf32(this) as f64).wrapping_sub(side).wrapping_add(hud);
+    s.y = ftol(g.m.rf32(this + 4) as f64).wrapping_add(rect_top);
+    s.scale = g.m.rf32(this + 0x7a);
+    s.clip = [g.m.ri32(this + 0x3a), g.m.ri32(this + 0x3e), g.m.ri32(this + 0x42), g.m.ri32(this + 0x46)];
+    s.direct = g.m.r8(this + 0x35) != 0;
+    if !terrain {
+        let mut tag = g.m.r32(this + 0x4a);
+        if tag == 0 || tag == NONE {
+            g.m.w32(this + 0x4a, 0x61666564);
+            tag = 0x61666564;
+        }
+        if tag == 0x61666564 {
+            s.layer = if g.m.r8(this + 0x19) != 0 { 7 } else { 3 };
+        } else if let Some(l) = layer_for_tag(tag) {
+            s.layer = l;
+        }
+    } else {
+        let time = G_Game_GameTime_Get(g);
+        if time > g.m.ri32(this + 0x86) {
+            s.layer = 1;
+            s.flags |= 8;
+            s.clip = view::bg_buffer_rect(g);
+            g.m.wi32(this + 0x86, time);
+        }
+    }
+    let vis = g.m.rf32(this + 0x62) as f64;
+    if !(vis == g.m.rf64(0x4e59c0)) {
+        s.flags |= 1;
+        let pct = ftol(vis);
+        s.color = view::visibility_to_blend(g, pct);
+    }
+    let info = view::obj_info(g, this);
+    if g.m.r8(this + 0x52) == 0 {
+        view::render_lists_add(g, &s, DrawKind::Body, info);
+    }
+    // The hit flash.
+    let flash_pct = g.m.rf32(this + 0x54) as f64;
+    if flash_pct > g.m.rf64(0x4e59b0) {
+        let t1 = ((flash_pct / g.m.rf64(0x4e59c0)) * g.m.rf64(0x4e59c8)) as f32;
+        let k32 = g.m.rf32(0x4e59d0) as f64;
+        let t2 = (g.m.rf64(0x4e59d8) - (s.color as f64 / k32)) as f32;
+        let mut flash = t1 as f64 * t2 as f64 - k32;
+        if flash < g.m.rf64(0x4e59b0) {
+            flash = -flash;
+        }
+        s.color = ftol(flash) as u32;
+        s.flags = 0;
+        if terrain {
+            s.flags |= 8;
+        }
+        s.flags |= 4;
+        s.tint = g.m.r16(this + 0x60);
+        view::render_lists_add(g, &s, DrawKind::Flash, info);
+    }
+    // The glow.
+    if g.m.r8(this + 0x6e) != 0 {
+        s.flags = 0;
+        if terrain {
+            s.flags |= 8;
+        }
+        s.flags |= 4;
+        s.color = g.m.r32(this + 0x70);
+        s.tint = g.m.r16(this + 0x78);
+        view::render_lists_add(g, &s, DrawKind::Glow, info);
+    }
+}
+
+/// `G_GameObject::Priv_DrawShadow` — 0x424c40. The shadow's offset is the
+/// permanent floats 0x30/0x31 (ground, scaled by half the object's scale)
+/// or 0x32/0x33 (elevated, the object's scale), by material tag; the
+/// settings' scale is whatever that computation left in its slot.
+pub fn G_GameObject_Priv_DrawShadow(g: &mut G, this: u32) {
+    let terrain = g.m.rb(this + 0x36);
+    let mut hud = 0i32;
+    let mut rect_top = 0i32;
+    if terrain {
+        hud = 0x20;
+        rect_top = G_Bgnd_GetUpdateRectTop(g);
+    }
+    let mut side = 0i32;
+    if g.m.rb(this + 0x18) && !terrain {
+        side = G_Bgnd_GetSideScrolling(g);
+    }
+    let mut s = Settings::template(g);
+    s.frame_data = g.m.r32(this + 0x4e);
+    s.x = ftol(g.m.rf32(this) as f64);
+    s.y = ftol(g.m.rf32(this + 4) as f64);
+    s.sprite = g.m.r32(this + 0x1c);
+    s.frame = g.m.ri32(this + 0x20);
+    s.clip = [g.m.ri32(this + 0x3a), g.m.ri32(this + 0x3e), g.m.ri32(this + 0x42), g.m.ri32(this + 0x46)];
+    s.direct = g.m.r8(this + 0x35) != 0;
+    s.flags |= 2;
+    let mut blend: u32 = 0x14;
+    let vis = g.m.rf32(this + 0x62) as f64;
+    if !(vis == g.m.rf64(0x4e59c0)) {
+        let pct = ftol(vis);
+        blend = view::visibility_to_blend(g, pct);
+        if blend < 0x14 {
+            blend = 0x14;
+        }
+    }
+    s.color = blend;
+    let mut tag = g.m.r32(this + 0x4a);
+    if tag == 0 || tag == NONE {
+        g.m.w32(this + 0x4a, 0x61666564);
+    }
+    tag = g.m.r32(this + 0x4a);
+    let m_scale = g.m.rf32(this + 0x7a);
+    let half = g.m.rf32(0x4e59e0) as f64;
+    let some19 = g.m.r8(this + 0x19) != 0;
+    let some1a = g.m.r8(this + 0x1a) != 0;
+    // (dx, dy) with the scale slot the settings share.
+    let ground = |g: &mut G, s: &mut Settings| -> (i32, i32) {
+        let slot = (m_scale as f64 * half) as f32;
+        s.scale = slot;
+        if some1a {
+            let dx = ftol(G_Res_GetPermFloat(g, 0x30) as f64 * slot as f64);
+            let dy = ftol(G_Res_GetPermFloat(g, 0x31) as f64 * slot as f64);
+            (dx, dy)
+        } else {
+            let dx = ftol(G_Res_GetPermFloat(g, 0x30) as f64 * half);
+            let dy = ftol(G_Res_GetPermFloat(g, 0x31) as f64 * half);
+            (dx, dy)
+        }
+    };
+    let elevated = |g: &mut G, s: &mut Settings| -> (i32, i32) {
+        s.scale = m_scale;
+        let dx = ftol(G_Res_GetPermFloat(g, 0x32) as f64 * m_scale as f64);
+        let dy = ftol(G_Res_GetPermFloat(g, 0x33) as f64 * m_scale as f64);
+        (dx, dy)
+    };
+    let default_tag = tag == 0x61666564;
+    let (mut dx, mut dy);
+    if default_tag {
+        if some19 {
+            s.layer = 6;
+            (dx, dy) = ground(g, &mut s);
+        } else {
+            s.layer = 2;
+            (dx, dy) = elevated(g, &mut s);
+        }
+    } else if some19 {
+        (dx, dy) = ground(g, &mut s);
+    } else {
+        (dx, dy) = elevated(g, &mut s);
+    }
+    if terrain {
+        s.layer = 0;
+        s.x = ftol(dx as f64 + g.m.rf32(this) as f64 - side as f64 + hud as f64);
+        s.y = ftol(dy as f64 + g.m.rf32(this + 4) as f64 + rect_top as f64);
+        s.flags |= 8;
+        s.clip = view::bg_buffer_rect(g);
+    } else {
+        if !default_tag {
+            match tag {
+                0x756f7267 => {
+                    s.layer = 2;
+                    (dx, dy) = elevated(g, &mut s);
+                }
+                0x69687267 => {
+                    s.layer = 4;
+                    (dx, dy) = elevated(g, &mut s);
+                }
+                0x20647568 | 0x65776c70 | 0x66656c70 | 0x68736c70 | 0x69686961 | 0x69756c70 | 0x6f6c6961
+                | 0x6f6d7461 | 0x79616c70 => {
+                    s.layer = 6;
+                    (dx, dy) = ground(g, &mut s);
+                }
+                _ => {}
+            }
+        }
+        s.x = ftol(dx as f64 + g.m.rf32(this) as f64 - side as f64);
+        s.y = ftol(dy as f64 + g.m.rf32(this + 4) as f64);
+    }
+    let info = view::obj_info(g, this);
+    view::render_lists_add(g, &s, DrawKind::Shadow, info);
+}

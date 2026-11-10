@@ -31,3 +31,5 @@ pub mod load;
 pub mod init;
 pub mod play;
 pub mod spriteplate;
+pub mod view;
+pub mod session;

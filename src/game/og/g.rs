@@ -66,11 +66,19 @@ pub struct G {
     /// Optional trace for the film oracle: `R` lines for rand() draws
     /// (new state, caller) plus whatever `trace` records.
     pub rand_log: Option<Vec<String>>,
+    /// Live play: the inputs `G_Input_CachePlayerInputs` hands to the game,
+    /// two `G_Input_PlayerInputs` of 7 bytes ([0]=up [1]=right [2]=down
+    /// [3]=left [4]=ground weapon [5]=air weapon [6]=cycle). Zero during
+    /// film replays, where the film supplies the inputs.
+    pub live_inputs: [u8; 14],
+    /// Live play: `U_Sprite_RenderLists_Add` appends here (see view.rs)
+    /// while it is `Some`; film replays leave it `None` and draw nothing.
+    pub draw_sink: Option<Vec<super::view::DrawItem>>,
 }
 
 impl G {
     pub fn new(m: Mem, host: Box<dyn Host>) -> G {
-        G { m, rand_state: 1, host, rand_log: None }
+        G { m, rand_state: 1, host, rand_log: None, live_inputs: [0; 14], draw_sink: None }
     }
 
     /// Record an oracle trace line (only while tracing).

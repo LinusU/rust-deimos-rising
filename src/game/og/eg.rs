@@ -1496,7 +1496,7 @@ pub fn sub_41b2d0(g: &mut G) {
                         g.m.w8(e + 0x35, 0);
                         let v = g.m.r8(d16 + 0x106);
                         g.m.w8(e + 0x38, v);
-                        // G_GameObject::Draw(e): drawing is not ported.
+                        G_GameObject_Draw(g, e);
                     }
                     if g.m.r8(e + 0xd2) != 0 {
                         let st = G_Entity_GetCurrentStatePtr(g, e);
