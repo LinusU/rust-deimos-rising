@@ -143,6 +143,19 @@ impl FilmPlayback {
     }
 }
 
+/// `DEIMOS_ENTS=t1,t2,...` dumps the live entities when G_EG_Process
+/// starts on those ticks.
+fn ents_dump_tick(t: u32) -> bool {
+    static TICKS: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    TICKS
+        .get_or_init(|| {
+            std::env::var("DEIMOS_ENTS")
+                .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+                .unwrap_or_default()
+        })
+        .contains(&t)
+}
+
 /// `U_Utils_RandomInt(min, max)` = `min + rand() % (max - min + 1)`.
 /// The original early-returns `min` with NO rand() draw when min == max
 /// (0x40f7ee jne skips the rand call) — matching that is essential for
@@ -2587,6 +2600,15 @@ impl Sim {
 
     fn step_entities(&mut self, assets: &GameAssets) {
         self.entity_scroll_pause = false;
+        if ents_dump_tick(self.game_time) {
+            // Same view as the original's G_EG_Process at its on-timer
+            // check: game-area x, screen y, velocity with y down.
+            eprintln!("== tick {}", self.game_time);
+            for e in self.entities.iter().filter(|e| !e.dead) {
+                eprintln!("  {} #{} pos=({:.3},{:.3}) vel=({:.3},{:.3}) st={} act={}", rid_str(e.unit), e.unique_num,
+                    e.pos.x, self.scroll + SCREEN_H - e.pos.y, e.vel.x, -e.vel.y, e.state, e.activate_in);
+            }
+        }
         // Retail's G_EG_Process walks a live child linked-list: an entity
         // spawned mid-pass is appended at the tail and reached later in the
         // SAME pass. Process in waves so same-tick spawns get their first
