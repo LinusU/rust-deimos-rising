@@ -577,6 +577,38 @@ fn cat(tagname: &str, ridname: &str) {
     }
 }
 
+/// `--og-film <id>`: a film id is four characters (`de01`) or the eight hex
+/// digits of the little-endian value (`31306564`).
+fn og_film(args: &[String], pos: usize) {
+    use std::io::Write;
+    let arg = args.get(pos + 1).expect("--og-film needs a film id");
+    let film_id = if arg.len() == 8 && arg.bytes().all(|b| b.is_ascii_hexdigit()) {
+        u32::from_str_radix(arg, 16).unwrap()
+    } else {
+        id(arg)
+    };
+    let ticks: Option<u32> = arg_value(args, "--ticks").and_then(|s| s.parse().ok());
+    let dir = data_dir();
+    let mut set = PakSet::open_dir(&dir).expect("open paks");
+    let film = set.read_raw(Tag::Film, film_id).expect("film not found");
+    let exe_path = [dir.join("../../DeimosRising.exe"), PathBuf::from("retail/DeimosRising.exe")]
+        .into_iter()
+        .find(|p| p.exists())
+        .expect("DeimosRising.exe not found next to the data directory");
+    let exe = std::fs::read(exe_path).expect("read exe");
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let r = game::og::play::run_film(&exe, &dir, film_id, &film, ticks, &mut out);
+    out.flush().ok();
+    match r {
+        Ok(n) => eprintln!("ran {n} ticks"),
+        Err(e) => {
+            eprintln!("og-film: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--dump-data") {
@@ -601,6 +633,12 @@ fn main() {
     }
     if args.iter().any(|a| a == "--films") {
         film_probe();
+        return;
+    }
+    // --og-film <film-id> [--ticks N]: replay a film through the ported
+    // gameplay (src/game/og), one `T`/`R` line per tick on stdout.
+    if let Some(pos) = args.iter().position(|a| a == "--og-film") {
+        og_film(&args, pos);
         return;
     }
     // --dump-raw <tag> <id> <file>: write a resource's raw bytes (sprite

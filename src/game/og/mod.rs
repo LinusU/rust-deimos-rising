@@ -28,3 +28,5 @@ pub mod weaponhandler;
 pub mod wepdefs;
 pub mod pixbuf;
 pub mod load;
+pub mod init;
+pub mod play;
