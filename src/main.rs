@@ -230,7 +230,7 @@ fn trace_replay(
         if inp.p1.fire { fire_frames += 1; }
         if inp.p1.bomb { bomb_frames += 1; }
         let prev_phase = sim.players[0].as_ref().map(|p| p.phase);
-        sim.advance(&a, &inp, 1.0 / 60.0);
+        sim.step(&a, &inp);
         if let (Some(pp), Some(np)) = (prev_phase, sim.players[0].as_ref().map(|p| p.phase)) {
             if pp != np {
                 let near: Vec<String> = sim.entities.iter()
@@ -425,7 +425,7 @@ fn film_test() {
                 s
             };
             let inp = PlayerInput { p1: mk(0), p2: mk(1) };
-            sim.advance(&a, &inp, 1.0 / 60.0);
+            sim.step(&a, &inp);
         }
         let score = sim.players[0].as_ref().map(|p| p.score).unwrap_or(-1);
         let alive = sim.players[0]
@@ -1730,7 +1730,7 @@ fn test_sim() {
             },
             p2: p2in,
         };
-        sim.advance(&assets, &inp, 1.0 / 60.0);
+        sim.step(&assets, &inp);
         if tick % 600 == 599 {
             let p = sim.players[0].as_ref().unwrap();
             let mut projs = 0usize;

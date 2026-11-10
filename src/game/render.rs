@@ -1565,13 +1565,13 @@ fn sim_system(
         demo.frame += 1;
     }
     // Screenshot mode steps exactly one tick per rendered frame so a given
-    // frame number always shows the same sim state.
-    let dt = if shot.is_some() {
-        1.0 / crate::game::sim::TICK_HZ
+    // frame number always shows the same sim state. (Accumulating 1/60 s
+    // in floating point would now and then step twice or not at all.)
+    if shot.is_some() {
+        sim.0.step(&*assets, &input);
     } else {
-        time.delta_secs()
-    };
-    sim.0.advance(&*assets, &input, dt);
+        sim.0.advance(&*assets, &input, time.delta_secs());
+    }
 }
 
 /// Menu/flow state machine. Drives title → sectors → briefing → play →
