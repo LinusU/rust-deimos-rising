@@ -1828,6 +1828,45 @@ impl Sim {
 
     fn step_tick(&mut self, assets: &GameAssets, input: &PlayerInput) {
 
+        // --- level object spawning ---
+        // Initial update-rect objects spawn once, descending y (the
+        // original's DoInitialMapSpawns row order) before any scrolling.
+        for oi in std::mem::take(&mut self.initial_objects) {
+            self.queue_level_object(assets, oi);
+        }
+        // Level-start notice banner: sub_41fc80 runs DoInitialMapSpawns,
+        // then this RequestSpawn, before the first G_Bgnd_Process row
+        // check — so it queues after the initial batch but before any
+        // scroll-gated object.
+        if let Some((unit, pos, screen)) = self.pending_notice.take() {
+            self.request_spawn_screen(assets, SpawnReq {
+                unit,
+                pos,
+                heading: None,
+                heading_forced: false,
+                owner: usize::MAX,
+                spawner_player: -1,
+                stationary: true,
+                state: None,
+            }, screen);
+        }
+
+        // Contact tests run against where the ship WAS before this tick's
+        // movement (retail's playerPrevLocs).
+        for slot in 0..2 {
+            self.player_pos_prev[slot] = self.players[slot]
+                .as_ref()
+                .map(|p| p.world_pos(self))
+                .unwrap_or(Vec2::splat(-9999.0));
+        }
+
+        // --- players ---
+        for slot in 0..2 {
+            self.step_player(assets, slot, input);
+        }
+
+        // --- G_Bgnd_Process: scroll, then the row spawns ---
+        // sub_020280 runs it after the players and before G_EG_Process.
         // --- scrolling ---
         if !self.scroll_paused && !self.entity_scroll_pause && self.phase == Phase::Playing {
             self.scroll += self.scroll_speed;
@@ -1992,29 +2031,6 @@ impl Sim {
             }
         }
 
-        // --- level object spawning ---
-        // Initial update-rect objects spawn once, descending y (the
-        // original's DoInitialMapSpawns row order) before any scrolling.
-        for oi in std::mem::take(&mut self.initial_objects) {
-            self.queue_level_object(assets, oi);
-        }
-        // Level-start notice banner: sub_41fc80 runs DoInitialMapSpawns,
-        // then this RequestSpawn, before the first G_Bgnd_Process row
-        // check — so it queues after the initial batch but before any
-        // scroll-gated object.
-        if let Some((unit, pos, screen)) = self.pending_notice.take() {
-            self.request_spawn_screen(assets, SpawnReq {
-                unit,
-                pos,
-                heading: None,
-                heading_forced: false,
-                owner: usize::MAX,
-                spawner_player: -1,
-                stationary: true,
-                state: None,
-            }, screen);
-        }
-
         // Scroll-gated spawns (sub_410230 → sub_417900): each frame checks
         // row scrollOffset-0x40 = level_height-544-scroll; objects at that
         // file y spawn. In descending file-y order this is equivalent to
@@ -2030,19 +2046,6 @@ impl Sim {
             }
         }
 
-        // Contact tests run against where the ship WAS before this tick's
-        // movement (retail's playerPrevLocs).
-        for slot in 0..2 {
-            self.player_pos_prev[slot] = self.players[slot]
-                .as_ref()
-                .map(|p| p.world_pos(self))
-                .unwrap_or(Vec2::splat(-9999.0));
-        }
-
-        // --- players ---
-        for slot in 0..2 {
-            self.step_player(assets, slot, input);
-        }
 
         // --- entities ---
         self.step_entities(assets);
