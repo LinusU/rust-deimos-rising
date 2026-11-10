@@ -723,6 +723,36 @@ fn plate_rects(alpha: &[u8], w: usize, h: usize) -> Vec<(usize, usize, usize, us
     out
 }
 
+/// The frames of a sprite plate pair. `U_Sprite_Load` takes them from the
+/// uppercase (alpha) 8-bit plate with `U_SpritePlate`. The port's trim on the
+/// raw GIF indices of that plate keeps the cell's own background rows and
+/// columns where the original's 8-bit buffer does not (the glow sprites show
+/// them as lines), while the colour plate's rectangles are too big wherever its
+/// cell background is dithered: a frame is the part of the alpha plate's
+/// rectangle that lies in the colour plate's rectangle over it.
+fn frame_rects(color: &[u8], alpha_idx: &[u8], w: usize, h: usize) -> Option<Vec<(usize, usize, usize, usize)>> {
+    use crate::game::og::spriteplate::bitmap_rects;
+    let (cw, ch, cidx) = decode_gif_indexed(color)?;
+    let cr = bitmap_rects(&cidx, cw as i32, cw as i32, ch as i32);
+    let ar = bitmap_rects(alpha_idx, w as i32, w as i32, h as i32);
+    let mut out = Vec::new();
+    for a in ar {
+        let (a0, a1, a2, a3) = (a.0, a.1, a.0 + a.2, a.1 + a.3);
+        // The colour rectangle overlapping this one the most.
+        let best = cr
+            .iter()
+            .map(|c| {
+                let (x0, y0, x1, y1) = (a0.max(c.0), a1.max(c.1), a2.min(c.0 + c.2), a3.min(c.1 + c.3));
+                (x0, y0, x1, y1)
+            })
+            .filter(|r| r.2 > r.0 && r.3 > r.1)
+            .max_by_key(|r| (r.2 - r.0) * (r.3 - r.1));
+        let r = best.unwrap_or((a0, a1, a2, a3));
+        out.push((r.0.max(0) as usize, r.1.max(0) as usize, (r.2 - r.0).max(1) as usize, (r.3 - r.1).max(1) as usize));
+    }
+    Some(out)
+}
+
 /// Decode a sprite: colour plate (original case) + alpha plate (uppercase).
 fn decode_sprite(color: &[u8], alpha: &[u8]) -> Option<Sprite> {
     let (cw, ch, color_px) = decode_gif_rgba(color)?;
@@ -731,7 +761,11 @@ fn decode_sprite(color: &[u8], alpha: &[u8]) -> Option<Sprite> {
         return None;
     }
     let (w, h) = (cw as usize, ch as usize);
-    let rects = plate_rects(&alpha_idx, w, h);
+    // The frames drawn are the rectangles `U_SpritePlate` finds on the
+    // alpha plate (the port's `spriteplate`): on the colour plate the
+    // glow-type sprites keep whole cells, but the original draws the
+    // trimmed frame centred on the object (checked against screenshots).
+    let rects = frame_rects(color, &alpha_idx, w, h)?;
     if rects.is_empty() {
         return None;
     }
