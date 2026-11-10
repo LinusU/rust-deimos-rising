@@ -81,6 +81,8 @@ pub struct Flow {
     pub controls_sel: (usize, usize),
     /// Controls screen is waiting for the key to bind.
     pub rebinding: bool,
+    /// The last key pressed while rebinding was already in use.
+    pub key_in_use: bool,
     /// Page of the credits being shown.
     pub credits_page: usize,
     /// `ticks` value at which every player was found dead, while the
@@ -604,6 +606,7 @@ pub fn flow_system(
                     TitleItem::Controls => {
                         flow.controls_sel = (0, 0);
                         flow.rebinding = false;
+                        flow.key_in_use = false;
                         flow.state = FlowState::Controls;
                     }
                     TitleItem::Scores => {
@@ -813,15 +816,20 @@ pub fn flow_system(
             if flow.rebinding {
                 if esc {
                     flow.rebinding = false;
+                    flow.key_in_use = false;
                 } else if let Some(key) = keys
                     .get_just_pressed()
                     .copied()
                     .find(|k| crate::game::input::is_bindable(*k))
                 {
-                    bindings.bind(col, row, key);
-                    bindings.save();
-                    flow.rebinding = false;
-                    click = true;
+                    if bindings.bind(col, row, key) {
+                        bindings.save();
+                        flow.rebinding = false;
+                        flow.key_in_use = false;
+                        click = true;
+                    } else {
+                        flow.key_in_use = true;
+                    }
                 }
             } else {
                 let rows = crate::game::menu::CONTROLS_ROWS;
@@ -1091,6 +1099,7 @@ pub fn run(
         menu_sel: 0,
         controls_sel: (0, 0),
         rebinding: false,
+        key_in_use: false,
         credits_page: 0,
         game_over_at: None,
         restricted: false,

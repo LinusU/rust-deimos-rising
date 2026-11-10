@@ -652,7 +652,9 @@ fn controls(p: &mut Painter, flow: &Flow, bindings: &KeyBindings) {
         }
     }
     let hint = text_style(p.assets, "inco");
-    let text = if flow.rebinding {
+    let text = if flow.rebinding && flow.key_in_use {
+        "That key is already in use!"
+    } else if flow.rebinding {
         "Press the new key, or Esc to keep the old one"
     } else {
         "Arrows choose  -  Enter changes the key  -  Esc returns"

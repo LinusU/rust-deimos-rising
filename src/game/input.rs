@@ -129,18 +129,19 @@ impl KeyBindings {
         let _ = std::fs::write(KEYS_PATH, self.to_text());
     }
 
-    /// Bind `key` to an action. A key already used elsewhere swaps places
-    /// with the one it replaces, so no action is left without a key.
-    pub fn bind(&mut self, slot: usize, index: usize, key: KeyCode) {
-        let old = self.keys[slot][index];
+    /// Bind `key` to an action. Like the original's dialog (sub_44a450),
+    /// a key another action already uses is refused: returns false and
+    /// changes nothing.
+    pub fn bind(&mut self, slot: usize, index: usize, key: KeyCode) -> bool {
         for s in 0..2 {
             for i in 0..7 {
-                if self.keys[s][i] == key {
-                    self.keys[s][i] = old;
+                if (s, i) != (slot, index) && self.keys[s][i] == key {
+                    return false;
                 }
             }
         }
         self.keys[slot][index] = key;
+        true
     }
 }
 
@@ -263,12 +264,14 @@ mod tests {
     }
 
     #[test]
-    fn binding_a_used_key_swaps_it() {
+    fn binding_a_used_key_is_refused() {
         let mut b = KeyBindings::default();
-        // LAlt is player 1's ground weapon; give it to the air weapon.
-        b.bind(0, FIRE, KeyCode::AltLeft);
-        assert_eq!(b.keys[0][FIRE], KeyCode::AltLeft);
-        assert_eq!(b.keys[0][BOMB], KeyCode::ControlLeft);
+        // LAlt is player 1's ground weapon; End is player 2's air weapon.
+        assert!(!b.bind(0, FIRE, KeyCode::AltLeft));
+        assert!(!b.bind(0, FIRE, KeyCode::End));
+        assert_eq!(b.keys[0][FIRE], KeyCode::ControlLeft);
+        // Rebinding an action to its own key is fine.
+        assert!(b.bind(0, FIRE, KeyCode::ControlLeft));
     }
 
     #[test]
