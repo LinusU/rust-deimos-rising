@@ -56,7 +56,7 @@ pub struct OgGame {
     handle: Option<Handle<Image>>,
     dirty: bool,
     /// Scripted inputs (screenshot mode without a film): per tick.
-    pub script: Option<crate::game::render::DemoRec>,
+    pub script: Option<crate::game::render::InputScript>,
     /// The level music last handed to the audio engine.
     music: u32,
 }
@@ -458,7 +458,7 @@ fn draw_game_text(assets: &mut GameAssets, t: &mut Target, it: &TextItem) {
 /// The score bars (`G_ScoreBar_Draw`), over the `scor` panel, in screen
 /// coordinates.
 fn draw_score_bars(assets: &mut GameAssets, t: &mut Target, fv: &FrameView) {
-    let pf = |a: &GameAssets, i: usize| crate::game::sim::pf(a, i);
+    use crate::game::render::pf;
     let full = [0, 0, t.h, t.w];
     let max_lives = pf(assets, 0x8f) as i64;
     for slot in 0..2usize {
@@ -663,10 +663,7 @@ pub fn og_system(
                 [[false; 7]; 2]
             } else if let Some(sc) = &og.script {
                 let t = og.ticks as usize;
-                let unpack = |v: &Vec<u8>| crate::game::render::DemoRec::unpack(v.get(t).copied().unwrap_or(0));
-                let (a, b) = (unpack(&sc.p1), unpack(&sc.p2));
-                let m = |s: crate::game::sim::SlotInput| [s.up, s.right, s.down, s.left, s.bomb, s.fire, s.cycle];
-                [m(a), m(b)]
+                sc.og_inputs(t)
             } else {
                 slot_inputs(&keys, &bindings, &mut og.cycle_latch, i == 0)
             };

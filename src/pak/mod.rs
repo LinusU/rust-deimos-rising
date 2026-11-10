@@ -27,6 +27,11 @@ pub const fn id(s: &str) -> ResId {
 
 pub const NONE_ID: ResId = id("none");
 
+/// The four characters of a packed resource ID, for debug output.
+pub fn rid_str(rid: ResId) -> String {
+    rid.to_le_bytes().iter().map(|&c| c as char).collect()
+}
+
 /// Resource tag, identified by its four-character code.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Tag {

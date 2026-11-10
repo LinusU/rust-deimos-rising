@@ -137,6 +137,22 @@ fn ents_dump_tick(t: i32) -> bool {
         .contains(&t)
 }
 
+/// One `E <tick> <group> <child> <unit> <hex>` line per live entity, with
+/// its raw 0x1e4-byte object. Same walk as tools/oracle/entraw.py: groups,
+/// then children.
+pub fn write_entities(g: &G, t: i32, out: &mut dyn Write) {
+    let groups = list::objects(&g.m, g.m.r32(0x4e0d70));
+    for (gi, grp) in groups.iter().enumerate() {
+        let kids = list::objects(&g.m, g.m.r32(grp + 0xa6));
+        for (ci, e) in kids.iter().enumerate() {
+            let def = g.m.r32(e + 0x8a);
+            let unit = String::from_utf8_lossy(g.m.bytes(def + 4, 4)).into_owned();
+            let hex: String = g.m.bytes(*e, 0x1e4).iter().map(|b| format!("{b:02x}")).collect();
+            let _ = writeln!(out, "E {t} {gi} {ci} {unit} {hex}");
+        }
+    }
+}
+
 /// Writes the `R` lines for the draws since the last call.
 fn flush_rand(g: &mut G, out: &mut dyn Write) {
     if let Some(log) = g.rand_log.as_mut() {
@@ -262,17 +278,7 @@ pub fn play_film(
         let t = g.m.ri32(GAME_TIME);
         let _ = writeln!(out, "T {t} ({x:.4},{y:.4}) score={score} st={st}");
         if ents_dump_tick(t) {
-            // Same walk as tools/oracle/entraw.py: groups, then children.
-            let groups = list::objects(&g.m, g.m.r32(0x4e0d70));
-            for (gi, grp) in groups.iter().enumerate() {
-                let kids = list::objects(&g.m, g.m.r32(grp + 0xa6));
-                for (ci, e) in kids.iter().enumerate() {
-                    let def = g.m.r32(e + 0x8a);
-                    let unit = String::from_utf8_lossy(g.m.bytes(def + 4, 4)).into_owned();
-                    let hex: String = g.m.bytes(*e, 0x1e4).iter().map(|b| format!("{b:02x}")).collect();
-                    let _ = writeln!(out, "E {t} {gi} {ci} {unit} {hex}");
-                }
-            }
+            write_entities(g, t, out);
         }
 
         // Process_StartFrame says: run a frame.

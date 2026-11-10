@@ -11,10 +11,9 @@
 
 use super::input::{key_label, KeyBindings, ACTIONS};
 use super::render::{
-    frame_image_blend, image16_handle, layout_text, to_world_z, Blit, Flow, FlowState,
-    HighScores, TextureBook, FONT,
+    frame_image_blend, image16_handle, layout_text, pf, to_world_z, Blit, Flow, FlowState,
+    HighScores, TextureBook, FONT, PLAY_LEFT,
 };
-use super::sim::{pf, PLAY_LEFT};
 use crate::assets::GameAssets;
 use crate::pak::{id, ResId, NONE_ID};
 use bevy::prelude::*;

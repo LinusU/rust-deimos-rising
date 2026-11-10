@@ -1,16 +1,27 @@
-//! Bevy rendering layer: turns `Sim` state into sprites each frame.
+//! Bevy window layer: the menu flow, sprite images for the menus and the
+//! app setup. Gameplay itself is drawn by `ogplay.rs`.
 //!
-//! World→screen mapping (top-left origin, y down):
-//!   screen_x = world_x - cam_x          (cam_x = side-scroll offset)
-//!   screen_y = scroll + 480 - world_y
-//! Bevy world→NDC: camera centered, so bevy_pos = (screen_x - 320, 240 - screen_y).
+//! Screen coordinates have a top-left origin, y down. The Bevy camera is
+//! centred, so bevy_pos = (screen_x - 320, 240 - screen_y).
 
 use crate::assets::GameAssets;
 use crate::game::ogplay::{OgGame, OgMode};
-use crate::game::sim::{PlayerInput, SlotInput, Sim, SCREEN_H, SCREEN_W};
+use crate::game::input::SlotInput;
 use crate::pak::ResId;
 use bevy::prelude::*;
 use std::collections::HashMap;
+
+pub const TICK_HZ: f32 = 60.0;
+pub const SCREEN_W: f32 = 640.0;
+pub const SCREEN_H: f32 = 480.0;
+/// Left edge of the 416-px playfield on screen: the original copies its
+/// game buffer to the window at `LeftBorderWidth` (perm 0x3b = 32).
+pub const PLAY_LEFT: f32 = 32.0;
+
+/// Permanent float `i` of the `fill_list`.
+pub fn pf(assets: &GameAssets, i: usize) -> f32 {
+    assets.fill_list.as_ref().map(|f| f.get(i) as f32).unwrap_or(0.0)
+}
 
 /// Cache of decoded sprite frames → Bevy images.
 #[derive(Resource, Default)]
@@ -80,8 +91,6 @@ pub struct Flow {
     pub restricted: bool,
     /// Sequentially completed level count; sectors 0..=progress are selectable.
     pub progress: u32,
-    /// Run-scoped state carried into the next level (score/lives/etc.).
-    pub carry: Option<crate::game::sim::RunCarry>,
     /// Levels started this run (exe 0x4e482a equivalent).
     pub levels_played: u32,
 }
@@ -178,38 +187,33 @@ impl HighScores {
 }
 
 // ---------------------------------------------------------------------------
-// Demo/attract mode (G_Film port): record per-player input bitmasks during
-// play, replay them on the title screen after idle. Local file only.
+// Attract mode and input scripts
 // ---------------------------------------------------------------------------
 
-const DEMO_PATH: &str = "deimos-demo.bin";
-const DEMO_MAX_FRAMES: usize = 20000; // original pad is 0x4e20 bytes
-
 /// Retail demo films (`film` resources) the original's attract mode plays
-/// on the title screen, cycled each time idle playback triggers. The local
-/// `deimos-demo.bin` recording is only a fallback when films can't load.
+/// on the title screen, cycled each time idle playback triggers.
 const DEMO_FILMS: [u32; 4] = [0x31306564, 0x32306564, 0x33306564, 0x34306564];
 
-/// Recorded input stream for one player: 7 bits/frame
-/// (up,down,left,right,fire,bomb,cycle).
+/// Longest input script, in frames (the original's film pad is 0x4e20 bytes).
+const SCRIPT_MAX_FRAMES: usize = 20000;
+
+/// Scripted controls for both players, one packed byte per frame:
+/// bit 0 up, 1 down, 2 left, 3 right, 4 fire, 5 bomb, 6 cycle.
 #[derive(Default)]
-pub struct DemoRec {
+pub struct InputScript {
     pub level: Option<ResId>,
     pub seed: u64,
     pub p1: Vec<u8>,
     pub p2: Vec<u8>,
-    /// A retail film: replayed inside the sim per Active tick, not per
-    /// frame, so `p1`/`p2` stay empty.
-    pub film: Option<crate::game::sim::FilmPlayback>,
 }
 
-impl DemoRec {
+impl InputScript {
     /// Parse an input script: one `<from>-<to> <keys...>` line per span of
     /// frames (inclusive; a lone `<frame>` is a single frame). Keys are
     /// `up down left right fire bomb cycle`, for player 1 unless written
     /// `p2:<key>`. Spans may overlap; `#` starts a comment.
-    pub fn from_script(text: &str, level: ResId, seed: u64) -> Result<DemoRec, String> {
-        let mut rec = DemoRec { level: Some(level), seed, p1: Vec::new(), p2: Vec::new(), film: None };
+    pub fn from_script(text: &str, level: ResId, seed: u64) -> Result<InputScript, String> {
+        let mut rec = InputScript { level: Some(level), seed, p1: Vec::new(), p2: Vec::new() };
         for (ln, line) in text.lines().enumerate() {
             let line = line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
@@ -221,7 +225,7 @@ impl DemoRec {
             let (from, to) = span.split_once('-').unwrap_or((span, span));
             let from: usize = from.parse().map_err(|_| err("bad start frame"))?;
             let to: usize = to.parse().map_err(|_| err("bad end frame"))?;
-            if to < from || to >= DEMO_MAX_FRAMES {
+            if to < from || to >= SCRIPT_MAX_FRAMES {
                 return Err(err("bad frame span"));
             }
             let (mut m1, mut m2) = (0u8, 0u8);
@@ -248,12 +252,11 @@ impl DemoRec {
         Ok(rec)
     }
 
-    /// Both players' inputs at frame `f` (nothing pressed past the end).
-    pub fn input_at(&self, f: usize) -> PlayerInput {
-        PlayerInput {
-            p1: self.p1.get(f).map(|b| DemoRec::unpack(*b)).unwrap_or_default(),
-            p2: self.p2.get(f).map(|b| DemoRec::unpack(*b)).unwrap_or_default(),
-        }
+    /// Both players' inputs at frame `f` in the port's order (nothing
+    /// pressed past the end).
+    pub fn og_inputs(&self, f: usize) -> [[bool; 7]; 2] {
+        let at = |v: &Vec<u8>| InputScript::unpack(v.get(f).copied().unwrap_or(0)).og();
+        [at(&self.p1), at(&self.p2)]
     }
 
     pub fn pack(s: &SlotInput) -> u8 {
@@ -265,6 +268,7 @@ impl DemoRec {
             | ((s.bomb as u8) << 5)
             | ((s.cycle as u8) << 6)
     }
+
     pub fn unpack(b: u8) -> SlotInput {
         SlotInput {
             up: b & 1 != 0,
@@ -276,72 +280,17 @@ impl DemoRec {
             cycle: b & 64 != 0,
         }
     }
+
     pub fn frames(&self) -> usize {
-        if let Some(f) = &self.film {
-            return f.total[0].max(f.total[1]);
-        }
         self.p1.len().max(self.p2.len())
     }
-    fn save(&self) {
-        if let Some(lvl) = self.level {
-            let mut buf = Vec::with_capacity(16 + self.p1.len() + self.p2.len());
-            buf.extend_from_slice(&lvl.to_le_bytes());
-            buf.extend_from_slice(&self.seed.to_le_bytes());
-            buf.extend_from_slice(&(self.p1.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&self.p1);
-            buf.extend_from_slice(&(self.p2.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&self.p2);
-            let _ = std::fs::write(DEMO_PATH, buf);
-        }
-    }
-    fn load() -> Option<Self> {
-        let buf = std::fs::read(DEMO_PATH).ok()?;
-        if buf.len() < 24 {
-            return None;
-        }
-        let lvl = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-        let seed = u64::from_le_bytes(buf[4..12].try_into().ok()?);
-        let n1 = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
-        if buf.len() < 16 + n1 + 4 {
-            return None;
-        }
-        let p1 = buf[16..16 + n1].to_vec();
-        let n2 = u32::from_le_bytes(buf[16 + n1..20 + n1].try_into().ok()?) as usize;
-        if buf.len() < 20 + n1 + n2 {
-            return None;
-        }
-        let p2 = buf[20 + n1..20 + n1 + n2].to_vec();
-        Some(DemoRec { level: Some(lvl), seed, p1, p2, film: None })
-    }
-
-    /// Build a playback stream from a retail `film` resource, translating
-    /// each packed input byte through the recovered G_Film bit map
-    /// (bit0=L bit1=R bit2=U bit3=D bit4=bomb bit5=air-fire bit6=cycle)
-    /// into our SlotInput packing. This is what the original's attract
-    /// mode replays; the seed/level come straight from the film header.
-    pub fn from_film(film: &crate::assets::FilmData) -> Self {
-        DemoRec {
-            level: Some(film.level_id),
-            seed: film.seed as u64,
-            p1: Vec::new(),
-            p2: Vec::new(),
-            film: Some(crate::game::sim::FilmPlayback::new(film.inputs.clone(), film.frames)),
-        }
-    }
 }
 
-/// Demo recorder + playback cursor.
+/// Which retail film attract mode plays next.
 #[derive(Resource, Default)]
 pub struct Demo {
-    /// Inputs recorded during the current run.
-    pub rec: DemoRec,
-    /// Playback state: demo being replayed + frame cursor.
-    pub playback: Option<DemoRec>,
-    pub frame: usize,
-    /// Cursor into DEMO_FILMS so successive attract triggers cycle demos.
     pub film_idx: usize,
 }
-
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -526,7 +475,7 @@ pub fn flow_system(
     let ticks = if shot.is_some() {
         1
     } else {
-        flow.tick_acc += time.delta_secs() * crate::game::sim::TICK_HZ;
+        flow.tick_acc += time.delta_secs() * TICK_HZ;
         let n = flow.tick_acc.floor().min(8.0);
         flow.tick_acc -= n;
         n as u32
@@ -541,8 +490,7 @@ pub fn flow_system(
         }
     }
     // Title idle ~20s: start attract playback. The original plays its
-    // pre-recorded demo films here — cycle through them; fall back to the
-    // locally-recorded demo only when no film resource loads.
+    // pre-recorded demo films here; cycle through them.
     if flow.state == FlowState::Title && og.mode == OgMode::Idle && flow.ticks > ATTRACT_IDLE_TICKS {
         for _ in 0..DEMO_FILMS.len() {
             let rid = DEMO_FILMS[demo.film_idx % DEMO_FILMS.len()];
@@ -550,7 +498,6 @@ pub fn flow_system(
             let Some(bytes) = assets.set.read_raw(crate::pak::Tag::Film, rid) else { continue };
             match og.start_film(rid, &bytes) {
                 Ok(()) => {
-                    flow.carry = None;
                     flow.state = FlowState::Playing;
                     flow.ticks = 0;
                     flow.paused = false;
@@ -685,8 +632,6 @@ pub fn flow_system(
                 .any(|&a| keys.just_pressed(bindings.keys[0][a]));
             if enter || space || fire || hit == Some(SectorHit::Current) {
                 if flow.sector as u32 <= flow.progress {
-                    // New run: drop any carried state from a previous run.
-                    flow.carry = None;
                     flow.levels_played = 0;
                     flow.state = FlowState::Briefing;
                     flow.ticks = 0;
@@ -831,7 +776,7 @@ pub fn flow_system(
         }
         FlowState::Scores => {
             // Scores_Duration (pf 0x4e), or any key.
-            if any || esc || flow.ticks > crate::game::sim::pf(&assets, 0x4e) as u32 {
+            if any || esc || flow.ticks > pf(&assets, 0x4e) as u32 {
                 flow.state = FlowState::Title;
                 flow.ticks = 0;
             }
@@ -965,61 +910,6 @@ fn mission_sorted_level_ids(assets: &GameAssets) -> Vec<ResId> {
     ids
 }
 
-/// Start a level: build Sim + spawn players.
-pub fn start_level(
-    assets: &mut GameAssets,
-    level_id: ResId,
-    players: usize,
-    seed: u64,
-) -> Option<Sim> {
-    // Warm per-frame sprite dimensions for the sim's collision bounds
-    // (entity/player half-extents = current frame's half height/width).
-    let mut rids: Vec<ResId> = Vec::new();
-    for (rid, u) in &assets.units {
-        rids.push(*rid);
-        rids.push(u.editor_preview_sprite_face);
-        for st in &u.states {
-            rids.push(st.sprite_face);
-        }
-    }
-    for w in assets.weapons.values() {
-        rids.push(w.player1_appearance_face);
-        rids.push(w.player2_appearance_face);
-    }
-    for rid in rids {
-        if rid != crate::pak::NONE_ID {
-            assets.warm_sprite_dims(rid);
-        }
-    }
-    let level = assets.levels.get(&level_id)?.clone();
-    let mut sim = Sim::new(level, level_id, seed);
-    // Media mask + g_bgndTileSize (bg width / mask width, int division).
-    sim.media_mask = assets.media_mask(sim.level.media_mask).cloned();
-    if let Some(m) = &sim.media_mask {
-        let bg_w = (sim.level.background[2] - sim.level.background[0]).max(1) as i64;
-        sim.media_tile_size = bg_w / m.w as i64;
-    }
-    // 1-based mission number for weapon level-availability filtering.
-    let level_ids = mission_sorted_level_ids(assets);
-    sim.level_number = level_ids.iter().position(|&r| r == level_id).map(|i| i as i64 + 1).unwrap_or(1);
-    sim.phase = crate::game::sim::Phase::Playing;
-    for slot in 0..players.min(2) {
-        sim.add_player(assets, slot, players > 1);
-    }
-    // Level-start notice banner: perm object levelNum + 9
-    // (Notice_Level_01..12), spawned screen-centered like sub_41fc80.
-    // Deferred so the initial level objects spawn first — the original
-    // runs G_Bgnd_DoInitialMapSpawns before this RequestSpawn.
-    let nidx = sim.level_number as usize + 9;
-    if let Some(rid) = assets.object_ids.entries.get(nidx).map(|e| e.1) {
-        if rid != crate::pak::NONE_ID {
-            let pos = Vec2::new(sim.cam_x + 240.0, sim.scroll + 240.0);
-            sim.pending_notice = Some((rid, pos, Vec2::new(crate::game::sim::PLAY_CENTER_X, 56.0)));
-        }
-    }
-    Some(sim)
-}
-
 /// Run the game. `assets` must already be opened + `load_all_data()` called.
 /// Screenshot mode (`--shot`): run deterministically, save PNGs of chosen
 /// frames, then exit. Lets a change be checked by looking at its output.
@@ -1031,7 +921,7 @@ pub struct ShotConfig {
     /// Retail film to replay.
     pub film: Option<ResId>,
     /// Input script to replay; with neither the ship sits still tapping fire.
-    pub script: Option<DemoRec>,
+    pub script: Option<InputScript>,
     /// Capture a menu screen instead of gameplay: `title`, `sectors`,
     /// `briefing`, `scores`, `name`, `credits` or `controls`.
     pub screen: Option<String>,
@@ -1087,7 +977,7 @@ pub fn run(assets: GameAssets, data_dir: std::path::PathBuf, level_id: ResId, pl
     }
     let mut og = OgGame::new(data_dir).expect("port game");
     og.warm().expect("port game data");
-    let mut demo = Demo::default();
+    let demo = Demo::default();
     let mut initial_state = FlowState::Title;
     let mut shot = shot;
     if let Some(cfg) = shot.as_mut().filter(|c| c.screen.is_none()) {
@@ -1100,14 +990,13 @@ pub fn run(assets: GameAssets, data_dir: std::path::PathBuf, level_id: ResId, pl
             (script, None) => {
                 let script = script.unwrap_or_else(|| {
                     // Tap fire: holding it charges the weapon until it overloads.
-                    let fire = DemoRec::pack(&crate::game::sim::SlotInput { fire: true, ..default() });
+                    let fire = InputScript::pack(&SlotInput { fire: true, ..default() });
                     let len = last + SHOT_EXIT_DELAY as usize + 60;
-                    DemoRec {
+                    InputScript {
                         level: Some(level_id),
                         seed: 0xC0FFEE,
                         p1: (0..len).map(|f| if f % 12 < 4 { fire } else { 0 }).collect(),
                         p2: Vec::new(),
-                        film: None,
                     }
                 });
                 let lid = script.level.unwrap_or(level_id);
@@ -1184,7 +1073,6 @@ pub fn run(assets: GameAssets, data_dir: std::path::PathBuf, level_id: ResId, pl
         game_over_at: None,
         restricted: false,
         progress: load_progress(),
-        carry: None,
         levels_played: 0,
     };
     // Screenshot mode can open straight on a menu screen.

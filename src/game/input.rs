@@ -7,6 +7,27 @@
 
 use bevy::prelude::*;
 
+/// One player's controls for a tick.
+#[derive(Clone, Copy, Default)]
+pub struct SlotInput {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub fire: bool,
+    pub bomb: bool,
+    /// Select/cycle air weapon (original input[6]).
+    pub cycle: bool,
+}
+
+impl SlotInput {
+    /// The port's input order: up, right, down, left, ground weapon, air
+    /// weapon, cycle.
+    pub fn og(self) -> [bool; 7] {
+        [self.up, self.right, self.down, self.left, self.bomb, self.fire, self.cycle]
+    }
+}
+
 /// Player actions in binding order: `(config key, on-screen label)`.
 pub const ACTIONS: [(&str, &str); 7] = [
     ("up", "Move Up"),

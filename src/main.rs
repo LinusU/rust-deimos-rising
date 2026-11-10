@@ -204,242 +204,16 @@ fn film_probe() {
     }
 }
 
-/// Replay recorded inputs through the headless sim, printing the player's
-/// phase changes plus a status line every 10 seconds. `--entities-at <tick>`
-/// also lists the live on-screen entities at that tick.
-fn trace_replay(
-    a: &mut assets::GameAssets,
-    level: ResId,
-    players: usize,
-    seed: u64,
-    rec: &game::render::DemoRec,
-    n: usize,
-    args: &[String],
-) {
-    let mut sim = game::render::start_level(a, level, players, seed).expect("level");
-    sim.film = rec.film.clone();
-    let a = &*a;
-    let ent_at = args
-        .iter()
-        .position(|x| x == "--entities-at")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse::<usize>().ok());
-    let mut fire_frames = 0u32;
-    let mut bomb_frames = 0u32;
-    for t in 0..n {
-        let inp = rec.input_at(t);
-        if inp.p1.fire { fire_frames += 1; }
-        if inp.p1.bomb { bomb_frames += 1; }
-        let prev_phase = sim.players[0].as_ref().map(|p| p.phase);
-        sim.step(&a, &inp);
-        if let (Some(pp), Some(np)) = (prev_phase, sim.players[0].as_ref().map(|p| p.phase)) {
-            if pp != np {
-                let near: Vec<String> = sim.entities.iter()
-                    .filter(|e| !e.dead)
-                    .take(6)
-                    .map(|e| format!("{:08x}@({:.0},{:.0})", e.unit, e.pos.x, e.pos.y))
-                    .collect();
-                println!("t={:>5} phase {:?} -> {:?} scr=({:.0},{:.0}) ents={}",
-                    t, pp, np,
-                    sim.players[0].as_ref().unwrap().screen.x,
-                    sim.players[0].as_ref().unwrap().screen.y,
-                    near.join(" "));
-            }
-        }
-        // --entities-at <tick>: list the live on-screen entities.
-        if ent_at == Some(t) {
-            for e in sim.entities.iter().filter(|e| !e.dead) {
-                let sp = e.screen_pos(&sim);
-                if sp.y < -50.0 || sp.y > 530.0 {
-                    continue;
-                }
-                let d = a.units.get(&e.unit);
-                let st = d.and_then(|d| d.states.get(e.state));
-                println!(
-                    "ENT #{} age={} {} '{}' scr=({:.0},{:.0}) owner={} state={}:{} face={} frame={} dir={} hdg={:.0} vis={} scale={:.2} layer={} ground={}",
-                    e.unique_num,
-                    e.age,
-                    game::sim::rid_str(e.unit),
-                    d.map(|d| d.name.as_str()).unwrap_or("?"),
-                    sp.x, sp.y, e.owner, e.state,
-                    st.map(|s| s.name.as_str()).unwrap_or("?"),
-                    st.map(|s| game::sim::rid_str(s.sprite_face)).unwrap_or_default(),
-                    e.frame, e.dir_index, e.heading, e.vis, e.scale,
-                    d.map(|d| game::sim::rid_str(d.draw_layer)).unwrap_or_default(),
-                    d.map(|d| d.is_ground_based).unwrap_or(false),
-                );
-            }
-        }
-        if t % 600 == 599 {
-            let p = sim.players[0].as_ref().unwrap();
-            let mut projs = 0usize;
-            let mut pinfo = String::new();
-            for e in &sim.entities {
-                if let Some(d) = a.units.get(&e.unit) {
-                    if d.player_projectile {
-                        projs += 1;
-                        if projs <= 3 {
-                            pinfo.push_str(&format!(" [{:.0},{:.0} v{:.1},{:.1} tv{:.1},{:.1} st{}]",
-                                e.pos.x, e.pos.y, e.vel.x, e.vel.y, e.tvel.x, e.tvel.y, e.state));
-                        }
-                    }
-                }
-            }
-            println!("t={:>5} ph={:?} scr=({:.0},{:.0}) vel=({:.1},{:.1}) sh={:.0} lives={} score={} hit={} kill={}/{} shots={} proj={} ftmr={} bt={} ent={} pick={} coin={} pts={} money={} mult={}",
-                t, p.phase, p.screen.x, p.screen.y, p.vel.x, p.vel.y, p.shields, p.lives, p.score, sim.stat_hits, sim.stat_kills_player, sim.stat_kills, sim.stat_shots, projs, p.fire_timer, p.bomb_burst, sim.entities.len(), sim.stat_pickups, sim.stat_coins, sim.stat_score_points, p.money, p.multiplier);
-            println!("   proj{}", pinfo);
-        }
-    }
-    println!("fire_frames={fire_frames} bomb_frames={bomb_frames} / {n}");
-    println!(
-        "final: scroll={:.0}/{:.0} complete={} phase={:?} score={} money={} spawns={} endseq={}",
-        sim.scroll, sim.max_scroll(), sim.level_complete,
-        sim.players[0].as_ref().map(|p| p.phase),
-        sim.players[0].as_ref().map(|p| p.score).unwrap_or(0),
-        sim.players[0].as_ref().map(|p| p.money).unwrap_or(0),
-        sim.stat_spawns,
-        sim.end_seq_state,
-    );
-}
-
-/// `--trace --input <file> [--level leNN] [--players N]`: run an input
-/// script through the headless sim with the same report as `--filmedbg`.
-fn trace_script(args: &[String]) {
-    let mut a = assets::GameAssets::open(&data_dir()).expect("open");
-    a.load_all_data();
-    let level = arg_value(args, "--level").map(|s| id(&s)).unwrap_or_else(|| id("le07"));
-    let players = arg_value(args, "--players").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let rec = load_input_script(args, level).expect("--trace needs --input <file>");
-    let n = rec.frames();
-    trace_replay(&mut a, level, players, rec.seed, &rec, n, args);
-}
-
 /// Value following `flag` on the command line.
 fn arg_value(args: &[String], flag: &str) -> Option<String> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
 }
 
 /// Parse the `--input <file>` script, if given.
-fn load_input_script(args: &[String], level: ResId) -> Option<game::render::DemoRec> {
+fn load_input_script(args: &[String], level: ResId) -> Option<game::render::InputScript> {
     let path = arg_value(args, "--input")?;
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-    Some(game::render::DemoRec::from_script(&text, level, 0xC0FFEE).unwrap_or_else(|e| panic!("{path}: {e}")))
-}
-
-/// Brute-force the retail film bit→action mapping using the score oracle:
-/// field1 records score+0xb3ac2 at the last frame, and the sim is
-/// deterministic given the film seed.
-fn film_test() {
-    use game::sim::{PlayerInput, Sim, SlotInput};
-    let dir = data_dir();
-    let mut a = assets::GameAssets::open(&dir).expect("open");
-    a.load_all_data();
-    // --filmtest <rid-hex> [--map b0,b1,...,b6]
-    let args: Vec<String> = std::env::args().collect();
-    let pos = args.iter().position(|x| x == "--filmtest").unwrap();
-    let film_rid = u32::from_str_radix(&args[pos + 1], 16).unwrap();
-    let film = a.film(film_rid).expect("film");
-    println!(
-        "film {:08x}: level={:08x} seed={:#x} gt={} frames={:?} score_marks={:?}",
-        film_rid, film.level_id, film.seed, film.game_type, film.frames, film.score_marks
-    );
-    // Debug single replay: --filmedbg (with --filmtest) shows per-10s status.
-    if args.iter().any(|a| a == "--filmedbg") {
-        let film = a.film(film_rid).expect("film");
-        let players = if film.frames[1] > 0 { 2 } else { 1 };
-        let rec = game::render::DemoRec::from_film(&film);
-        let n = film.frames[0].min(20000);
-        trace_replay(&mut a, film.level_id, players, film.seed as u64, &rec, n, &args);
-        return;
-    }
-    let players = if film.frames[1] > 0 { 2 } else { 1 };
-
-    // Field ids: 0=up 1=down 2=left 3=right 4=fire 5=bomb 6=cycle.
-    // bits {0,1} and {2,3} are the two axis pairs; bits {4,5,6} are the
-    // action buttons in some order. Try every axis/order/action assignment.
-    //
-    // NOTE: the true retail mapping is recovered from the decomp —
-    // G_Film::GetInputs permutes the byte into m_unk0..6 (= inputs[0..6])
-    // and G_Player/G_WeaponHandler consume inputs[0]=up [1]=right
-    // [2]=down [3]=left [4]=bomb(ground) [5]=air-fire [6]=cycle, giving
-    // map=[2,3,0,1,5,4,6] (bit0=left bit1=right bit2=up bit3=down
-    // bit4=bomb bit5=air-fire bit6=cycle). Earlier notes had bits 4/5
-    // swapped — the WeaponHandler Process args are (inputs[4]=inA=ground,
-    // inputs[5]=inB=air). Exact score replay still fails because
-    // rand()-stream parity needs every call site ordered like the
-    // original, so this search remains a diagnostic, not an oracle.
-    let perms = [
-        [4usize, 5, 6],
-        [4, 6, 5],
-        [5, 4, 6],
-        [5, 6, 4],
-        [6, 4, 5],
-        [6, 5, 4],
-    ];
-    let mut cands: Vec<[usize; 7]> = Vec::new();
-    for swap_axes in 0..2 {
-        for s0 in 0..2 {
-            for s1 in 0..2 {
-                let (ax, ay) = if swap_axes == 0 {
-                    ((0usize, 1usize), (2usize, 3usize))
-                } else {
-                    ((2usize, 3usize), (0usize, 1usize))
-                };
-                let mut map = [usize::MAX; 7];
-                map[0] = if s0 == 0 { ax.0 } else { ax.1 };
-                map[1] = if s0 == 0 { ax.1 } else { ax.0 };
-                map[2] = if s1 == 0 { ay.0 } else { ay.1 };
-                map[3] = if s1 == 0 { ay.1 } else { ay.0 };
-                for perm in perms {
-                    let mut m = map;
-                    m[4] = perm[0];
-                    m[5] = perm[1];
-                    m[6] = perm[2];
-                    cands.push(m);
-                }
-            }
-        }
-    }
-    let mut best: Vec<(i64, i64, [usize; 7])> = Vec::new();
-    for map in cands {
-        // Replay.
-        let mut sim = game::render::start_level(&mut a, film.level_id, players, film.seed as u64)
-            .expect("level");
-        let n = film.frames[0].min(20000);
-        for t in 0..n {
-            let mk = |p: usize| -> SlotInput {
-                let b = film.inputs[p].get(t).copied().unwrap_or(0);
-                let mut s = SlotInput::default();
-                for (bit, &f) in map.iter().enumerate() {
-                    if b & (1 << bit) != 0 {
-                        match f {
-                            0 => s.up = true,
-                            1 => s.down = true,
-                            2 => s.left = true,
-                            3 => s.right = true,
-                            4 => s.fire = true,
-                            5 => s.bomb = true,
-                            _ => s.cycle = true,
-                        }
-                    }
-                }
-                s
-            };
-            let inp = PlayerInput { p1: mk(0), p2: mk(1) };
-            sim.step(&a, &inp);
-        }
-        let score = sim.players[0].as_ref().map(|p| p.score).unwrap_or(-1);
-        let alive = sim.players[0]
-            .as_ref()
-            .map(|p| p.lives)
-            .unwrap_or(0);
-        best.push((score, alive, map));
-    }
-    best.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-    for (s, l, m) in best.iter().take(10) {
-        println!("score={:>8} lives={} diff={:>8} map={:?}", s, l, (s - film.score_marks[0]).abs(), m);
-    }
-    println!("expected score_marks={:?}", film.score_marks);
+    Some(game::render::InputScript::from_script(&text, level, 0xC0FFEE).unwrap_or_else(|e| panic!("{path}: {e}")))
 }
 
 fn perm_probe() {
@@ -504,8 +278,8 @@ fn dims_probe() {
     println!("sprite_dims: warmed={warmed} missing={missing} total={}", a.sprite_dims.len());
     for rid in [pak::id("pl1c"), pak::id("buzz"), pak::id("cass"), pak::id("allp"), pak::id("plla"), pak::id("bu01")] {
         match a.sprite_dims.get(&rid) {
-            Some(d) => println!("  {:08x} {}: {} frames first={:?}", rid, game::sim::rid_str(rid), d.len(), d.first()),
-            None => println!("  {:08x} {}: NO DIMS", rid, game::sim::rid_str(rid)),
+            Some(d) => println!("  {:08x} {}: {} frames first={:?}", rid, pak::rid_str(rid), d.len(), d.first()),
+            None => println!("  {:08x} {}: NO DIMS", rid, pak::rid_str(rid)),
         }
     }
 }
@@ -609,10 +383,14 @@ fn og_film(args: &[String], pos: usize) {
     }
 }
 
-/// `--og-live-test <ticks>`: a 1-player game at level 1 on the ported game
-/// with no input; per tick the number of draw items and player 0's state.
-fn og_live_test(args: &[String], pos: usize) {
-    let ticks: u32 = args.get(pos + 1).and_then(|s| s.parse().ok()).expect("--og-live-test needs a tick count");
+/// A live game on the port, headless. `--og-live-test <ticks>` prints one
+/// line per tick; `--trace --input <file>` runs an input script to its end
+/// and prints a line every `--every N` ticks (default 600). Both take
+/// `--level <leNN | N>`, `--players N`, `--seed N`, `--god` (shields kept
+/// full), `--items` (the draw list after each printed tick) and
+/// `--entities-at t1,t2,...` (raw `E` lines, as `OG_ENTS` does for films).
+fn og_trace(args: &[String], ticks: Option<u32>) {
+    use std::io::Write;
     let dir = data_dir();
     let exe_path = [dir.join("../../DeimosRising.exe"), PathBuf::from("retail/DeimosRising.exe")]
         .into_iter()
@@ -620,64 +398,87 @@ fn og_live_test(args: &[String], pos: usize) {
         .expect("DeimosRising.exe not found next to the data directory");
     let exe = std::fs::read(exe_path).expect("read exe");
     let mut s = game::og::session::Session::new(&exe, &dir).expect("session");
-    let seed: u32 = arg_value(args, "--seed").and_then(|v| v.parse().ok()).unwrap_or(12345);
-    let level: i32 = arg_value(args, "--level").and_then(|v| v.parse().ok()).unwrap_or(1);
-    s.start_game(1, level, seed).expect("start_game");
-    println!(
-        "start: level {} items={} texts={} bg scroll_y={} view={}x{} buffer={}x{}",
-        s.level_number(),
-        s.frame().items.len(),
-        s.frame().texts.len(),
-        s.frame().background.scroll_y,
-        s.frame().background.view_w,
-        s.frame().background.view_h,
-        s.frame().background.width,
-        s.frame().background.height
-    );
-    for _ in 0..ticks {
+    // Level by mission number or by resource id.
+    let level: i32 = match arg_value(args, "--level") {
+        None => 1,
+        Some(v) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => match game::og::level::G_Level_Get1BasedNumForLevelID(&mut s.g, id(&v) as i32) {
+                n if n >= 1 => n,
+                _ => panic!("unknown level {v}"),
+            },
+        },
+    };
+    let players: i32 = arg_value(args, "--players").and_then(|v| v.parse().ok()).unwrap_or(1);
+    let script = load_input_script(args, 0);
+    let seed: u32 = arg_value(args, "--seed")
+        .and_then(|v| v.parse().ok())
+        .or(script.as_ref().map(|sc| sc.seed as u32))
+        .unwrap_or(12345);
+    let ticks = ticks.unwrap_or_else(|| script.as_ref().map(|sc| sc.frames() as u32).expect("--trace needs --input <file>"));
+    let every: u32 = if script.is_some() && args.iter().any(|a| a == "--trace") {
+        arg_value(args, "--every").and_then(|v| v.parse().ok()).unwrap_or(600)
+    } else {
+        1
+    };
+    let ents_at: Vec<i32> = arg_value(args, "--entities-at")
+        .map(|v| v.split(',').filter_map(|x| x.trim().parse().ok()).collect())
+        .unwrap_or_default();
+    let god = args.iter().any(|a| a == "--god");
+    let items = args.iter().any(|a| a == "--items");
+    s.start_game(players, level, seed).expect("start_game");
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let _ = writeln!(out, "start: level {} ({}) players={players} seed={seed}", s.level_number(), pak::rid_str(s.level_id()));
+    for i in 0..ticks {
         if !s.is_playing() {
-            println!("ended: {:?}", s.end_reason());
+            let _ = writeln!(out, "ended: {:?}", s.end_reason());
             break;
         }
         let t = s.game_time();
-        if args.iter().any(|a| a == "--god") {
+        if ents_at.contains(&t) {
+            game::og::play::write_entities(&s.g, t, &mut out);
+        }
+        if god {
             let p0 = s.g.m.r32(game::og::game::PLAYERS);
             game::og::player::G_Player_Shields_SetPercentage(&mut s.g, p0, 100.0);
         }
-        s.tick([[false; 7]; 2]);
-        let p = s.player(0);
+        let inputs = script.as_ref().map(|sc| sc.og_inputs(i as usize)).unwrap_or([[false; 7]; 2]);
+        s.tick(inputs);
+        if (i + 1) % every != 0 && i + 1 != ticks {
+            continue;
+        }
         let f = s.frame();
-        println!(
-            "t={} items={} texts={} particles={} p0: state={} pos=({:.1},{:.1}) score={} lives={} shields={:.1} money={} mult={} scroll_y={}",
-            t,
-            f.items.len(),
-            f.texts.len(),
-            f.particles.len(),
-            p.state,
-            p.x,
-            p.y,
-            p.score,
-            p.lives,
-            p.shields_pct,
-            p.money,
-            p.multiplier,
-            f.background.scroll_y
-        );
-        if args.iter().any(|a| a == "--items") {
-            for it in &f.items {
-                println!("    {:?}", it);
+        let (n_items, n_texts, n_particles, scroll_y) = (f.items.len(), f.texts.len(), f.particles.len(), f.background.scroll_y);
+        for slot in 0..players.clamp(1, 2) as usize {
+            let p = s.player(slot);
+            let _ = writeln!(
+                out,
+                "t={t} p{slot}: state={} pos=({:.1},{:.1}) score={} lives={} shields={:.1} money={} mult={} items={n_items} texts={n_texts} particles={n_particles} scroll_y={scroll_y}",
+                p.state, p.x, p.y, p.score, p.lives, p.shields_pct, p.money, p.multiplier
+            );
+        }
+        if items {
+            for it in &s.frame().items {
+                let _ = writeln!(out, "    {:?}", it);
             }
-            for it in &f.texts {
-                println!("    {:?}", it);
+            for it in &s.frame().texts {
+                let _ = writeln!(out, "    {:?}", it);
             }
         }
     }
+    let _ = writeln!(out, "final: level_complete={} game_over={} end_sequence={}", s.is_level_complete(), s.is_game_over(), s.end_sequence_started());
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(pos) = args.iter().position(|a| a == "--og-live-test") {
-        og_live_test(&args, pos);
+        let ticks = args.get(pos + 1).and_then(|s| s.parse().ok()).expect("--og-live-test needs a tick count");
+        og_trace(&args, Some(ticks));
+        return;
+    }
+    if args.iter().any(|a| a == "--trace") {
+        og_trace(&args, None);
         return;
     }
     if args.iter().any(|a| a == "--dump-data") {
@@ -777,17 +578,9 @@ fn main() {
             let mut names: Vec<_> = pak.names.values().collect();
             names.sort_by(|a, b| (&a.folder, &a.display).cmp(&(&b.folder, &b.display)));
             for n in names {
-                println!("{} {} {}", n.folder, game::sim::rid_str(n.rid), n.display);
+                println!("{} {} {}", n.folder, pak::rid_str(n.rid), n.display);
             }
         }
-        return;
-    }
-    if args.iter().any(|a| a == "--trace") {
-        trace_script(&args);
-        return;
-    }
-    if args.iter().any(|a| a == "--filmtest") {
-        film_test();
         return;
     }
     if args.iter().any(|a| a == "--pickups") {
@@ -846,10 +639,6 @@ fn main() {
         test_defs();
         return;
     }
-    if args.iter().any(|a| a == "--mediacheck") {
-        test_media();
-        return;
-    }
     if args.iter().any(|a| a == "--test-floats") {
         test_floats();
         return;
@@ -868,10 +657,6 @@ fn main() {
     }
     if args.iter().any(|a| a == "--strings") {
         test_strings();
-        return;
-    }
-    if args.iter().any(|a| a == "--test-sim") {
-        test_sim();
         return;
     }
     if let Some(pos) = args.iter().position(|a| a == "--rawim16") {
@@ -1582,7 +1367,7 @@ fn flag_census() {
     for u in a.units.values() {
         for st in &u.states {
             if st.flee_id != crate::pak::NONE_ID {
-                let s = game::sim::rid_str(st.flee_id);
+                let s = pak::rid_str(st.flee_id);
                 if !flee_vals.contains(&s) {
                     flee_vals.push(s);
                 }
@@ -1631,340 +1416,6 @@ fn test_unit(ridv: u32) {
             println!("  state[{}] '{}' spr={:08x} dirs={} fpd={} framedly={} maxspd={} delta={} ontimer={}-{}->'{}' delNoPl={} destrNoPl={} destrScroll={} rules={:?}", i, st.name, st.sprite_face, st.num_directions, st.frames_per_direction, st.frame_delay, st.max_speed, st.delta, st.on_timer_min, st.on_timer_max, st.on_timer_change_to, st.delete_on_no_active_players, st.destruct_on_no_active_players, st.destruct_if_scrolling_not_paused, st.rules.iter().map(|r|(r.name.clone(),r.unit_id,r.range,r.condition.clone(),r.action.clone())).collect::<Vec<_>>());
             for ss in &st.spawn_sets { println!("     spawnset '{}' id={:08x} x={} y={} rate={}-{} volley={}-{} delay={}-{} repeat={}", ss.name, ss.spawn_id, ss.x_offset, ss.y_offset, ss.rate_min, ss.rate_max, ss.volley_min, ss.volley_max, ss.delay_between_min, ss.delay_between_max, ss.repeat_spawns); }
         }
-    }
-}
-
-/// Media-mask end-to-end check: spawn each media-impact ground unit on and
-/// off the le01 water band, destroy it, and verify the perm-object splash
-/// spawn (object_ids 6..=9) appears only on media.
-fn test_media() {
-    use game::sim::{PlayerInput, SpawnReq};
-    use glam::Vec2;
-    let dir = data_dir();
-    let mut assets = assets::GameAssets::open(&dir).expect("open");
-    assets.load_all_data();
-    let level_id = pak::id("le01");
-    let mut sim = game::render::start_level(&mut assets, level_id, 1, 1).expect("level");
-    let m = sim.media_mask.as_ref().expect("media mask").clone();
-    let tile = sim.media_tile_size.max(1) as u32;
-    let level_h = (sim.level.background[3] - sim.level.background[1]).max(1) as f32;
-    println!(
-        "mask {}x{} tile={} scroll={} level_h={}",
-        m.w, m.h, tile, sim.scroll, level_h
-    );
-    // Find a media tile (0x1f) and a dry tile, preferring mid-screen x.
-    // tile (tx,ty) -> loc=(tx*t+2, ty*t+2) -> pos=(loc_x-32, level_h-loc_y).
-    let mut media_tile = None;
-    let mut dry_tile = None;
-    'scan: for ty in 0..m.h {
-        for tx in 0..m.w {
-            let v = m.at(tx, ty);
-            if v == 0x1f && media_tile.is_none() && tx > m.w / 4 && tx < m.w * 3 / 4 {
-                media_tile = Some((tx, ty));
-            }
-            if v != 0x1f && dry_tile.is_none() && tx > m.w / 4 && tx < m.w * 3 / 4 {
-                dry_tile = Some((tx, ty));
-            }
-            if media_tile.is_some() && dry_tile.is_some() {
-                break 'scan;
-            }
-        }
-    }
-    let tile_to_pos = |(tx, ty): (u32, u32)| -> (Vec2, f32) {
-        let loc_x = (tx * tile + tile / 2) as f32;
-        let loc_y = (ty * tile + tile / 2) as f32;
-        let pos = Vec2::new(loc_x - 32.0, level_h - loc_y);
-        // Park scroll so pos.y sits mid-view.
-        let scroll = (pos.y - 240.0).clamp(0.0, sim.max_scroll());
-        (pos, scroll)
-    };
-    let (media_pos, media_scroll) = media_tile.map(tile_to_pos).unwrap_or((Vec2::ZERO, 0.0));
-    let (dry_pos, dry_scroll) = dry_tile.map(tile_to_pos).unwrap_or((Vec2::ZERO, 0.0));
-    println!(
-        "media_tile={media_tile:?} pos={media_pos:?} scroll={media_scroll} | dry_tile={dry_tile:?} pos={dry_pos:?} scroll={dry_scroll}"
-    );
-    let mut media_rids = std::collections::HashSet::new();
-    for s in 6..=9usize {
-        if let Some((name, rid)) = assets.object_ids.entries.get(s) {
-            println!(
-                "  obj[{}] {:08x} {} unit_def={}",
-                s,
-                rid,
-                name,
-                assets.units.contains_key(rid)
-            );
-            media_rids.insert(*rid);
-        }
-    }
-    let count_media = |sim: &game::sim::Sim| -> Vec<ResId> {
-        sim.entities
-            .iter()
-            .filter(|e| !e.dead && media_rids.contains(&e.unit))
-            .map(|e| e.unit)
-            .collect()
-    };
-    for unit in [0x72746174u32, 0x72636f62, pak::id("plbo")] {
-        let uname = assets
-            .units
-            .get(&unit)
-            .map(|u| u.name.clone())
-            .unwrap_or_else(|| format!("{:08x}", unit));
-        if let Some(d) = assets.units.get(&unit) {
-            println!(
-                "  {uname}: states={} grp={}-{} appears={}% ponly={} notype={} ground={}",
-                d.states.len(),
-                d.num_in_group_min,
-                d.num_in_group_max,
-                d.appears_percent,
-                d.spawn_only_when_players_active,
-                d.do_not_spawn_if_type_exists,
-                d.is_ground_based
-            );
-        }
-        for (label, pos, scroll) in [
-            ("media", media_pos, media_scroll),
-            ("dry", dry_pos, dry_scroll),
-        ] {
-            let before = count_media(&sim).len();
-            // Entities outside the visible window [scroll, scroll+480]
-            // are culled on the first step — park the camera so the test
-            // position is on-screen. The media lookup is scroll-invariant.
-            sim.scroll = scroll;
-            // roll_spawn_count can legitimately return 0 — retry until one
-            // materialises (each attempt re-rolls).
-            let mut idx = None;
-            'spawn: for _attempt in 0..12 {
-                let n0 = sim.entities.len();
-                sim.request_spawn(
-                    &assets,
-                    SpawnReq {
-                        unit,
-                        pos,
-                        heading: None,
-                        heading_forced: false,
-                        owner: usize::MAX,
-                        spawner_player: -1,
-                        stationary: true,
-                        state: None,
-                    },
-                );
-                // request_spawn is synchronous — the entity is already in
-                // the list; take the newest match so retries don't alias.
-                if let Some(i) = sim.entities[n0..]
-                    .iter()
-                    .rposition(|e| e.unit == unit && !e.dead)
-                    .map(|r| n0 + r)
-                {
-                    idx = Some(i);
-                    break 'spawn;
-                }
-            }
-            let Some(idx) = idx else {
-                println!("{uname} @{label}: spawn FAILED");
-                continue;
-            };
-            sim.destroy_entity(&assets, idx, -1);
-            // reap sweep runs inside step(); the media spawn queues behind it.
-            for _ in 0..3 {
-                sim.step(&assets, &PlayerInput::default());
-            }
-            let spawned = count_media(&sim);
-            println!(
-                "{uname} @{label}: media_spawns={} {:?}",
-                spawned.len().saturating_sub(before),
-                spawned
-            );
-        }
-    }
-
-    // Coin release (sub_01ae10 at reap): Twin Gun drops 'slac' x1, but
-    // only when the killer is a real player (killer != -1).
-    let coin_rid = 0x736c6163u32; // 'slac'
-    let count_coins = |sim: &game::sim::Sim| {
-        sim.entities
-            .iter()
-            .filter(|e| !e.dead && e.unit == coin_rid)
-            .count()
-    };
-    for killer in [0i32, -1] {
-        let unit = 0x75677774u32; // 'ugwt' Twin Gun
-        let pos = Vec2::new(200.0, 240.0);
-        sim.scroll = 0.0;
-        let mut idx = None;
-        'cs: for _ in 0..12 {
-            let n0 = sim.entities.len();
-            sim.request_spawn(
-                &assets,
-                SpawnReq {
-                    unit,
-                    pos,
-                    heading: None,
-                    heading_forced: false,
-                    owner: usize::MAX,
-                    spawner_player: -1,
-                    stationary: true,
-                    state: None,
-                },
-            );
-            if let Some(i) = sim.entities[n0..]
-                .iter()
-                .rposition(|e| e.unit == unit && !e.dead)
-                .map(|r| n0 + r)
-            {
-                idx = Some(i);
-                break 'cs;
-            }
-        }
-        let Some(idx) = idx else {
-            println!("Twin Gun: spawn FAILED");
-            continue;
-        };
-        let before = count_coins(&sim);
-        sim.destroy_entity(&assets, idx, killer);
-        for _ in 0..3 {
-            sim.step(&assets, &PlayerInput::default());
-        }
-        println!(
-            "Twin Gun killer={killer}: coin_spawns={}",
-            count_coins(&sim).saturating_sub(before)
-        );
-    }
-}
-
-/// Headless sim smoke test: run le01 for `secs` seconds with scripted input.
-fn test_sim() {
-    use game::sim::{PlayerInput, SlotInput};
-    let dir = data_dir();
-    let mut assets = assets::GameAssets::open(&dir).expect("open");
-    assets.load_all_data();
-    let secs: u32 = std::env::args()
-        .position(|a| a == "--secs")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(30);
-    let level_arg = std::env::args()
-        .position(|a| a == "--level")
-        .and_then(|i| std::env::args().nth(i + 1));
-    let level_id = level_arg
-        .as_deref()
-        .map(pak::id)
-        .unwrap_or_else(|| pak::id("le01"));
-    let players: usize = std::env::args()
-        .position(|a| a == "--players")
-        .and_then(|i| std::env::args().nth(i + 1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1)
-        .clamp(1, 2);
-    let mut sim = game::render::start_level(&mut assets, level_id, players, 1).expect("level");
-    for tick in 0..secs * 60 {
-        // Scripted input: wiggle + periodic fire.
-        let t = tick as f32;
-        let fire = (tick / 45) % 2 == 0;
-        let p2in = if players == 2 {
-            SlotInput {
-                up: (t * 0.07).sin() > 0.4,
-                down: (t * 0.07).sin() < -0.4,
-                left: (t * 0.04).cos() < -0.4,
-                right: (t * 0.04).cos() > 0.4,
-                fire: (tick / 60) % 2 == 0,
-                bomb: (tick / 90) % 3 == 0,
-                cycle: false,
-            }
-        } else {
-            SlotInput::default()
-        };
-        let inp = PlayerInput {
-            p1: SlotInput {
-                up: (t * 0.05).sin() > 0.3,
-                down: (t * 0.05).sin() < -0.3,
-                left: (t * 0.03).cos() > 0.5,
-                right: (t * 0.03).cos() < -0.5,
-                fire,
-                bomb: false,
-                cycle: false,
-            },
-            p2: p2in,
-        };
-        sim.step(&assets, &inp);
-        if tick % 600 == 599 {
-            let p = sim.players[0].as_ref().unwrap();
-            let mut projs = 0usize;
-            let mut pickups = 0usize;
-            let mut pausers = 0usize;
-            for e in &sim.entities {
-                if e.dead {
-                    continue;
-                }
-                if let Some(d) = assets.units.get(&e.unit) {
-                    if d.player_projectile {
-                        projs += 1;
-                    }
-                    if d.pickup_type != pak::NONE_ID {
-                        pickups += 1;
-                    }
-                    if d.states.get(e.state).map(|s| s.pause_vertical_scrolling).unwrap_or(false) {
-                        pausers += 1;
-                    }
-                }
-            }
-            println!(
-                "t={:>4}s scroll={:7.1} ent={:>4} proj={:>3} pick={:>2}/{} pause={} hit={} kill={} ph={:?} p=({:5.1},{:5.1}) sh={:5.1} score={} money={} mult={} lives={} wpn={:08x} done={}",
-                tick / 60,
-                sim.scroll,
-                sim.entities.len(),
-                projs,
-                pickups,
-                sim.stat_pickups,
-                pausers,
-                sim.stat_hits,
-                sim.stat_kills,
-                sim.phase,
-                p.screen.x,
-                p.screen.y,
-                p.shields,
-                p.score,
-                p.money,
-                p.multiplier,
-                p.lives,
-                p.air_weapon,
-                sim.level_complete,
-            );
-        }
-        if sim.level_complete && tick % 60 == 0 {
-            let p = sim.players[0].as_ref().unwrap();
-            println!(
-                "  endseq={} pct={} bonus={}/{} rem={} tally(ph={} rem={} purse={}) score={} money={} perfect={} done={}",
-                sim.end_seq_state,
-                sim.end_bonus_percent,
-                sim.end_bonus_total,
-                sim.end_bonus_step,
-                sim.end_bonus_remaining,
-                p.money_tally.phase,
-                p.money_tally.remaining,
-                p.money_tally.purse,
-                p.score,
-                p.money,
-                sim.perfect_count,
-                sim.level_end_complete,
-            );
-        }
-        if sim.level_end_complete {
-            println!("LEVEL END COMPLETE at t={}s", tick / 60);
-            break;
-        }
-        if tick > 60 * 400 {
-            println!("TIMEOUT waiting for level end at t={}s state={}", tick / 60, sim.end_seq_state);
-            break;
-        }
-    }
-    // Final entity census.
-    let mut by_unit: std::collections::HashMap<u32, usize> = Default::default();
-    for e in &sim.entities {
-        *by_unit.entry(e.unit).or_default() += 1;
-    }
-    println!("final: {} entities, {} distinct units", sim.entities.len(), by_unit.len());
-    for (u, n) in by_unit.iter().take(10) {
-        println!("  {:08x}: {}", u, n);
     }
 }
 
