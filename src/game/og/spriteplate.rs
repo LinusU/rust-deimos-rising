@@ -2,12 +2,16 @@
 //! plate. Frames sit in bands marked in column 0 and are trimmed to the
 //! pixels that differ from their cell's background; the trimmed size is
 //! what `U_Sprite_GetDimensions` reports.
+//!
+//! The plate is generic over the pixel type: the original scans an 8-bit
+//! QuickTime buffer, which `assets::plate_pixels` models as colours
+//! compared at 4 bits per channel.
 
 /// One frame: (left, top, width, height) of the trimmed bitmap.
 pub type Rect = (i32, i32, i32, i32);
 
 /// `U_SpritePlate_GetBitmapRectListFromPlate` on an 8-bit plate.
-pub fn bitmap_rects(px: &[u8], stride: i32, width: i32, height: i32) -> Vec<Rect> {
+pub fn bitmap_rects<T: Copy + PartialEq>(px: &[T], stride: i32, width: i32, height: i32) -> Vec<Rect> {
     let mut out = Vec::new();
     if width < 3 || height < 2 || px.len() < 3 || px[0] == px[1] || px[1] == px[2] {
         return out;
@@ -20,7 +24,7 @@ pub fn bitmap_rects(px: &[u8], stride: i32, width: i32, height: i32) -> Vec<Rect
 }
 
 /// `sub_40e540`: the next frame after (row, col).
-fn next_bitmap(px: &[u8], stride: i32, width: i32, height: i32, io_row: &mut i32, io_col: &mut i32) -> Option<Rect> {
+fn next_bitmap<T: Copy + PartialEq>(px: &[T], stride: i32, width: i32, height: i32, io_row: &mut i32, io_col: &mut i32) -> Option<Rect> {
     let mut row = *io_row;
     let mut col = *io_col;
     if row == 0 {
@@ -53,7 +57,7 @@ fn next_bitmap(px: &[u8], stride: i32, width: i32, height: i32, io_row: &mut i32
 
 /// `sub_40e6e0`: rows from `start` until column 0 shows the marker
 /// colour `plate[1]`.
-fn band_height(px: &[u8], stride: i32, limit: i32, start: i32) -> Option<i32> {
+fn band_height<T: Copy + PartialEq>(px: &[T], stride: i32, limit: i32, start: i32) -> Option<i32> {
     let key = px[1];
     let mut run = 0;
     while start + run < limit && px[((start + run) * stride) as usize] != key {
@@ -64,7 +68,7 @@ fn band_height(px: &[u8], stride: i32, limit: i32, start: i32) -> Option<i32> {
 
 /// `sub_40e750`: columns from `start` with no marker pixel (`band[1]`)
 /// in the band's rows.
-fn cell_width(band: &[u8], stride: i32, limit: i32, rows: i32, start: i32) -> Option<i32> {
+fn cell_width<T: Copy + PartialEq>(band: &[T], stride: i32, limit: i32, rows: i32, start: i32) -> Option<i32> {
     let key = band[1];
     let span = rows * limit;
     let mut run = 0;
@@ -84,7 +88,7 @@ fn cell_width(band: &[u8], stride: i32, limit: i32, rows: i32, start: i32) -> Op
 
 /// `sub_40e7d0`: trim a cell to the pixels that differ from its corner
 /// colour; None when the cell is empty. Returns (x, y, w, h) inside it.
-fn trim(cell: &[u8], stride: i32, width: i32, height: i32) -> Option<Rect> {
+fn trim<T: Copy + PartialEq>(cell: &[T], stride: i32, width: i32, height: i32) -> Option<Rect> {
     let key = cell[0];
     let at = |r: i32, c: i32| cell[(r * stride + c) as usize];
     let row_empty = |r: i32| (0..width).all(|c| at(r, c) == key);

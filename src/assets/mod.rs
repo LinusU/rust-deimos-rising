@@ -315,11 +315,11 @@ impl GameAssets {
         self.sprites.get(&(Tag::Im08.code(), rid))
     }
 
-    /// The colour and alpha plates of sprite `rid` as 8-bit indexed pixels.
-    pub fn sprite_plates_indexed(&mut self, rid: ResId) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec<u8>))> {
-        let color_raw = self.set.read_raw(Tag::Im08, rid)?;
+    /// The frames `U_Sprite_Load` finds for sprite `rid`: `U_SpritePlate`
+    /// run on its uppercase (alpha) plate as `plate_pixels` models it.
+    pub fn sprite_frame_rects(&mut self, rid: ResId) -> Option<Vec<crate::game::og::spriteplate::Rect>> {
         let alpha_raw = self.set.read_raw(Tag::Im08, to_upper_id(rid))?;
-        Some((decode_gif_indexed(&color_raw)?, decode_gif_indexed(&alpha_raw)?))
+        plate_frame_rects(&alpha_raw)
     }
 
     /// Decode `rid`'s sprite and cache its per-frame (w,h) table for the
@@ -477,231 +477,63 @@ fn decode_gif_indexed(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
     Some((w as u32, h as u32, canvas))
 }
 
-// ---------------------------------------------------------------------------
-// Sprite plate scanning — port of U_SpritePlate_GetBitmapRectListFromPlate.
-// The "key" byte is `plate[1]`; rectangles of non-key pixels are the frames.
-// ---------------------------------------------------------------------------
-
-fn plate_row_run(d: &[u8], stride: usize, limit: usize, start: usize) -> Option<usize> {
-    let key = d[1];
-    let mut row = start * stride;
-    let mut run = 0usize;
-    while start + run < limit && d[row] != key {
-        row += stride;
-        run += 1;
-    }
-    (run > 0).then_some(run)
-}
-
-fn plate_col_run(
-    d: &[u8],
-    band: usize,
-    stride: usize,
-    limit: usize,
-    rows: usize,
-    start: usize,
-) -> Option<usize> {
-    let key = d[band + 1];
-    let span = rows * stride;
-    let mut column = band + start;
-    let mut run = 0usize;
-    while start + run < limit {
-        let mut offset = 0usize;
-        while offset < span && d[column + offset] != key {
-            offset += stride;
-        }
-        if offset < span {
-            break;
-        }
-        run += 1;
-        column += 1;
-    }
-    (run > 0).then_some(run)
-}
-
-/// Trim the uniform border of one candidate block; returns (offset, w, h).
-fn plate_trim(
-    d: &[u8],
-    plate: usize,
-    stride: usize,
-    width: usize,
-    height: usize,
-) -> Option<(usize, usize, usize)> {
-    let key = d[plate];
-    let mut top = 0usize;
-    let mut offset = 0usize;
-    loop {
-        if top >= height {
-            return None;
-        }
-        let mut col = 0usize;
-        while col < width && d[plate + offset + col] == key {
-            col += 1;
-        }
-        if col < width {
-            break;
-        }
-        top += 1;
-        offset += stride;
-    }
-    let mut bottom = 0usize;
-    offset = (height - 1) * stride;
-    loop {
-        if bottom >= height {
-            return None;
-        }
-        let mut col = 0usize;
-        while col < width && d[plate + offset + col] == key {
-            col += 1;
-        }
-        if col < width {
-            break;
-        }
-        bottom += 1;
-        if offset < stride {
-            return None;
-        }
-        offset -= stride;
-    }
-    let out_h = height - top - bottom;
-    let limit = (top + out_h) * stride;
-    let mut column = 0usize;
-    loop {
-        if column >= width {
-            return None;
-        }
-        let mut scan = top * stride;
-        while scan < limit && d[plate + scan + column] == key {
-            scan += stride;
-        }
-        if scan < limit {
-            break;
-        }
-        column += 1;
-    }
-    let mut right = 0usize;
-    loop {
-        if right >= width {
-            break;
-        }
-        let mut scan = top * stride;
-        while scan < limit && d[plate + (width + scan) - right - 1] == key {
-            scan += stride;
-        }
-        if scan < limit {
-            break;
-        }
-        right += 1;
-    }
-    Some((plate + top * stride + column, width - column - right, out_h))
-}
-
-/// Resumable cursor over the plate, mirroring `sub_40e540`'s ioRow/ioCol.
-struct PlateScanner<'a> {
-    d: &'a [u8],
-    stride: usize,
-    width: usize,
-    height: usize,
-    row: usize,
-    col: usize,
-}
-
-impl<'a> PlateScanner<'a> {
-    /// Find the next bitmap rect; returns (left, top, w, h).
-    fn find_one(&mut self) -> Option<(usize, usize, usize, usize)> {
-        let d = self.d;
-        let stride = self.stride;
-        let (width, height) = (self.width, self.height);
-        let mut row = self.row;
-        let mut col = self.col;
-        if row == 0 {
-            row = 1;
-        }
-        while row < height {
-            if let Some(rr) = plate_row_run(d, stride, height, row) {
-                let band = row * stride;
-                while col < width {
-                    if let Some(cr) = plate_col_run(d, band, stride, width, rr, col) {
-                        if let Some((_bo, bw, bh)) = plate_trim(d, band + col, stride, cr, rr) {
-                            self.row = row;
-                            self.col = col + cr + 1;
-                            let left = col + 1;
-                            let top = (rr - bh) + row - 1;
-                            return Some((left, top, bw, bh));
-                        }
-                        col += cr;
-                    }
-                    col += 1;
-                }
-                row += rr;
-                col = 0;
-            }
-            row += 1;
-        }
-        None
-    }
-}
-
-/// Find every frame rectangle in an alpha plate (indexed pixels).
-fn plate_rects(alpha: &[u8], w: usize, h: usize) -> Vec<(usize, usize, usize, usize)> {
-    let mut s = PlateScanner {
-        d: alpha,
-        stride: w,
-        width: w,
-        height: h,
-        row: 0,
-        col: 0,
+/// An 8-bit plate as the original scans it. `U_Image_GetPixelBuffer`
+/// has QuickTime draw the GIF into an 8-bit GWorld, whose rows are padded
+/// to 4 bytes and whose pixels are indices found through an inverse table:
+/// colours agreeing in their top 4 bits per channel get the same index.
+/// Each pixel is that 4-4-4 colour; padding never equals a pixel. Returns
+/// (width, height, stride, pixels). Checked against every sprite plate
+/// the original scans for Demo 01's level (tools/oracle/plates.py,
+/// spritedims.py).
+fn plate_pixels(data: &[u8]) -> Option<(usize, usize, usize, Vec<u16>)> {
+    let mut opts = gif::DecodeOptions::new();
+    opts.set_color_output(gif::ColorOutput::Indexed);
+    let mut decoder = opts.read_info(data).ok()?;
+    let global = decoder.global_palette().map(|p| p.to_vec());
+    let (w, h) = (decoder.width() as usize, decoder.height() as usize);
+    let frame = decoder.read_next_frame().ok()??;
+    let pal = frame.palette.clone().or(global)?;
+    let rgb444 = |i: u8| -> u16 {
+        let c = |k: usize| pal.get(i as usize * 3 + k).copied().unwrap_or(0) as u16 >> 4;
+        (c(0) << 8) | (c(1) << 4) | c(2)
     };
-    let mut out = Vec::new();
-    while let Some(r) = s.find_one() {
-        out.push(r);
+    let stride = (w + 3) & !3;
+    let mut px = vec![u16::MAX; stride * h];
+    let (fw, fh, fl, ft) = (frame.width as usize, frame.height as usize, frame.left as usize, frame.top as usize);
+    let bg = rgb444(0);
+    for y in 0..h {
+        for x in 0..w {
+            px[y * stride + x] = bg;
+        }
     }
-    out
+    for y in 0..fh.min(h.saturating_sub(ft)) {
+        for x in 0..fw.min(w.saturating_sub(fl)) {
+            px[(ft + y) * stride + fl + x] = rgb444(frame.buffer[y * fw + x]);
+        }
+    }
+    Some((w, h, stride, px))
 }
 
-/// The frames of a sprite plate pair. `U_Sprite_Load` takes them from the
-/// uppercase (alpha) 8-bit plate with `U_SpritePlate`. The port's trim on the
-/// raw GIF indices of that plate keeps the cell's own background rows and
-/// columns where the original's 8-bit buffer does not (the glow sprites show
-/// them as lines), while the colour plate's rectangles are too big wherever its
-/// cell background is dithered: a frame is the part of the alpha plate's
-/// rectangle that lies in the colour plate's rectangle over it.
-fn frame_rects(color: &[u8], alpha_idx: &[u8], w: usize, h: usize) -> Option<Vec<(usize, usize, usize, usize)>> {
-    use crate::game::og::spriteplate::bitmap_rects;
-    let (cw, ch, cidx) = decode_gif_indexed(color)?;
-    let cr = bitmap_rects(&cidx, cw as i32, cw as i32, ch as i32);
-    let ar = bitmap_rects(alpha_idx, w as i32, w as i32, h as i32);
-    let mut out = Vec::new();
-    for a in ar {
-        let (a0, a1, a2, a3) = (a.0, a.1, a.0 + a.2, a.1 + a.3);
-        // The colour rectangle overlapping this one the most.
-        let best = cr
-            .iter()
-            .map(|c| {
-                let (x0, y0, x1, y1) = (a0.max(c.0), a1.max(c.1), a2.min(c.0 + c.2), a3.min(c.1 + c.3));
-                (x0, y0, x1, y1)
-            })
-            .filter(|r| r.2 > r.0 && r.3 > r.1)
-            .max_by_key(|r| (r.2 - r.0) * (r.3 - r.1));
-        let r = best.unwrap_or((a0, a1, a2, a3));
-        out.push((r.0.max(0) as usize, r.1.max(0) as usize, (r.2 - r.0).max(1) as usize, (r.3 - r.1).max(1) as usize));
-    }
-    Some(out)
+/// `U_SpritePlate` on the plate GIF `data` (see `plate_pixels`).
+fn plate_frame_rects(data: &[u8]) -> Option<Vec<crate::game::og::spriteplate::Rect>> {
+    let (w, h, stride, px) = plate_pixels(data)?;
+    Some(crate::game::og::spriteplate::bitmap_rects(&px, stride as i32, w as i32, h as i32))
 }
 
 /// Decode a sprite: colour plate (original case) + alpha plate (uppercase).
 fn decode_sprite(color: &[u8], alpha: &[u8]) -> Option<Sprite> {
     let (cw, ch, color_px) = decode_gif_rgba(color)?;
-    let (aw, ah, alpha_idx) = decode_gif_indexed(alpha)?;
+    let (aw, ah, _) = decode_gif_indexed(alpha)?;
     if cw != aw || ch != ah {
         return None;
     }
     let (w, h) = (cw as usize, ch as usize);
     // The frames drawn are the rectangles `U_SpritePlate` finds on the
-    // alpha plate (the port's `spriteplate`): on the colour plate the
-    // glow-type sprites keep whole cells, but the original draws the
-    // trimmed frame centred on the object (checked against screenshots).
-    let rects = frame_rects(color, &alpha_idx, w, h)?;
+    // alpha plate.
+    let rects: Vec<(usize, usize, usize, usize)> = plate_frame_rects(alpha)?
+        .into_iter()
+        .map(|r| (r.0.max(0) as usize, r.1.max(0) as usize, r.2.max(1) as usize, r.3.max(1) as usize))
+        .collect();
     if rects.is_empty() {
         return None;
     }

@@ -62,8 +62,7 @@ impl AssetHost {
 }
 
 impl AssetHost {
-    /// The sprite's frames as `U_SpritePlate` finds them on the colour
-    /// plate (cached).
+    /// The sprite's frames as `U_SpritePlate` finds them (cached).
     fn frames(&self, id: u32) -> Vec<spriteplate::Rect> {
         if let Some(r) = self.frame_cache.borrow().get(&id) {
             return r.clone();
@@ -71,8 +70,7 @@ impl AssetHost {
         let rects = self
             .assets
             .borrow_mut()
-            .sprite_plates_indexed(id)
-            .map(|((w, h, px), _)| spriteplate::bitmap_rects(&px, w as i32, w as i32, h as i32))
+            .sprite_frame_rects(id)
             .unwrap_or_default();
         self.frame_cache.borrow_mut().insert(id, rects.clone());
         rects
