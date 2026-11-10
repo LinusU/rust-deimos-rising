@@ -55,3 +55,33 @@ and `sim.rs` goes away.
    spawns at row `scrollOffset - 0x40`; level-end sequence
 6. G_EG_Process; its result stops or resumes vertical scrolling
 7. G_Game_Play increments the game time (the first tick runs at time 0)
+
+## Porting conventions (`src/game/og/`)
+
+The port is a C-level translation that keeps the original's memory layout,
+so a function can be translated from the disassembly line by line:
+
+- `mem::Mem` is a flat 32-bit address space. The retail executable's
+  sections are mapped at their virtual addresses, so globals keep their
+  addresses (`m.r32(0x4de708)` is `g_bgndVerticalScroll`) and constants
+  come from the exe. Heap objects (`m.alloc`) keep the original field
+  offsets; pointers are plain `u32` addresses, 0 is null.
+- Locals whose address is passed to another function live on the scratch
+  stack: `let sp = m.sp; let req = m.alloca(0x28); ...; m.pop_to(sp);`.
+- `mem::list` is `U_LinkedList`; a `U_LinkRef` is 8 bytes {link, object}.
+- Each original function becomes a Rust function named after it (snake
+  case), with its address in the doc comment. `this` and pointer
+  arguments are `u32`. Calls go to the ported callee; never inline a
+  callee differently from the original.
+- Floating point: the x87 runs at double precision (FPU control word
+  0x23f). Evaluate expressions in `f64`; every `fstp dword`/`fst dword`
+  rounds to `f32` (`as f32`); `fistp`-style conversions use
+  `umath::ftol` (truncation). Comparisons follow the `fcomp`/`fnstsw`
+  test exactly, including what NaN does.
+- `rand()` is the MSL LCG (`state = state * 1103515245 + 12345`, result
+  `(state >> 16) & 0x7fff`); draw order must never change.
+- Unit definitions are `G_UnitDef` images (`unitdef.rs`) copied into
+  memory; their layout was verified against the original's memory.
+- Trust decompiled C++ only for rows marked `complete` in
+  `scratch/deimos-rising-decomp/config/reconstruction.csv`; translate the
+  rest from the disassembly (`tools/oracle/x86dis.py`).

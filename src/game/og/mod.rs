@@ -4,3 +4,4 @@
 pub mod token;
 pub mod umath;
 pub mod unitdef;
+pub mod mem;
