@@ -30,3 +30,4 @@ pub mod pixbuf;
 pub mod load;
 pub mod init;
 pub mod play;
+pub mod spriteplate;

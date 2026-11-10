@@ -379,6 +379,13 @@ impl GameAssets {
         self.sprites.get(&(Tag::Im08.code(), rid))
     }
 
+    /// The colour and alpha plates of sprite `rid` as 8-bit indexed pixels.
+    pub fn sprite_plates_indexed(&mut self, rid: ResId) -> Option<((u32, u32, Vec<u8>), (u32, u32, Vec<u8>))> {
+        let color_raw = self.set.read_raw(Tag::Im08, rid)?;
+        let alpha_raw = self.set.read_raw(Tag::Im08, to_upper_id(rid))?;
+        Some((decode_gif_indexed(&color_raw)?, decode_gif_indexed(&alpha_raw)?))
+    }
+
     /// Decode `rid`'s sprite and cache its per-frame (w,h) table for the
     /// sim's collision bounds. Safe to call for missing/non-im08 rids —
     /// they are skipped.

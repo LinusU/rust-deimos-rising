@@ -26,7 +26,8 @@ use super::init::*;
 use super::input::G_Input_AssumeControl;
 use super::level::{self, LEVEL_SIZE};
 use super::load::{load_game_data, PakHost};
-use super::mem::Mem;
+use super::mem::{list, Mem};
+use super::spriteplate;
 use super::player::G_Player_InGame;
 use super::resource::G_Res_GetPermFloat;
 use super::umath::ftol;
@@ -41,11 +42,30 @@ const REGISTRATION: u32 = 0x52b688;
 /// remake's asset loader.
 pub struct AssetHost {
     assets: RefCell<GameAssets>,
+    frame_cache: RefCell<std::collections::HashMap<u32, Vec<spriteplate::Rect>>>,
 }
 
 impl AssetHost {
     pub fn open(paks: &Path) -> std::io::Result<AssetHost> {
-        Ok(AssetHost { assets: RefCell::new(GameAssets::open(paks)?) })
+        Ok(AssetHost { assets: RefCell::new(GameAssets::open(paks)?), frame_cache: Default::default() })
+    }
+}
+
+impl AssetHost {
+    /// The sprite's frames as `U_SpritePlate` finds them on the colour
+    /// plate (cached).
+    fn frames(&self, id: u32) -> Vec<spriteplate::Rect> {
+        if let Some(r) = self.frame_cache.borrow().get(&id) {
+            return r.clone();
+        }
+        let rects = self
+            .assets
+            .borrow_mut()
+            .sprite_plates_indexed(id)
+            .map(|((w, h, px), _)| spriteplate::bitmap_rects(&px, w as i32, w as i32, h as i32))
+            .unwrap_or_default();
+        self.frame_cache.borrow_mut().insert(id, rects.clone());
+        rects
     }
 }
 
@@ -54,14 +74,10 @@ impl Host for AssetHost {
         if frame < 0 {
             return None;
         }
-        let mut a = self.assets.borrow_mut();
-        a.warm_sprite_dims(id);
-        a.sprite_dims.get(&id)?.get(frame as usize).map(|&(w, h)| (w as i32, h as i32))
+        self.frames(id).get(frame as usize).map(|r| (r.2, r.3))
     }
     fn sprite_num_frames(&self, id: u32) -> i32 {
-        let mut a = self.assets.borrow_mut();
-        a.warm_sprite_dims(id);
-        a.sprite_dims.get(&id).map(|d| d.len() as i32).unwrap_or(0)
+        self.frames(id).len() as i32
     }
     fn has_image(&self, id: u32) -> bool {
         self.sprite_num_frames(id) > 0

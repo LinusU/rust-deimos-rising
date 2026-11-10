@@ -619,6 +619,22 @@ fn main() {
         cat(&args[2], &args[3]);
         return;
     }
+    // --sprite-dims <id>: every frame's width and height as the remake reads them.
+    if let Some(sid) = arg_value(&args, "--sprite-dims") {
+        let mut a = assets::GameAssets::open(&data_dir()).expect("open");
+        a.warm_sprite_dims(id(&sid));
+        if let Some(((cw, ch, c), (aw, ah, al))) = a.sprite_plates_indexed(id(&sid)) {
+            let cr = game::og::spriteplate::bitmap_rects(&c, cw as i32, cw as i32, ch as i32);
+            let ar = game::og::spriteplate::bitmap_rects(&al, aw as i32, aw as i32, ah as i32);
+            for i in 0..cr.len().max(ar.len()) {
+                println!("plate {i} color {:?} alpha {:?}", cr.get(i), ar.get(i));
+            }
+        }
+        for (i, (w, h)) in a.sprite_dims.get(&id(&sid)).cloned().unwrap_or_default().iter().enumerate() {
+            println!("{i} {w}x{h}");
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--dims") {
         dims_probe();
         return;
