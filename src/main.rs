@@ -613,6 +613,18 @@ fn main() {
         return;
     }
     // --ls <pak-name-part>: list a pak's resources (tag folder, id, name).
+    // --og-unitdef <id> <out>: the ported G_UnitDef image for one unit.
+    if let Some(pos) = args.iter().position(|a| a == "--og-unitdef") {
+        let mut set = PakSet::open_dir(&data_dir()).expect("open paks");
+        let rid = id(&args[pos + 1]);
+        let text = set.read_text(Tag::Unde, rid).expect("unit not found");
+        let has_image = |r: u32| set.find(Tag::Im16, r).is_some() || set.find(Tag::Im08, r).is_some();
+        let mut t = text.into_bytes();
+        t.push(0);
+        let d = game::og::unitdef::UnitDef::parse(rid, &t, &has_image);
+        std::fs::write(&args[pos + 2], &d.img).expect("write");
+        return;
+    }
     if let Some(part) = arg_value(&args, "--ls") {
         let set = PakSet::open_dir(&data_dir()).expect("open paks");
         for (path, pak) in &set.paks {
