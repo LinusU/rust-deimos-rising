@@ -5,6 +5,15 @@ the four retail demo films: replayed in the remake, every tick must show the
 same rand() stream, spawns, state changes and positions as the original
 running in Drydock, ending on the score the film records (Demo 01: 25050).
 
+## Status
+
+All four demo films replay through `src/game/og` tick for tick like the
+original (rand() stream, player 1's position, state and score on every
+tick, checked against complete Drydock traces with
+`tools/oracle/cmpog.py`): Demo 01 to 25050, Demo 02 to 116180, Demo 03 to
+57520, Demo 04 to 24670. Remaining: the renderer and live play still run
+on `sim.rs`.
+
 ## Why a port and not more fixes
 
 `src/game/sim.rs` was written from the decompilation's names but not its
