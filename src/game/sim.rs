@@ -994,6 +994,9 @@ impl Sim {
     /// rolls, gates, and the spawn_one chain all happen inline, in
     /// request order.
     pub fn request_spawn(&mut self, assets: &GameAssets, req: SpawnReq) {
+        if rand_log_enabled() {
+            eprintln!("S {} at=({:.2},{:.2})", rid_str(req.unit), req.pos.x, req.pos.y);
+        }
         let count = self.roll_spawn_count(assets, req.unit);
         if std::env::var("DEIMOS_COINLOG").is_ok() && req.unit == id("cass") {
             eprintln!("t={} reqspawn cass count={} pos={:?}", self.game_time, count, req.pos);
@@ -1006,6 +1009,9 @@ impl Sim {
 
     /// Spawn pinned to a fixed screen position (notice banners).
     pub fn request_spawn_screen(&mut self, assets: &GameAssets, req: SpawnReq, screen: Vec2) {
+        if rand_log_enabled() {
+            eprintln!("S {} at=({:.2},{:.2})", rid_str(req.unit), req.pos.x, req.pos.y);
+        }
         let count = self.roll_spawn_count(assets, req.unit);
         if count <= 0 {
             return;
