@@ -5,4 +5,5 @@
 pub mod env;
 pub mod obs;
 pub mod server;
+pub mod copilot;
 pub mod policy;

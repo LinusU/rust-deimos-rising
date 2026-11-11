@@ -387,7 +387,8 @@ fn og_film(args: &[String], pos: usize) {
 /// A live game on the port, headless. `--og-live-test <ticks>` prints one
 /// line per tick; `--trace --input <file>` runs an input script to its end
 /// and prints a line every `--every N` ticks (default 600). Both take
-/// `--level <leNN | N>`, `--players N`, `--seed N`, `--god` (shields kept
+/// `--level <leNN | N>`, `--players N`, `--seed N`, `--copilot <policy.bin>`
+/// (the bot flies player 2), `--god` (shields kept
 /// full), `--items` (the draw list after each printed tick) and
 /// `--entities-at t1,t2,...` (raw `E` lines, as `OG_ENTS` does for films).
 fn og_trace(args: &[String], ticks: Option<u32>) {
@@ -427,6 +428,11 @@ fn og_trace(args: &[String], ticks: Option<u32>) {
         .unwrap_or_default();
     let god = args.iter().any(|a| a == "--god");
     let items = args.iter().any(|a| a == "--items");
+    // --copilot <policy.bin>: the trained bot flies player 2.
+    let mut copilot = arg_value(args, "--copilot").map(|p| {
+        let pol = rl::policy::Policy::load(std::path::Path::new(&p)).expect("co-pilot policy");
+        rl::copilot::CoPilot::new(pol, 1, 1.0, seed as u64)
+    });
     s.start_game(players, level, seed).expect("start_game");
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::new(stdout.lock());
@@ -444,7 +450,10 @@ fn og_trace(args: &[String], ticks: Option<u32>) {
             let p0 = s.g.m.r32(game::og::game::PLAYERS);
             game::og::player::G_Player_Shields_SetPercentage(&mut s.g, p0, 100.0);
         }
-        let inputs = script.as_ref().map(|sc| sc.og_inputs(i as usize)).unwrap_or([[false; 7]; 2]);
+        let mut inputs = script.as_ref().map(|sc| sc.og_inputs(i as usize)).unwrap_or([[false; 7]; 2]);
+        if let Some(c) = copilot.as_mut() {
+            inputs[c.slot] = c.input(&mut s);
+        }
         s.tick(inputs);
         if (i + 1) % every != 0 && i + 1 != ticks {
             continue;
