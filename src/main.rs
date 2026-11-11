@@ -2,6 +2,7 @@ mod assets;
 mod data;
 mod game;
 mod pak;
+mod rl;
 
 use pak::{id, PakSet, ResId, Tag, NONE_ID};
 use std::path::PathBuf;
@@ -472,6 +473,24 @@ fn og_trace(args: &[String], ticks: Option<u32>) {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--rl-parity") {
+        rl::server::parity(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--rl-server" || a == "--rl-bench") {
+        let dir = data_dir();
+        let exe_path = [dir.join("../../DeimosRising.exe"), PathBuf::from("retail/DeimosRising.exe")]
+            .into_iter()
+            .find(|p| p.exists())
+            .expect("DeimosRising.exe not found next to the data directory");
+        let exe = std::fs::read(exe_path).expect("read exe");
+        if args.iter().any(|a| a == "--rl-bench") {
+            rl::server::bench(&args, exe, dir);
+        } else {
+            rl::server::run(&args, exe, dir);
+        }
+        return;
+    }
     if let Some(pos) = args.iter().position(|a| a == "--og-live-test") {
         let ticks = args.get(pos + 1).and_then(|s| s.parse().ok()).expect("--og-live-test needs a tick count");
         og_trace(&args, Some(ticks));
