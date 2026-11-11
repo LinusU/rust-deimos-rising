@@ -59,6 +59,11 @@ pub struct OgGame {
     pub script: Option<crate::game::render::InputScript>,
     /// The level music last handed to the audio engine.
     music: u32,
+    /// The trained bot, when one was loaded (`--copilot`,
+    /// `deimos-copilot.bin`); it flies player 2 in games started with
+    /// `copilot_on` set.
+    pub copilot: Option<crate::rl::copilot::CoPilot>,
+    pub copilot_on: bool,
 }
 
 impl OgGame {
@@ -85,6 +90,8 @@ impl OgGame {
             dirty: false,
             script: None,
             music: 0,
+            copilot: None,
+            copilot_on: false,
         })
     }
 
@@ -103,6 +110,14 @@ impl OgGame {
         self.cycle_latch = [false; 2];
         self.dirty = true;
         self.music = 0;
+        if let Some(c) = self.copilot.as_mut() {
+            c.reset();
+        }
+    }
+
+    /// The co-pilot flies its ship in the running game.
+    pub fn copilot_flying(&self) -> bool {
+        self.copilot_on && self.copilot.is_some() && self.mode == OgMode::Live
     }
 
     /// A new live game of `players` players from the 1-based level list
@@ -672,6 +687,14 @@ pub fn og_system(
             } else {
                 slot_inputs(&keys, &bindings, &mut og.cycle_latch, i == 0)
             };
+            let mut inputs = inputs;
+            if og.copilot_flying() {
+                if let (Some(c), Some(s)) = (og.copilot.as_mut(), og.session.as_mut()) {
+                    if s.is_playing() {
+                        inputs[c.slot] = c.input(s);
+                    }
+                }
+            }
             if og.session.as_ref().map(|s| s.is_playing()).unwrap_or(false) {
                 og.tick(&mut assets, inputs);
             }

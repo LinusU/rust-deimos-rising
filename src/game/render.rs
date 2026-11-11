@@ -93,6 +93,8 @@ pub struct Flow {
     pub progress: u32,
     /// Levels started this run (exe 0x4e482a equivalent).
     pub levels_played: u32,
+    /// `--copilot`: Two Players means you and the co-pilot.
+    pub copilot_default: bool,
 }
 
 /// A run result waiting for a player name.
@@ -570,6 +572,7 @@ pub fn flow_system(
                 (KeyCode::Digit1, TitleItem::OnePlayer),
                 (KeyCode::KeyN, TitleItem::OnePlayer),
                 (KeyCode::Digit2, TitleItem::TwoPlayers),
+                (KeyCode::KeyB, TitleItem::TwoPlayers),
                 (KeyCode::KeyC, TitleItem::Controls),
                 (KeyCode::KeyS, TitleItem::Scores),
                 (KeyCode::KeyH, TitleItem::Scores),
@@ -589,6 +592,11 @@ pub fn flow_system(
                 match item {
                     TitleItem::OnePlayer | TitleItem::TwoPlayers => {
                         flow.players = if item == TitleItem::OnePlayer { 1 } else { 2 };
+                        // B: a two-player game with the co-pilot flying
+                        // player 2 (as is Two Players under `--copilot`).
+                        og.copilot_on = item == TitleItem::TwoPlayers
+                            && og.copilot.is_some()
+                            && (keys.just_pressed(KeyCode::KeyB) || flow.copilot_default);
                         // Open on the furthest sector reached.
                         flow.sector = (flow.progress as usize).min(flow.level_ids.len().saturating_sub(1));
                         flow.state = FlowState::Sectors;
@@ -969,7 +977,15 @@ fn shot_system(
     }
 }
 
-pub fn run(assets: GameAssets, data_dir: std::path::PathBuf, level_id: ResId, players: usize, shot: Option<ShotConfig>) {
+/// `copilot`: the bot to offer (and whether Two Players means you and it).
+pub fn run(
+    assets: GameAssets,
+    data_dir: std::path::PathBuf,
+    level_id: ResId,
+    players: usize,
+    shot: Option<ShotConfig>,
+    copilot: Option<(crate::rl::copilot::CoPilot, bool)>,
+) {
     let mut assets = assets;
     let mut level_ids = mission_sorted_level_ids(&assets);
     if level_ids.is_empty() {
@@ -977,6 +993,12 @@ pub fn run(assets: GameAssets, data_dir: std::path::PathBuf, level_id: ResId, pl
     }
     let mut og = OgGame::new(data_dir).expect("port game");
     og.warm().expect("port game data");
+    let mut copilot_default = false;
+    if let Some((c, d)) = copilot {
+        og.copilot = Some(c);
+        og.copilot_on = d && players == 2;
+        copilot_default = d;
+    }
     let demo = Demo::default();
     let mut initial_state = FlowState::Title;
     let mut shot = shot;
@@ -1074,6 +1096,7 @@ pub fn run(assets: GameAssets, data_dir: std::path::PathBuf, level_id: ResId, pl
         restricted: false,
         progress: load_progress(),
         levels_played: 0,
+        copilot_default,
     };
     // Screenshot mode can open straight on a menu screen.
     match shot_screen.as_deref() {

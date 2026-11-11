@@ -846,7 +846,32 @@ fn main() {
                 .unwrap_or(0),
         }
     });
-    game::render::run(assets, dir, level, players, shot);
+    // --copilot [policy.bin] [--copilot-temp T]: a trained bot flies
+    // player 2 in two-player games. Without the flag, a
+    // `deimos-copilot.bin` in the working directory is offered on the
+    // title screen (B).
+    let copilot_flag = args.iter().position(|a| a == "--copilot");
+    let copilot_path = copilot_flag
+        .and_then(|i| args.get(i + 1))
+        .filter(|v| !v.starts_with("--"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("deimos-copilot.bin"));
+    let temp: f32 = arg_value(&args, "--copilot-temp").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let copilot = match rl::policy::Policy::load(&copilot_path) {
+        Ok(p) => {
+            eprintln!("co-pilot: {} (temperature {temp}); B on the title screen starts a game with it", copilot_path.display());
+            let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+            Some((rl::copilot::CoPilot::new(p, 1, temp, seed), copilot_flag.is_some()))
+        }
+        Err(e) => {
+            if copilot_flag.is_some() {
+                eprintln!("co-pilot not loaded: {e}");
+            }
+            None
+        }
+    };
+    let players = if copilot.as_ref().map(|c| c.1).unwrap_or(false) { 2 } else { players };
+    game::render::run(assets, dir, level, players, shot, copilot);
 }
 
 fn test_sprites() {
