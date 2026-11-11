@@ -150,6 +150,12 @@ impl Mem {
         self.w8(dst + s.len() as u32, 0);
     }
 
+    /// Bytes handed out from the top of the heap so far (freed blocks are
+    /// reused, so this only grows when the free lists run dry).
+    pub fn heap_used(&self) -> u32 {
+        self.heap_next - HEAP_BASE
+    }
+
     /// `operator new` / malloc: zero-filled, 4-aligned.
     pub fn alloc(&mut self, size: u32) -> u32 {
         let size = (size.max(1) + 3) & !3;
