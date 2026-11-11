@@ -165,6 +165,9 @@ pub struct DrawItem {
     pub visibility_pct: f32,
     pub tint_pct: f32,
     pub tint_color: u16,
+    /// Address of the game object that submitted the draw (not part of the
+    /// original's settings; lets observers follow an object across frames).
+    pub obj: u32,
 }
 
 impl DrawItem {
@@ -193,10 +196,11 @@ pub struct ObjInfo {
     pub visibility_pct: f32,
     pub tint_pct: f32,
     pub tint_color: u16,
+    pub obj: u32,
 }
 
 pub fn obj_info(g: &G, obj: u32) -> ObjInfo {
-    ObjInfo { visibility_pct: g.m.rf32(obj + 0x62), tint_pct: g.m.rf32(obj + 0x54), tint_color: g.m.r16(obj + 0x60) }
+    ObjInfo { visibility_pct: g.m.rf32(obj + 0x62), tint_pct: g.m.rf32(obj + 0x54), tint_color: g.m.r16(obj + 0x60), obj }
 }
 
 /// `U_Sprite_RenderLists_Add` (0x4094e0) / `U_Sprite_Draw` for direct
@@ -237,6 +241,7 @@ pub fn render_lists_add(g: &mut G, s: &Settings, kind: DrawKind, info: ObjInfo) 
         visibility_pct: info.visibility_pct,
         tint_pct: info.tint_pct,
         tint_color: info.tint_color,
+        obj: info.obj,
     };
     g.draw_sink.as_mut().unwrap().push(item);
 }
