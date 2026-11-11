@@ -313,6 +313,8 @@ pub enum TextSource {
 /// the game area are listed, as the original skips the others.
 #[derive(Clone, Debug)]
 pub struct Particle {
+    /// The particle's slot (its address; not drawn).
+    pub id: u32,
     pub x: f32,
     pub y: f32,
     pub ix: i32,
@@ -578,6 +580,7 @@ fn live_particles(g: &mut G) -> Vec<Particle> {
                 continue;
             }
             out.push(Particle {
+                id: p,
                 x,
                 y,
                 ix: ftol(x as f64),
