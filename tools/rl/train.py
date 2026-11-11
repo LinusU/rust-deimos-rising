@@ -1,0 +1,411 @@
+"""PPO for the co-pilot.
+
+Each game has two ships. Per episode a game draws a partner setup:
+- self:   both ships run the policy being trained (both learn)
+- past:   one ship learns, the other is a frozen earlier snapshot
+- camper: the partner flies to a spot near the bottom and stays there
+          (sometimes firing): the "user hides in the corner" case
+- idle:   the partner never touches the controls
+- noisy:  the partner wanders like a distracted beginner
+Training against a population of partners of mixed skill rather than only
+itself keeps the bot from depending on conventions only it would follow
+(Strouse et al. 2021, "Collaborating with Humans without Human Data").
+
+The reward is cooperative: a ship's own terms plus half of its partner's
+(score, lives lost, shield damage), so protecting the partner pays.
+
+Usage: uv run python train.py --run NAME [--envs 256 ...]
+"""
+
+import argparse
+import collections
+import json
+import os
+import random
+import time
+
+import numpy as np
+import torch
+
+from envclient import (EnvServer, I_DAMAGE, I_DEATHS, I_DSCORE, I_END, I_INGAME, I_LEVEL_DONE, I_LEVELS_DONE,
+                       I_PROGRESS, I_SCORE, I_START_LEVEL, I_TICKS)
+from model import Policy, evaluate, export, pack_actions, sample
+
+MODES = ["self", "past", "camper", "idle", "noisy"]
+
+
+def parse():
+    p = argparse.ArgumentParser()
+    p.add_argument("--run", default="run1")
+    p.add_argument("--envs", type=int, default=256)
+    p.add_argument("--threads", type=int, default=16)
+    p.add_argument("--steps", type=int, default=128, help="decisions per rollout")
+    p.add_argument("--updates", type=int, default=100000)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--gamma", type=float, default=0.995)
+    p.add_argument("--lam", type=float, default=0.95)
+    p.add_argument("--clip", type=float, default=0.2)
+    p.add_argument("--epochs", type=int, default=3)
+    p.add_argument("--minibatches", type=int, default=4)
+    p.add_argument("--ent", type=float, default=0.01)
+    p.add_argument("--vf", type=float, default=0.5)
+    p.add_argument("--team", type=float, default=0.5, help="weight of the partner's reward terms")
+    p.add_argument("--death", type=float, default=3.0)
+    p.add_argument("--damage", type=float, default=1.0, help="per 100%% shields lost")
+    p.add_argument("--score", type=float, default=1e-3, help="per point")
+    p.add_argument("--level", type=float, default=3.0)
+    p.add_argument("--jitter", type=float, default=0.01, help="cost of changing direction (or letting go)")
+    p.add_argument("--cycle-cost", type=float, default=0.02)
+    p.add_argument("--mode-probs", default="0.45,0.2,0.15,0.05,0.15")
+    p.add_argument("--snapshot-every", type=int, default=25, help="updates between partner-pool snapshots")
+    p.add_argument("--save-every", type=int, default=50, help="updates between kept checkpoints")
+    p.add_argument("--pool", type=int, default=24)
+    p.add_argument("--resume", default=None)
+    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--device", default="mps" if torch.backends.mps.is_available() else "cpu")
+    return p.parse_args()
+
+
+class RunningStd:
+    def __init__(self):
+        self.n, self.mean, self.m2 = 1e-4, 0.0, 1.0
+
+    def update(self, x):
+        x = np.asarray(x, dtype=np.float64).ravel()
+        if x.size == 0:
+            return
+        bn, bm, bv = x.size, x.mean(), x.var()
+        d = bm - self.mean
+        tot = self.n + bn
+        self.mean += d * bn / tot
+        self.m2 = (self.m2 * self.n + bv * bn + d * d * self.n * bn / tot) / tot
+        self.n = tot
+
+    @property
+    def std(self):
+        return float(np.sqrt(self.m2) + 1e-8)
+
+
+class Scripted:
+    """Scripted partners, per env."""
+
+    def __init__(self, n, rng):
+        self.rng = rng
+        self.target = np.zeros((n, 2), np.float32)
+        self.fire = np.zeros(n, bool)
+        self.dir = np.zeros(n, np.int64)
+        self.air = np.zeros(n, bool)
+
+    def reset(self, e):
+        r = self.rng
+        self.target[e] = (r.choice([0.06, 0.94, r.uniform(0.1, 0.9)]), r.uniform(0.75, 0.95))
+        self.fire[e] = r.random() < 0.5
+        self.dir[e] = r.integers(0, 9)
+        self.air[e] = r.random() < 0.7
+
+    # Direction index for (dx + 1, dy + 1).
+    DIRS = np.array([[8, 7, 6], [1, 0, 5], [2, 3, 4]])
+
+    def camper(self, es, selfv):
+        """Action bytes for envs `es` whose partner ships have `selfv` [len(es), S]."""
+        x, y = selfv[:, 0], selfv[:, 1]
+        tx, ty = self.target[es, 0], self.target[es, 1]
+        dx = np.where(np.abs(tx - x) < 0.02, 0, np.where(tx > x, 1, -1))
+        dy = np.where(np.abs(ty - y) < 0.02, 0, np.where(ty > y, 1, -1))
+        return (self.DIRS[dx + 1, dy + 1] | np.where(self.fire[es], 16, 0)).astype(np.uint8)
+
+    def noisy(self, es, selfv):
+        r = self.rng
+        n = len(es)
+        ch = r.random(n) < 0.08
+        self.dir[es[ch]] = r.integers(0, 9, ch.sum())
+        fl = r.random(n) < 0.05
+        self.air[es[fl]] = ~self.air[es[fl]]
+        d = self.dir[es].copy()
+        # Stay off the top edge like a person would.
+        d[(selfv[:, 1] < 0.2) & np.isin(d, (1, 2, 8))] = 5
+        return (d | np.where(self.air[es], 16, 0) | np.where(r.random(n) < 0.05, 32, 0)).astype(np.uint8)
+
+
+def to_dev(obs, dev):
+    n = obs["ent"].shape[0]
+    A = n * 2
+    return (
+        torch.from_numpy(np.ascontiguousarray(obs["ent"])).to(dev).view(A, *obs["ent"].shape[2:]),
+        torch.from_numpy(np.ascontiguousarray(obs["ent_id"])).to(dev).view(A, *obs["ent_id"].shape[2:]),
+        torch.from_numpy(np.ascontiguousarray(obs["self"])).to(dev).view(A, -1),
+        torch.from_numpy(np.ascontiguousarray(obs["self_id"])).to(dev).view(A, -1),
+    )
+
+
+def main():
+    a = parse()
+    torch.manual_seed(a.seed)
+    rng = np.random.default_rng(a.seed)
+    run_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runs", a.run)
+    os.makedirs(run_dir, exist_ok=True)
+    with open(os.path.join(run_dir, "args.json"), "w") as f:
+        json.dump(vars(a), f, indent=1)
+    dev = torch.device(a.device)
+
+    env = EnvServer(a.envs, threads=a.threads, seed=a.seed)
+    n, A = env.n, env.n * 2
+    model = Policy(env.F, env.S, env.SELF_IDS, k=env.K).to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=a.lr, eps=1e-5)
+    start_update = 0
+    pool = []  # (update, state_dict on cpu)
+    total_steps = 0
+    if a.resume:
+        ck = torch.load(a.resume, map_location="cpu", weights_only=False)
+        model.load_state_dict(ck["model"])
+        if "opt" in ck:
+            opt.load_state_dict(ck["opt"])
+        start_update = ck.get("update", 0)
+        total_steps = ck.get("total_steps", 0)
+        pool = ck.get("pool", [])
+    print(f"params: {sum(p.numel() for p in model.parameters())}")
+
+    probs = np.array([float(x) for x in a.mode_probs.split(",")])
+    probs /= probs.sum()
+    mode = np.zeros(n, np.int64)
+    learner = np.zeros((n, 2), bool)
+    snap_of = np.zeros(n, np.int64)
+    scripted = Scripted(n, rng)
+    partner_models = []
+
+    def new_episode(e):
+        m = rng.choice(len(MODES), p=probs)
+        if MODES[m] == "past" and not partner_models:
+            m = 0
+        mode[e] = m
+        if MODES[m] == "self":
+            learner[e] = (True, True)
+        else:
+            s = rng.integers(0, 2)
+            learner[e] = (s == 0, s == 1)
+        snap_of[e] = rng.integers(0, max(1, len(partner_models)))
+        scripted.reset(e)
+
+    for e in range(n):
+        new_episode(e)
+
+    rew_std = RunningStd()
+    ret_acc = np.zeros(A)
+    obs = env.read()
+    ep_stats = collections.defaultdict(list)
+    ep_acc = {"score": np.zeros(n), "deaths": np.zeros((n, 2)), "rew": np.zeros(A)}
+    prev_dir = np.zeros(A, np.int64)
+    log = open(os.path.join(run_dir, "log.jsonl"), "a")
+
+    T = a.steps
+    K, F, S, SI = env.K, env.F, env.S, env.SELF_IDS * 2
+    buf_ent = torch.zeros(T, A, K, F, device=dev)
+    buf_ent_id = torch.zeros(T, A, K, 2, dtype=torch.int32, device=dev)
+    buf_self = torch.zeros(T, A, S, device=dev)
+    buf_self_id = torch.zeros(T, A, SI, dtype=torch.int32, device=dev)
+    buf_act = torch.zeros(T, A, 4, dtype=torch.long, device=dev)
+    buf_logp = torch.zeros(T, A, device=dev)
+    buf_val = torch.zeros(T, A, device=dev)
+    buf_rew = np.zeros((T, A), np.float32)
+    buf_done = np.zeros((T, A), np.float32)
+    buf_valid = np.zeros((T, A), bool)
+
+    for update in range(start_update, a.updates):
+        t0 = time.time()
+        # Partners from the pool for this rollout.
+        if pool:
+            picks = [pool[i] for i in rng.choice(len(pool), size=min(2, len(pool)), replace=False)]
+            partner_models = []
+            for _, sd in picks:
+                pm = Policy(env.F, env.S, env.SELF_IDS, k=env.K).to(dev)
+                pm.load_state_dict(sd)
+                pm.eval()
+                partner_models.append(pm)
+            snap_of[:] = rng.integers(0, len(partner_models), size=n)
+        model.eval()
+        t_env = 0.0
+        for t in range(T):
+            o = to_dev(obs, dev)
+            with torch.no_grad():
+                logits, value = model(*o)
+                acts, logp = sample(logits)
+                bytes_ = pack_actions(acts).cpu().numpy()
+            learn_flat = learner.reshape(-1)
+            selfv = obs["self"].reshape(A, -1)
+            pslot_ai = np.arange(n) * 2 + np.where(learner[:, 1], 0, 1)
+            for md, fn in (("camper", scripted.camper), ("noisy", scripted.noisy), ("idle", None)):
+                es = np.nonzero(mode == MODES.index(md))[0]
+                if len(es):
+                    ai = pslot_ai[es]
+                    bytes_[ai] = 0 if fn is None else fn(es, selfv[ai])
+            past_envs = np.nonzero(mode == MODES.index("past"))[0]
+            if len(past_envs) and partner_models:
+                with torch.no_grad():
+                    for si, pm in enumerate(partner_models):
+                        es = past_envs[snap_of[past_envs] == si]
+                        if len(es) == 0:
+                            continue
+                        slots = np.where(learner[es, 1], 0, 1)
+                        idx = torch.from_numpy(es * 2 + slots).to(dev)
+                        lg, _ = pm(o[0][idx], o[1][idx], o[2][idx], o[3][idx])
+                        pa, _ = sample(lg)
+                        bytes_[(es * 2 + slots)] = pack_actions(pa).cpu().numpy()
+            send = bytes_ | np.where(learn_flat, 128, 0).astype(np.uint8)
+            buf_ent[t] = o[0]
+            buf_ent_id[t] = o[1]
+            buf_self[t] = o[2]
+            buf_self_id[t] = o[3]
+            buf_act[t] = acts
+            buf_logp[t] = logp
+            buf_val[t] = value
+            in_game = selfv[:, 11] > 0.5
+            buf_valid[t] = learn_flat & in_game
+            te = time.time()
+            obs = env.step(send.reshape(n, 2))
+            t_env += time.time() - te
+            info = obs["info"]
+
+            # Rewards.
+            own = np.zeros((n, 2), np.float32)
+            for p in range(2):
+                b = p * 8
+                own[:, p] = (a.score * info[:, b + I_DSCORE] - a.death * info[:, b + I_DEATHS]
+                             - a.damage * info[:, b + I_DAMAGE] / 100.0)
+            own += a.level * info[:, [I_LEVEL_DONE]]
+            r = own + a.team * own[:, ::-1]
+            r = r.reshape(-1)
+            dirs = acts[:, 0].cpu().numpy()
+            r -= a.jitter * (dirs != prev_dir)
+            r -= a.cycle_cost * acts[:, 3].cpu().numpy()
+            prev_dir = dirs
+            done = info[:, I_END] > 0
+            done_a = np.repeat(done, 2)
+            buf_rew[t] = r
+            buf_done[t] = done_a
+            ret_acc = ret_acc * a.gamma + r
+            rew_std.update(ret_acc[learn_flat])
+            ret_acc[done_a] = 0.0
+
+            ep_acc["rew"] += r
+            ep_acc["score"] += info[:, I_DSCORE] + info[:, 8 + I_DSCORE]
+            ep_acc["deaths"] += info[:, [I_DEATHS, 8 + I_DEATHS]]
+            for e in np.nonzero(done)[0]:
+                md = MODES[mode[e]]
+                ls = [p for p in range(2) if learner[e, p]]
+                ep_stats[md + "/score"].append(ep_acc["score"][e])
+                ep_stats[md + "/levels"].append(info[e, I_LEVELS_DONE] + info[e, I_LEVEL_DONE] * 0)
+                ep_stats[md + "/progress"].append(info[e, I_PROGRESS])
+                ep_stats[md + "/ticks"].append(info[e, I_TICKS])
+                ep_stats[md + "/learner_deaths"].append(np.mean([ep_acc["deaths"][e, p] for p in ls]))
+                ep_stats[md + "/partner_deaths"].append(np.mean([ep_acc["deaths"][e, 1 - p] for p in ls]) if md != "self" else np.mean(ep_acc["deaths"][e]))
+                ep_stats[md + "/end"].append(info[e, I_END])
+                ep_stats[md + "/start_level"].append(info[e, I_START_LEVEL])
+                ep_stats["all/reward"].append(np.mean([ep_acc["rew"][e * 2 + p] for p in ls]))
+                ep_acc["score"][e] = 0
+                ep_acc["deaths"][e] = 0
+                ep_acc["rew"][e * 2:e * 2 + 2] = 0
+                prev_dir[e * 2:e * 2 + 2] = 0
+                new_episode(e)
+            total_steps += int(buf_valid[t].sum())
+
+        t_roll = time.time() - t0
+        # GAE.
+        with torch.no_grad():
+            _, last_v = model(*to_dev(obs, dev))
+        vals = buf_val.cpu().numpy()
+        last_v = last_v.cpu().numpy()
+        rs = buf_rew / rew_std.std
+        adv = np.zeros((T, A), np.float32)
+        gae = np.zeros(A, np.float32)
+        for t in reversed(range(T)):
+            nv = last_v if t == T - 1 else vals[t + 1]
+            nd = 1.0 - buf_done[t]
+            delta = rs[t] + a.gamma * nv * nd - vals[t]
+            gae = delta + a.gamma * a.lam * nd * gae
+            adv[t] = gae
+        ret = adv + vals
+
+        # PPO.
+        model.train()
+        valid = torch.from_numpy(buf_valid.reshape(-1)).to(dev)
+        idx_all = torch.nonzero(valid).squeeze(1)
+        b_ent = buf_ent.view(T * A, K, F)
+        b_ent_id = buf_ent_id.view(T * A, K, 2)
+        b_self = buf_self.view(T * A, S)
+        b_self_id = buf_self_id.view(T * A, SI)
+        b_act = buf_act.view(T * A, 4)
+        b_logp = buf_logp.view(-1)
+        b_adv = torch.from_numpy(adv.reshape(-1)).to(dev)
+        b_ret = torch.from_numpy(ret.reshape(-1)).to(dev)
+        b_val = buf_val.view(-1)
+        stats = collections.defaultdict(list)
+        N = idx_all.numel()
+        mb = max(1, N // a.minibatches)
+        for ep in range(a.epochs):
+            perm = idx_all[torch.randperm(N, device=dev)]
+            for i in range(0, N - mb + 1, mb):
+                ix = perm[i:i + mb]
+                logits, v = model(b_ent[ix], b_ent_id[ix], b_self[ix], b_self_id[ix])
+                logp, ent = evaluate(logits, b_act[ix])
+                ratio = (logp - b_logp[ix]).exp()
+                ad = b_adv[ix]
+                ad = (ad - ad.mean()) / (ad.std() + 1e-8)
+                pg = -torch.min(ratio * ad, ratio.clamp(1 - a.clip, 1 + a.clip) * ad).mean()
+                vc = b_val[ix] + (v - b_val[ix]).clamp(-a.clip * 5, a.clip * 5)
+                vl = 0.5 * torch.max((v - b_ret[ix]) ** 2, (vc - b_ret[ix]) ** 2).mean()
+                ent_m = ent.sum(-1).mean()
+                loss = pg + a.vf * vl - a.ent * ent_m
+                opt.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                opt.step()
+                with torch.no_grad():
+                    stats["pg"].append(pg.item())
+                    stats["vl"].append(vl.item())
+                    stats["ent"].append(ent.mean(0).cpu().numpy())
+                    stats["kl"].append(((ratio - 1) - (logp - b_logp[ix])).mean().item())
+                    stats["clipfrac"].append(((ratio - 1).abs() > a.clip).float().mean().item())
+
+        dt = time.time() - t0
+        rec = {
+            "update": update + 1,
+            "steps": total_steps,
+            "sps": round(N / dt),
+            "t_env": round(t_env, 2),
+            "t_roll": round(t_roll, 2),
+            "t_total": round(dt, 2),
+            "pg": float(np.mean(stats["pg"])),
+            "vl": float(np.mean(stats["vl"])),
+            "kl": float(np.mean(stats["kl"])),
+            "clipfrac": float(np.mean(stats["clipfrac"])),
+            "ent": [round(float(x), 3) for x in np.mean(stats["ent"], 0)],
+            "rew_std": rew_std.std,
+            "pool": len(pool),
+        }
+        for k, v in ep_stats.items():
+            rec[k] = round(float(np.mean(v)), 3)
+            rec[k.split("/")[0] + "/n"] = len(v)
+        ep_stats.clear()
+        log.write(json.dumps(rec) + "\n")
+        log.flush()
+        print(" ".join(f"{k}={v}" for k, v in rec.items() if not isinstance(v, list) or k == "ent"), flush=True)
+
+        u = update + 1
+        if u % a.snapshot_every == 0:
+            pool.append((u, {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}))
+            if len(pool) > a.pool:
+                # Keep the oldest few for weak partners, thin out the middle.
+                del pool[1 + rng.integers(0, len(pool) - 2)]
+        ck = {"model": model.state_dict(), "opt": opt.state_dict(), "update": u, "total_steps": total_steps,
+              "cfg": model.cfg, "pool": pool}
+        if u % 10 == 0:
+            torch.save(ck, os.path.join(run_dir, "latest.pt"))
+        if u % a.save_every == 0:
+            torch.save({"model": model.state_dict(), "update": u, "total_steps": total_steps, "cfg": model.cfg},
+                       os.path.join(run_dir, f"ckpt_{u:05d}.pt"))
+            export(model, os.path.join(run_dir, f"policy_{u:05d}.bin"))
+    env.close()
+
+
+if __name__ == "__main__":
+    main()

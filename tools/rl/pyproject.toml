@@ -1,0 +1,12 @@
+[project]
+name = "deimos-rl"
+version = "0.1.0"
+description = "Trains the co-pilot bot for Deimos Rising two-player games"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "torch>=2.5",
+    "numpy>=2.0",
+]
+
+[tool.uv]
+package = false

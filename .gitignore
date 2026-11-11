@@ -5,3 +5,6 @@ deimos-hi-scores.txt
 deimos-demo.bin
 deimos-progress.txt
 deimos-keys.txt
+/tools/rl/runs/
+/tools/rl/.venv/
+__pycache__/
