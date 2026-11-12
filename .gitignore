@@ -10,3 +10,4 @@ deimos-copilot.bin
 /tools/rl/runs/
 /tools/rl/.venv/
 __pycache__/
+/textures/

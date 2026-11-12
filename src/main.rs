@@ -525,6 +525,19 @@ fn main() {
         dump_data();
         return;
     }
+    // --export-textures [dir]: every sprite frame and image as a PNG
+    // (default textures/export), unaffected by any overrides.
+    if let Some(pos) = args.iter().position(|a| a == "--export-textures") {
+        let out = args.get(pos + 1).filter(|a| !a.starts_with("--")).cloned();
+        let out = PathBuf::from(out.unwrap_or_else(|| assets::textures::DEFAULT_EXPORT_DIR.into()));
+        let mut a = assets::GameAssets::open(&data_dir()).expect("open retail data");
+        a.use_overrides(None);
+        if let Err(e) = assets::textures::export(&mut a, &out) {
+            eprintln!("export-textures: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.len() >= 4 && args[1] == "--cat" {
         cat(&args[2], &args[3]);
         return;

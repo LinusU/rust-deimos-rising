@@ -5,7 +5,10 @@
 
 use crate::pak::{PakSet, ResId, Tag};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub mod textures;
+pub use textures::Hd;
 
 /// A decoded sprite frame: tightly-cropped RGBA pixels.
 #[derive(Clone)]
@@ -155,12 +158,25 @@ pub struct GameAssets {
     /// Per-sprite frame (width, height) table for collision bounds —
     /// populated by `warm_sprite_dims`.
     pub sprite_dims: HashMap<ResId, Vec<(u32, u32)>>,
+    /// Replacement textures, when an override directory exists.
+    overrides: Option<Overrides>,
+    /// Full-size pixels of oversized sprite frame overrides, by (sprite, frame).
+    hd_frames: HashMap<(ResId, usize), Hd>,
+    /// Full-size pixels of oversized `im16` overrides.
+    hd_images16: HashMap<ResId, Hd>,
+}
+
+/// Where replacement textures are read from (see `textures`).
+struct Overrides {
+    dir: PathBuf,
+    sprite_names: HashMap<ResId, String>,
+    image_names: HashMap<ResId, String>,
 }
 
 impl GameAssets {
     pub fn open(data_dir: &Path) -> std::io::Result<GameAssets> {
         let set = PakSet::open_dir(data_dir)?;
-        Ok(GameAssets {
+        let mut assets = GameAssets {
             set,
             sprites: HashMap::new(),
             images16: HashMap::new(),
@@ -181,7 +197,44 @@ impl GameAssets {
             strings: HashMap::new(),
             text_formats: HashMap::new(),
             sprite_dims: HashMap::new(),
-        })
+            overrides: None,
+            hd_frames: HashMap::new(),
+            hd_images16: HashMap::new(),
+        };
+        if let Some(dir) = textures::override_dir() {
+            assets.use_overrides(Some(dir));
+        }
+        Ok(assets)
+    }
+
+    /// Read replacement textures from `dir` (None: the originals only).
+    /// Clears what was decoded so far, so the change applies everywhere.
+    pub fn use_overrides(&mut self, dir: Option<PathBuf>) {
+        self.overrides = dir.map(|dir| Overrides {
+            sprite_names: textures::file_names(self, Tag::Im08),
+            image_names: textures::file_names(self, Tag::Im16),
+            dir,
+        });
+        self.sprites.clear();
+        self.images16.clear();
+        self.hd_frames.clear();
+        self.hd_images16.clear();
+    }
+
+    /// Full-size pixels of frame `frame` of sprite `rid`, when its override
+    /// is larger than the original.
+    #[allow(dead_code)] // for an HD renderer
+    pub fn sprite_frame_hd(&mut self, rid: ResId, frame: usize) -> Option<&Hd> {
+        self.sprite(rid)?;
+        self.hd_frames.get(&(rid, frame))
+    }
+
+    /// Full-size pixels of `im16` image `rid`, when its override is larger
+    /// than the original.
+    #[allow(dead_code)] // for an HD renderer
+    pub fn image16_hd(&mut self, rid: ResId) -> Option<&Hd> {
+        self.image16(rid)?;
+        self.hd_images16.get(&rid)
     }
 
     /// Load and parse every text resource. Call once at startup.
@@ -309,7 +362,19 @@ impl GameAssets {
             let upper = to_upper_id(rid);
             let color_raw = self.set.read_raw(Tag::Im08, rid)?;
             let alpha_raw = self.set.read_raw(Tag::Im08, upper)?;
-            let sprite = decode_sprite(&color_raw, &alpha_raw)?;
+            let mut sprite = decode_sprite(&color_raw, &alpha_raw)?;
+            if let Some(o) = &self.overrides {
+                if let Some(name) = o.sprite_names.get(&rid) {
+                    let dir = o.dir.join("sprites").join(name);
+                    for (i, f) in sprite.frames.iter_mut().enumerate() {
+                        let Some(hd) = textures::load_override(&dir.join(format!("{i:03}.png")), f.width, f.height) else { continue };
+                        f.rgba = textures::downscale(&hd, f.width, f.height);
+                        if hd.scale > 1 {
+                            self.hd_frames.insert((rid, i), hd);
+                        }
+                    }
+                }
+            }
             self.sprites.insert((Tag::Im08.code(), rid), sprite);
         }
         self.sprites.get(&(Tag::Im08.code(), rid))
@@ -341,7 +406,18 @@ impl GameAssets {
     pub fn image16(&mut self, rid: ResId) -> Option<&(u32, u32, Vec<u8>)> {
         if !self.images16.contains_key(&rid) {
             let raw = self.set.read_raw(Tag::Im16, rid)?;
-            let img = decode_tga(&raw)?;
+            let mut img = decode_tga(&raw)?;
+            if let Some(o) = &self.overrides {
+                if let Some(name) = o.image_names.get(&rid) {
+                    let path = o.dir.join("images").join(format!("{name}.png"));
+                    if let Some(hd) = textures::load_override(&path, img.0, img.1) {
+                        img.2 = textures::downscale(&hd, img.0, img.1);
+                        if hd.scale > 1 {
+                            self.hd_images16.insert(rid, hd);
+                        }
+                    }
+                }
+            }
             self.images16.insert(rid, img);
         }
         self.images16.get(&rid)
