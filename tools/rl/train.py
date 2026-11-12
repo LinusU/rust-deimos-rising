@@ -27,9 +27,9 @@ import time
 import numpy as np
 import torch
 
-from envclient import (EnvServer, I_DAMAGE, I_DEATHS, I_DSCORE, I_END, I_INGAME, I_LEVEL_DONE, I_LEVELS_DONE,
-                       I_PROGRESS, I_SCORE, I_START_LEVEL, I_TICKS)
-from model import Policy, evaluate, export, pack_actions, sample
+from envclient import (EnvServer, I_DAMAGE, I_DEATHS, I_DSCORE, I_END, I_LEVEL_DONE, I_LEVELS_DONE, I_PROGRESS,
+                       I_START_LEVEL, I_TICKS, S_INGAME, S_LATCH)
+from model import Policy, evaluate, export, masked_logp, pack_actions, sample
 
 MODES = ["self", "past", "camper", "idle", "noisy"]
 
@@ -209,6 +209,7 @@ def main():
     buf_rew = np.zeros((T, A), np.float32)
     buf_done = np.zeros((T, A), np.float32)
     buf_valid = np.zeros((T, A), bool)
+    buf_mask = torch.zeros(T, A, dtype=torch.bool, device=dev)
 
     for update in range(start_update, a.updates):
         t0 = time.time()
@@ -226,9 +227,11 @@ def main():
         t_env = 0.0
         for t in range(T):
             o = to_dev(obs, dev)
+            air_mask = o[2][:, S_LATCH] > 0.5
             with torch.no_grad():
                 logits, value = model(*o)
-                acts, logp = sample(logits)
+                acts, _ = sample(logits, heads=model.acts)
+                logp = masked_logp(logits, acts, air_mask, model.acts)
                 bytes_ = pack_actions(acts).cpu().numpy()
             learn_flat = learner.reshape(-1)
             selfv = obs["self"].reshape(A, -1)
@@ -248,9 +251,8 @@ def main():
                         slots = np.where(learner[es, 1], 0, 1)
                         idx = torch.from_numpy(es * 2 + slots).to(dev)
                         lg, _ = pm(o[0][idx], o[1][idx], o[2][idx], o[3][idx])
-                        pa, _ = sample(lg)
+                        pa, _ = sample(lg, heads=pm.acts)
                         bytes_[(es * 2 + slots)] = pack_actions(pa).cpu().numpy()
-            send = bytes_ | np.where(learn_flat, 128, 0).astype(np.uint8)
             buf_ent[t] = o[0]
             buf_ent_id[t] = o[1]
             buf_self[t] = o[2]
@@ -258,10 +260,11 @@ def main():
             buf_act[t] = acts
             buf_logp[t] = logp
             buf_val[t] = value
-            in_game = selfv[:, 11] > 0.5
+            buf_mask[t] = air_mask
+            in_game = selfv[:, S_INGAME] > 0.5
             buf_valid[t] = learn_flat & in_game
             te = time.time()
-            obs = env.step(send.reshape(n, 2))
+            obs = env.step(bytes_.reshape(n, 2), learner)
             t_env += time.time() - te
             info = obs["info"]
 
@@ -334,6 +337,7 @@ def main():
         b_self = buf_self.view(T * A, S)
         b_self_id = buf_self_id.view(T * A, SI)
         b_act = buf_act.view(T * A, 4)
+        b_mask = buf_mask.view(-1)
         b_logp = buf_logp.view(-1)
         b_adv = torch.from_numpy(adv.reshape(-1)).to(dev)
         b_ret = torch.from_numpy(ret.reshape(-1)).to(dev)
@@ -346,7 +350,7 @@ def main():
             for i in range(0, N - mb + 1, mb):
                 ix = perm[i:i + mb]
                 logits, v = model(b_ent[ix], b_ent_id[ix], b_self[ix], b_self_id[ix])
-                logp, ent = evaluate(logits, b_act[ix])
+                logp, ent = evaluate(logits, b_act[ix], model.acts, b_mask[ix])
                 ratio = (logp - b_logp[ix]).exp()
                 ad = b_adv[ix]
                 ad = (ad - ad.mean()) / (ad.std() + 1e-8)

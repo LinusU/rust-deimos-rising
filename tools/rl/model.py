@@ -3,8 +3,8 @@
 Every on-screen object is a token (its sprite id embedded from two hash
 buckets plus its float features); the player's own state is one more
 token. Two pre-norm attention blocks mix them; the self token and a
-max-pool over objects feed the action heads (direction, air weapon,
-ground weapon, weapon select) and the value head.
+max-pool over objects feed the action heads (direction, air weapon:
+off / fire / charge, ground weapon, weapon select) and the value head.
 
 The layers are written out by hand (no nn.MultiheadAttention) so the
 Rust forward pass (src/rl/policy.rs) can mirror them exactly.
@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as Fn
 
 ID_BUCKETS = 1024
-HEADS = [9, 2, 2, 2]  # direction, air, ground, cycle
+HEADS = [9, 3, 2, 2]  # direction, air (off, fire, charge), ground, cycle
 
 
 class Block(nn.Module):
@@ -49,9 +49,12 @@ class Block(nn.Module):
 
 
 class Policy(nn.Module):
-    def __init__(self, F, S, self_ids=3, d=96, heads=4, layers=2, emb=32, k=64):
+    def __init__(self, F, S, self_ids=3, d=96, heads=4, layers=2, emb=32, k=64, air=3, obs=2):
         super().__init__()
-        self.cfg = dict(F=F, S=S, self_ids=self_ids, d=d, heads=heads, layers=layers, emb=emb, k=k)
+        # air: options of the air head (2 before the charge order); obs:
+        # observation version (src/rl/policy.rs reads both).
+        self.cfg = dict(F=F, S=S, self_ids=self_ids, d=d, heads=heads, layers=layers, emb=emb, k=k, air=air, obs=obs)
+        self.acts = [9, air, 2, 2]
         self.k = k
         self.emb_a = nn.Embedding(ID_BUCKETS, emb)
         self.emb_b = nn.Embedding(ID_BUCKETS, emb)
@@ -62,7 +65,7 @@ class Policy(nn.Module):
         self.blocks = nn.ModuleList([Block(d, heads, 2 * d) for _ in range(layers)])
         self.ln_out = nn.LayerNorm(d)
         self.trunk = nn.Linear(2 * d, 256)
-        self.pi = nn.Linear(256, sum(HEADS))
+        self.pi = nn.Linear(256, sum(self.acts))
         self.v = nn.Linear(256, 1)
         nn.init.orthogonal_(self.pi.weight, 0.01)
         nn.init.zeros_(self.pi.bias)
@@ -96,14 +99,14 @@ class Policy(nn.Module):
         return self.pi(h), self.v(h).squeeze(-1)
 
 
-def split_logits(logits):
-    return torch.split(logits, HEADS, dim=-1)
+def split_logits(logits, heads=HEADS):
+    return torch.split(logits, heads, dim=-1)
 
 
-def sample(logits, temperature=1.0):
+def sample(logits, temperature=1.0, heads=HEADS):
     """Returns (actions [B,4] long, logp [B])."""
     acts, logps = [], []
-    for lg in split_logits(logits):
+    for lg in split_logits(logits, heads):
         d = torch.distributions.Categorical(logits=lg / temperature)
         a = d.sample()
         acts.append(a)
@@ -111,19 +114,31 @@ def sample(logits, temperature=1.0):
     return torch.stack(acts, -1), torch.stack(logps, -1).sum(-1)
 
 
-def evaluate(logits, acts):
+def evaluate(logits, acts, heads=HEADS, air_mask=None):
+    """air_mask [B] bool: the air choice did not count (a charge was
+    running), so it adds neither log-probability nor entropy."""
     logps, ents = [], []
-    for i, lg in enumerate(split_logits(logits)):
+    for i, lg in enumerate(split_logits(logits, heads)):
         d = torch.distributions.Categorical(logits=lg)
-        logps.append(d.log_prob(acts[:, i]))
-        ents.append(d.entropy())
+        lp, en = d.log_prob(acts[:, i]), d.entropy()
+        if i == 1 and air_mask is not None:
+            lp = torch.where(air_mask, torch.zeros_like(lp), lp)
+            en = torch.where(air_mask, torch.zeros_like(en), en)
+        logps.append(lp)
+        ents.append(en)
     return torch.stack(logps, -1).sum(-1), torch.stack(ents, -1)
 
 
+def masked_logp(logits, acts, air_mask, heads=HEADS):
+    return evaluate(logits, acts, heads, air_mask)[0]
+
+
 def pack_actions(acts):
-    """[B,4] (dir, air, ground, cycle) -> uint8 action bytes."""
+    """[B,4] (dir, air, ground, cycle) -> uint8 action bytes (air 1 = fire
+    bit 4, air 2 = charge bit 7)."""
     a = acts.to(torch.int64)
-    return (a[:, 0] | (a[:, 1] << 4) | (a[:, 2] << 5) | (a[:, 3] << 6)).to(torch.uint8)
+    air = a[:, 1]
+    return (a[:, 0] | ((air == 1).long() << 4) | (a[:, 2] << 5) | (a[:, 3] << 6) | ((air == 2).long() << 7)).to(torch.uint8)
 
 
 def export(model, path):

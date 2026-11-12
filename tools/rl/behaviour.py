@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from envclient import EnvServer
-from model import Policy, sample
+from model import Policy, pack_actions, sample
 from train import to_dev
 
 ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
@@ -20,11 +20,10 @@ alive = []
 for t in range(1500):
     with torch.no_grad():
         lg, _ = m(*to_dev(obs, "cpu"))
-        a, _ = sample(lg, float(sys.argv[2]) if len(sys.argv) > 2 else 1.0)
+        a, _ = sample(lg, float(sys.argv[2]) if len(sys.argv) > 2 else 1.0, heads=m.acts)
     acts_log.append(a.numpy())
     alive.append(obs["self"].reshape(32, -1)[:, 6] > 0.5)  # state 4 (active)
-    b = (a[:, 0] | a[:, 1] << 4 | a[:, 2] << 5 | a[:, 3] << 6).numpy().astype(np.uint8) | 128
-    obs = env.step(b.reshape(16, 2))
+    obs = env.step(pack_actions(a).numpy().reshape(16, 2), np.ones((16, 2), bool))
 env.close()
 A = np.stack(acts_log)
 L = np.stack(alive)
@@ -32,7 +31,7 @@ d = A[..., 0]
 ch = (d[1:] != d[:-1]) & L[1:] & L[:-1]
 print(f"direction changes per second: {ch.sum() / (L[1:] & L[:-1]).sum() * 10:.2f}")
 print("direction histogram (none, up, ur, r, dr, d, dl, l, ul):", np.round(np.bincount(d[L], minlength=9) / L.sum(), 3))
-print(f"air button held: {A[..., 1][L].mean():.2f}, ground held: {A[..., 2][L].mean():.2f}, cycle: {A[..., 3][L].mean():.3f}")
-air = A[..., 1]
+print(f"air (off, fire, charge): {np.round(np.bincount(A[..., 1][L], minlength=3) / L.sum(), 3)}, ground held: {A[..., 2][L].mean():.2f}, cycle: {A[..., 3][L].mean():.3f}")
+air = (A[..., 1] == 1).astype(int)
 presses = ((air[1:] == 1) & (air[:-1] == 0) & L[1:]).sum() / L.sum() * 10
 print(f"air presses per second: {presses:.2f}")

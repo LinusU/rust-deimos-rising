@@ -24,7 +24,7 @@ def main():
     rng = np.random.default_rng(0)
     rows = []
     for t in range(60):
-        obs = env.step(rng.integers(0, 128, size=(8, 2), dtype=np.uint8) | 128)
+        obs = env.step(rng.integers(0, 256, size=(8, 2), dtype=np.uint8), np.ones((8, 2), bool))
         if t % 10 == 9:
             rows.append({k: obs[k].copy() for k in ("ent", "ent_id", "self", "self_id")})
     env.close()
@@ -34,7 +34,7 @@ def main():
         export(m, pol)
         with open(dump, "wb") as f:
             n = sum(r["ent"].shape[0] * 2 for r in rows)
-            f.write(struct.pack("<ii", n, 15))
+            f.write(struct.pack("<ii", n, sum(m.acts)))
             for r in rows:
                 A = r["ent"].shape[0] * 2
                 t = [torch.from_numpy(r[k].reshape(A, *r[k].shape[2:]).copy()) for k in ("ent", "ent_id", "self", "self_id")]

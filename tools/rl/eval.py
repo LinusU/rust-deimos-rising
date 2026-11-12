@@ -50,13 +50,12 @@ def evaluate(ck_path, games, dev, temperature=1.0, seed=123):
         o = to_dev(obs, dev)
         with torch.no_grad():
             lg, _ = m(*o)
-            acts, _ = sample(lg, temperature)
+            acts, _ = sample(lg, temperature, heads=m.acts)
             b = pack_actions(acts).cpu().numpy()
         selfv = obs["self"].reshape(2 * n, -1)
         es = np.nonzero(camper)[0]
         b[es * 2] = scripted.camper(es, selfv[es * 2])
-        b = b | np.where(learner.reshape(-1), 128, 0).astype(np.uint8)
-        obs = env.step(b.reshape(n, 2))
+        obs = env.step(b.reshape(n, 2), learner)
         info = obs["info"]
         live = ~finished
         score[live] += info[live, I_DSCORE] + info[live, 8 + I_DSCORE]

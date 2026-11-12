@@ -12,6 +12,8 @@ BIN = os.path.join(ROOT, "target", "release", "deimos")
 # info columns (src/rl/env.rs fill_info): per player p at 8*p
 I_DSCORE, I_LIVES, I_SHIELDS, I_STATE, I_INGAME, I_DEATHS, I_DAMAGE, I_SCORE = range(8)
 I_LEVEL, I_LEVELS_DONE, I_LEVEL_DONE, I_END, I_TIME, I_TICKS, I_START_LEVEL, I_PROGRESS, I_COMPLETE = range(16, 25)
+# self columns the trainer reads or sets
+S_INGAME, S_LATCH, S_ROLE = 11, 48, 49
 
 
 class EnvServer:
@@ -22,7 +24,7 @@ class EnvServer:
             args += ["--levels", ",".join(str(l) for l in levels)]
         self.p = subprocess.Popen(args, cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         hdr = self._read(4 + 6 * 4)
-        assert hdr[:4] == b"DRL1", hdr[:4]
+        assert hdr[:4] == b"DRL2", hdr[:4]
         self.n, self.K, self.F, self.S, self.SELF_IDS, self.INFO = struct.unpack("<6I", hdr[4:])
         assert self.n == envs
         n = self.n
@@ -57,14 +59,15 @@ class EnvServer:
             off += cnt * 4
         return out
 
-    def send(self, actions):
-        """actions: uint8 [n, 2] (bit 7 = learner)."""
+    def send(self, actions, learners):
+        """actions: uint8 [n, 2] action bytes; learners: bool [n, 2]."""
         a = np.ascontiguousarray(actions, dtype=np.uint8)
-        assert a.shape == (self.n, 2)
-        self.p.stdin.write(b"S" + a.tobytes())
+        l = np.ascontiguousarray(learners, dtype=np.uint8)
+        assert a.shape == (self.n, 2) and l.shape == (self.n, 2)
+        self.p.stdin.write(b"S" + a.tobytes() + l.tobytes())
 
-    def step(self, actions):
-        self.send(actions)
+    def step(self, actions, learners):
+        self.send(actions, learners)
         return self.read()
 
     def close(self):

@@ -7,11 +7,12 @@
 //! observation lags, default 1).
 //!
 //! Protocol (little-endian). On start the server writes the header
-//! `b"DRL1"`, then u32 N, K, F, S, SELF_IDS, INFO, then an observation
+//! `b"DRL2"`, then u32 N, K, F, S, SELF_IDS, INFO, then an observation
 //! block. Then, per command byte read:
 //! - `S` + N*2 action bytes (env-major, player-minor; bits 0..3 direction,
-//!   4 air, 5 ground, 6 cycle, 7 "this player is a learner"): steps every
-//!   game and writes an observation block.
+//!   4 air, 5 ground, 6 cycle, 7 charge) + N*2 flag bytes (bit 0: this
+//!   player is a learner): steps every game and writes an observation
+//!   block.
 //! - `Q`: exits.
 //!
 //! An observation block is f32 ent[N][2][K][F], i32 ent_id[N][2][K][2],
@@ -124,7 +125,7 @@ pub fn run(args: &[String], exe: Vec<u8>, paks: PathBuf) {
                         let i = range.start + j;
                         let a0 = acts[i * 2];
                         let a1 = acts[i * 2 + 1];
-                        let learners = [a0 & 128 != 0, a1 & 128 != 0];
+                        let learners = [acts[n * 2 + i * 2] & 1 != 0, acts[n * 2 + i * 2 + 1] & 1 != 0];
                         e.step(&cfg, [Action::from_byte(a0), Action::from_byte(a1)], learners).expect("step");
                     }
                     tx_out.send(write_chunk(&envs)).unwrap();
@@ -137,7 +138,7 @@ pub fn run(args: &[String], exe: Vec<u8>, paks: PathBuf) {
 
     let stdout = std::io::stdout();
     let mut out = std::io::BufWriter::with_capacity(8 << 20, stdout.lock());
-    out.write_all(b"DRL1").unwrap();
+    out.write_all(b"DRL2").unwrap();
     for v in [n, K, F, S, SELF_IDS, INFO] {
         out.write_all(&(v as u32).to_le_bytes()).unwrap();
     }
@@ -170,7 +171,7 @@ pub fn run(args: &[String], exe: Vec<u8>, paks: PathBuf) {
         }
         match cmd[0] {
             b'S' => {
-                let mut acts = vec![0u8; n * 2];
+                let mut acts = vec![0u8; n * 4];
                 stdin.read_exact(&mut acts).unwrap();
                 let acts = Arc::new(acts);
                 for s in &senders {
@@ -204,7 +205,7 @@ pub fn bench(args: &[String], exe: Vec<u8>, paks: PathBuf) {
     let mut max_ent = 0;
     for _ in 0..steps {
         r = r.wrapping_mul(1103515245).wrapping_add(12345);
-        let a0 = Action::from_byte(((r >> 16) as u8 % 9) | 16 | 32);
+        let a0 = Action::from_byte(((r >> 16) as u8 % 9) | 16 | 32 | if (r >> 24) % 16 == 0 { 128 } else { 0 });
         let a1 = Action::from_byte(((r >> 20) as u8 % 9) | 16);
         if std::env::var_os("RL_DEBUG").is_some() {
             let p = e.s.player(0);

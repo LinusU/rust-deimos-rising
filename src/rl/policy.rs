@@ -59,6 +59,11 @@ struct Block {
 }
 
 pub struct Policy {
+    /// Action head sizes: direction, air (2, or 3 with the charge order),
+    /// ground, cycle.
+    acts: [usize; 4],
+    /// Self floats it was trained on (older policies: the first 48).
+    s_in: usize,
     /// Observation version: 1 embedded the weapon slots by sprite alone.
     obs_v: usize,
     d: usize,
@@ -137,9 +142,11 @@ impl Policy {
         let layers = cfg_int(&cfg, "layers").ok_or("config: layers")?;
         let emb = cfg_int(&cfg, "emb").ok_or("config: emb")?;
         let k = cfg_int(&cfg, "k").ok_or("config: k")?.min(K);
-        if cfg_int(&cfg, "F") != Some(F) || cfg_int(&cfg, "S") != Some(S) || cfg_int(&cfg, "self_ids") != Some(SELF_IDS) {
+        let s_in = cfg_int(&cfg, "S").unwrap_or(0);
+        if cfg_int(&cfg, "F") != Some(F) || !(s_in == 48 || s_in == S) || cfg_int(&cfg, "self_ids") != Some(SELF_IDS) {
             return Err(format!("policy was trained for another observation layout: {cfg}"));
         }
+        let air = cfg_int(&cfg, "air").unwrap_or(2);
         let obs_v = cfg_int(&cfg, "obs").unwrap_or(1);
         let mut blocks = Vec::new();
         for i in 0..layers {
@@ -154,6 +161,8 @@ impl Policy {
             });
         }
         Ok(Policy {
+            acts: [HEADS[0], air, HEADS[2], HEADS[3]],
+            s_in,
             obs_v,
             d,
             heads,
@@ -188,8 +197,9 @@ impl Policy {
         let mut tmp = Vec::new();
         let mut tmp2 = Vec::new();
         // The self token.
-        let mut sin = vec![0.0; S + self.emb];
-        sin[..S].copy_from_slice(&o.selfv);
+        let si = self.s_in;
+        let mut sin = vec![0.0; si + self.emb];
+        sin[..si].copy_from_slice(&o.selfv[..si]);
         let ids = if self.obs_v >= 2 { &o.self_id } else { &o.self_id_v1 };
         if self.obs_v < 2 {
             // Version 1 scaled the weapon slots' frames by 1/100.
@@ -198,7 +208,7 @@ impl Policy {
             }
         }
         for w in 0..SELF_IDS {
-            self.add_embed(ids[w * 2], ids[w * 2 + 1], &mut sin[S..]);
+            self.add_embed(ids[w * 2], ids[w * 2 + 1], &mut sin[si..]);
         }
         self.self_in.apply(&sin, &mut tmp);
         tmp.iter_mut().for_each(|v| *v = v.max(0.0));
@@ -299,7 +309,7 @@ impl Policy {
         let (logits, _) = self.forward(o);
         let mut picks = [0usize; 4];
         let mut off = 0;
-        for (h, &n) in HEADS.iter().enumerate() {
+        for (h, &n) in self.acts.iter().enumerate() {
             let lg = &logits[off..off + n];
             off += n;
             let t = temperature.max(1e-3);
@@ -316,6 +326,6 @@ impl Policy {
                 u -= pi;
             }
         }
-        Action { dir: picks[0] as u8, air: picks[1] == 1, ground: picks[2] == 1, cycle: picks[3] == 1 }
+        Action { dir: picks[0] as u8, air: picks[1] == 1, ground: picks[2] == 1, cycle: picks[3] == 1, charge: picks[1] == 2 }
     }
 }

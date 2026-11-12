@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use super::obs::{Action, Obs, Tracker};
+use super::obs::{own_knowledge, Action, Latch, Obs, Tracker};
 use crate::game::og::session::{EndReason, Session};
 
 /// Floats of per-env info: 8 per player then 9 for the game.
@@ -39,6 +39,7 @@ pub struct Env {
     hist: std::collections::VecDeque<[Obs; 2]>,
     delay: usize,
     pub info: [f32; INFO],
+    pub latch: [Latch; 2],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -68,6 +69,7 @@ impl Env {
             hist: Default::default(),
             delay: 0,
             info: [0.0; INFO],
+            latch: [Latch::default(); 2],
         })
     }
 
@@ -107,6 +109,7 @@ impl Env {
         self.tracker.reset();
         self.hist.clear();
         self.delay = cfg.delay;
+        self.latch = [Latch::default(); 2];
         self.observe();
         self.info = [0.0; INFO];
         self.fill_info(&[PStat::default(); 2], [0; 2], [0.0; 2], 0.0);
@@ -137,14 +140,7 @@ impl Env {
         // The previous-action features are the bot's own knowledge, not
         // something it sees late.
         for p in 0..2 {
-            let v = &mut self.obs[p].selfv;
-            for i in 34..46 {
-                v[i] = 0.0;
-            }
-            v[34 + prev[p].dir.min(8) as usize] = 1.0;
-            v[43] = prev[p].air as i32 as f32;
-            v[44] = prev[p].ground as i32 as f32;
-            v[45] = prev[p].cycle as i32 as f32;
+            own_knowledge(&mut self.obs[p].selfv, prev[p], self.latch[p].on, 0.0);
         }
     }
 
@@ -158,10 +154,20 @@ impl Env {
         let mut damage = [0f32; 2];
         let before = [self.pstat(0), self.pstat(1)];
         let mut last = before;
-        let inputs = [actions[0].og(), actions[1].og()];
+        let mut actions = actions;
+        for i in 0..2 {
+            self.latch[i].decide(&mut actions[i]);
+        }
+        let base = [actions[0].og(), actions[1].og()];
         let mut level_done = 0.0;
         let was_complete = self.s.is_level_complete();
         for _ in 0..cfg.repeat {
+            let mut inputs = base;
+            for i in 0..2 {
+                if let Some(hold) = self.latch[i].tick(&self.s, i) {
+                    inputs[i][5] = hold;
+                }
+            }
             self.s.tick(inputs);
             self.ticks += 1;
             for i in 0..2 {

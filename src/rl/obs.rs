@@ -26,7 +26,7 @@ pub const K: usize = 64;
 /// Floats per object.
 pub const F: usize = 18;
 /// Floats about the player.
-pub const S: usize = 48;
+pub const S: usize = 50;
 /// Ids per player besides the objects (the air weapon slots).
 pub const SELF_IDS: usize = 3;
 
@@ -59,22 +59,25 @@ pub fn id_buckets(sprite: u32) -> (i32, i32) {
 }
 
 /// One player's action: a direction (0 none, 1 up, then clockwise in
-/// eighths to 8 up-left) and three buttons.
+/// eighths to 8 up-left), three buttons and `charge`: hold air fire until
+/// the charge is full, then let go (see [`Latch`]).
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Action {
     pub dir: u8,
     pub air: bool,
     pub ground: bool,
     pub cycle: bool,
+    pub charge: bool,
 }
 
 impl Action {
-    /// From the packed byte: bits 0..3 direction, 4 air, 5 ground, 6 cycle.
+    /// From the packed byte: bits 0..3 direction, 4 air, 5 ground, 6 cycle,
+    /// 7 charge.
     pub fn from_byte(b: u8) -> Action {
-        Action { dir: (b & 15).min(8), air: b & 16 != 0, ground: b & 32 != 0, cycle: b & 64 != 0 }
+        Action { dir: (b & 15).min(8), air: b & 16 != 0, ground: b & 32 != 0, cycle: b & 64 != 0, charge: b & 128 != 0 }
     }
     pub fn to_byte(self) -> u8 {
-        self.dir.min(8) | (self.air as u8) << 4 | (self.ground as u8) << 5 | (self.cycle as u8) << 6
+        self.dir.min(8) | (self.air as u8) << 4 | (self.ground as u8) << 5 | (self.cycle as u8) << 6 | (self.charge as u8) << 7
     }
     /// The port's input order: up, right, down, left, ground, air, cycle.
     pub fn og(self) -> [bool; 7] {
@@ -107,8 +110,78 @@ impl Action {
             (-1, -1) => 8,
             _ => 0,
         };
-        Action { dir, ground: i[4], air: i[5], cycle: i[6] }
+        Action { dir, ground: i[4], air: i[5], cycle: i[6], charge: false }
     }
+}
+
+/// The charge order: air fire held from the decision that gives it until
+/// the charge is full (the power bar on the score bar reads 100%), then
+/// let go so the charge goes off. A person does the same, watching the
+/// bar; a decision every 100 ms could hardly hold a button for the ~2 s a
+/// charge takes by chance. Holding past full would overload the ship.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Latch {
+    pub on: bool,
+    ticks: u32,
+    /// Charges let go when full (for the trainer's statistics).
+    pub released: u32,
+}
+
+impl Latch {
+    /// At a decision: a charge order starts the hold. While one runs the
+    /// decision's air choices are ignored.
+    pub fn decide(&mut self, a: &mut Action) {
+        if self.on {
+            a.air = false;
+            a.charge = false;
+        } else if a.charge {
+            self.on = true;
+            self.ticks = 0;
+            a.air = false;
+        }
+    }
+
+    /// Per tick: whether air fire is held, or `None` when no charge runs.
+    pub fn tick(&mut self, s: &Session, me: usize) -> Option<bool> {
+        if !self.on {
+            return None;
+        }
+        let pobj = s.g.m.r32(crate::game::og::game::PLAYERS + me as u32 * 4);
+        // `G_Player` +0xba: the ship's state (4 = flying).
+        if s.g.m.ri32(pobj + 0xba) != 4 {
+            self.on = false;
+            return Some(false);
+        }
+        let h = pobj + 0x235;
+        let state = s.g.m.r32(h + 0x11);
+        let pct = s.g.m.rf32(h + 0x25);
+        self.ticks += 1;
+        if state == 1 && pct >= 100.0 {
+            self.on = false;
+            self.released += 1;
+            return Some(false);
+        }
+        if state == 2 || self.ticks > 90 {
+            self.on = false;
+            return Some(false);
+        }
+        Some(true)
+    }
+}
+
+/// The player's own knowledge, known at once rather than seen late: its
+/// previous action, whether a charge order is running, and its role
+/// (0 support: the co-pilot; 1 lead).
+pub fn own_knowledge(v: &mut [f32], prev: Action, latch_on: bool, role: f32) {
+    for x in v[34..46].iter_mut() {
+        *x = 0.0;
+    }
+    v[34 + prev.dir.min(8) as usize] = 1.0;
+    v[43] = (prev.air || prev.charge) as i32 as f32;
+    v[44] = prev.ground as i32 as f32;
+    v[45] = prev.cycle as i32 as f32;
+    v[48] = latch_on as i32 as f32;
+    v[49] = role;
 }
 
 /// One player's observation.
@@ -326,10 +399,7 @@ impl Tracker {
         v[31] = s.is_level_complete() as i32 as f32;
         v[32] = me as f32;
         v[33] = pa.money_counter_active as i32 as f32;
-        v[34 + prev_action.dir.min(8) as usize] = 1.0;
-        v[43] = prev_action.air as i32 as f32;
-        v[44] = prev_action.ground as i32 as f32;
-        v[45] = prev_action.cycle as i32 as f32;
+        own_knowledge(v, prev_action, false, 0.0);
         v[46] = n as f32 / K as f32;
         v[47] = (s.game_time() as f32 / 6000.0).min(3.0);
     }
