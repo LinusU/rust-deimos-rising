@@ -75,7 +75,7 @@ def parse():
     p.add_argument("--quiet-secs", type=float, default=1.5, help="seconds without points that make a lull")
     p.add_argument("--protect", type=float, default=0.5, help="support: extra weight of the partner's damage and deaths")
     p.add_argument("--bomb-miss", type=float, default=0.05, help="support: cost of a bomb volley that scores nothing")
-    p.add_argument("--bomb-hit", type=float, default=0.05, help="lead: bonus for a bomb volley that scores")
+    p.add_argument("--bomb-hit", type=float, default=0.15, help="lead: bonus for a bomb volley that scores")
     p.add_argument("--coin", type=float, default=0.02, help="lead: bonus per unit of money")
     p.add_argument("--lead-death", type=float, default=2.0)
     p.add_argument("--charge-bonus", type=float, default=0.0, help="per full charge let go, fading out")
