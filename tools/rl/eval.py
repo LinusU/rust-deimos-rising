@@ -4,7 +4,8 @@ they get, to pick a co-pilot that helps without carrying the game:
 - camper: the bot flies player 2; player 1 flies to a bottom corner and
   stays there without firing (the "user hides in the corner" case). A good
   co-pilot should NOT finish the game like this.
-- duo:    the bot flies both ships (a stand-in for a partner who plays).
+- duo:    the bot flies both ships, player 1 in the lead role and player 2
+          as support (a stand-in for a partner who plays).
 
 uv run python eval.py runs/<run> [--every 2] [--games 24] [--only 00500,01000]
 Appends to runs/<run>/eval.jsonl and prints a table.
@@ -19,7 +20,7 @@ import numpy as np
 import torch
 
 from envclient import (EnvServer, I_DSCORE, I_END, I_LEVEL, I_LEVELS_DONE, I_PROGRESS, I_PSTATS, I_TICKS, P_CHARGES,
-                       P_WCHANGES, PSTATS)
+                       P_WCHANGES, PSTATS, S_ROLE)
 from model import Policy, pack_actions, sample
 from train import Scripted, to_dev
 
@@ -42,6 +43,8 @@ def evaluate(ck_path, games, dev, temperature=1.0, seed=123):
     learner = np.zeros((n, 2), bool)
     learner[:, 1] = True
     learner[~camper, 0] = True
+    roles = np.zeros((n, 2), np.int64)
+    roles[~camper, 0] = 1
     support_stats = np.zeros((n, 2))  # charges, weapon changes of player 2
     finished = np.zeros(n, bool)
     res = [None] * n
@@ -49,6 +52,8 @@ def evaluate(ck_path, games, dev, temperature=1.0, seed=123):
     max_level = np.zeros(n)
     obs = env.read()
     while not finished.all():
+        obs["self"] = obs["self"].copy()
+        obs["self"][:, :, S_ROLE] = roles
         o = to_dev(obs, dev)
         with torch.no_grad():
             lg, _ = m(*o)

@@ -1,37 +1,62 @@
-"""Action statistics of a snapshot (both ships flown by it, level 1):
-uv run python behaviour.py runs/<run>/ckpt_XXXXX.pt [temperature]"""
-import sys
+"""Action statistics of a snapshot, both ships flown by it (player 1 as
+lead, player 2 as support), from level `--level` (list position, default 1):
+uv run python behaviour.py runs/<run>/ckpt_XXXXX.pt [--temperature T] [--level N]"""
+import argparse
 
 import numpy as np
 import torch
 
-from envclient import EnvServer
-from model import Policy, pack_actions, sample
+from envclient import I_PSTATS, PSTATS, P_CHARGES, P_HITS, P_MISSES, P_MONEY, P_VOLLEYS, P_WCHANGES, S_LATCH, S_ROLE, EnvServer
+from model import Policy, sample
 from train import to_dev
 
-ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
-env = EnvServer(16, threads=4, seed=9, levels=[1])
+p = argparse.ArgumentParser()
+p.add_argument("ckpt")
+p.add_argument("--temperature", type=float, default=1.0)
+p.add_argument("--level", type=int, default=1)
+p.add_argument("--decisions", type=int, default=3000)
+a = p.parse_args()
+ck = torch.load(a.ckpt, map_location="cpu", weights_only=False)
+n = 16
+env = EnvServer(n, threads=4, seed=9, levels=[a.level])
 m = Policy(env.F, env.S, env.SELF_IDS, **{k: v for k, v in ck["cfg"].items() if k not in ("F", "S", "self_ids")})
 m.load_state_dict(ck["model"])
 m.eval()
 obs = env.read()
-acts_log = []
-alive = []
-for t in range(1500):
+roles = np.tile(np.array([1, 0]), (n, 1))
+acts_log, alive, latch = [], [], []
+pst = np.zeros((n, 2, PSTATS))
+for t in range(a.decisions):
+    obs["self"] = obs["self"].copy()
+    obs["self"][:, :, S_ROLE] = roles
     with torch.no_grad():
         lg, _ = m(*to_dev(obs, "cpu"))
-        a, _ = sample(lg, float(sys.argv[2]) if len(sys.argv) > 2 else 1.0, heads=m.acts)
-    acts_log.append(a.numpy())
-    alive.append(obs["self"].reshape(32, -1)[:, 6] > 0.5)  # state 4 (active)
-    obs = env.step(pack_actions(a).numpy().reshape(16, 2), np.ones((16, 2), bool))
+        act, _ = sample(lg, a.temperature, heads=m.acts)
+    acts_log.append(act.numpy().reshape(n, 2, 4))
+    sv = obs["self"]
+    alive.append(sv[:, :, 6] > 0.5)  # state 4 (flying)
+    latch.append(sv[:, :, S_LATCH] > 0.5)
+    from model import pack_actions
+    obs = env.step(pack_actions(act).numpy().reshape(n, 2), np.ones((n, 2), bool))
+    for q in range(2):
+        pst[:, q] += obs["info"][:, I_PSTATS + PSTATS * q:I_PSTATS + PSTATS * (q + 1)] * alive[-1][:, q:q + 1]
 env.close()
 A = np.stack(acts_log)
 L = np.stack(alive)
-d = A[..., 0]
-ch = (d[1:] != d[:-1]) & L[1:] & L[:-1]
-print(f"direction changes per second: {ch.sum() / (L[1:] & L[:-1]).sum() * 10:.2f}")
-print("direction histogram (none, up, ur, r, dr, d, dl, l, ul):", np.round(np.bincount(d[L], minlength=9) / L.sum(), 3))
-print(f"air (off, fire, charge): {np.round(np.bincount(A[..., 1][L], minlength=3) / L.sum(), 3)}, ground held: {A[..., 2][L].mean():.2f}, cycle: {A[..., 3][L].mean():.3f}")
-air = (A[..., 1] == 1).astype(int)
-presses = ((air[1:] == 1) & (air[:-1] == 0) & L[1:]).sum() / L.sum() * 10
-print(f"air presses per second: {presses:.2f}")
+H = np.stack(latch)
+for q, name in ((1, "support"), (0, "lead")):
+    Lq = L[:, :, q]
+    d = A[:, :, q, 0]
+    both = Lq[1:] & Lq[:-1]
+    secs = Lq.sum() / 10
+    mins = secs / 60
+    print(f"== {name} ({secs / 60:.1f} ship-minutes flying)")
+    print(f"  direction changes per second: {((d[1:] != d[:-1]) & both).sum() / both.sum() * 10:.2f}")
+    print("  direction histogram (none, up, ur, r, dr, d, dl, l, ul):", np.round(np.bincount(d[Lq], minlength=9) / Lq.sum(), 3))
+    air = A[:, :, q, 1]
+    free = Lq & ~H[:, :, q]
+    print(f"  air choices when free (off, fire, charge): {np.round(np.bincount(air[free], minlength=3) / free.sum(), 3)}, "
+          f"charging {H[:, :, q][Lq].mean():.2f} of the time")
+    s = pst[:, q].sum(0)
+    print(f"  per minute: charges {s[P_CHARGES] / mins:.2f}, weapon changes {s[P_WCHANGES] / mins:.2f}, "
+          f"bomb volleys {s[P_VOLLEYS] / mins:.1f} (hits {s[P_HITS] / mins:.1f}, misses {s[P_MISSES] / mins:.1f}), money {s[P_MONEY] / mins:.1f}")

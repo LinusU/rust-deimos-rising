@@ -1,8 +1,11 @@
 """PPO for the co-pilot.
 
-Each game has two ships. Per episode a game draws a partner setup:
-- self:   both ships run the policy being trained (both learn)
-- past:   one ship learns, the other is a frozen earlier snapshot
+Each game has two ships. One network plays two roles, told apart by an
+input: the support (the co-pilot) and the lead (a stand-in for a person
+who goes for ground targets and coins and takes more risks). Per episode
+a game draws a partner setup:
+- duo:    one ship plays lead, the other support (both learn)
+- past:   the support learns next to a frozen earlier snapshot as lead
 - camper: the partner flies to a spot near the bottom and stays there
           (sometimes firing): the "user hides in the corner" case
 - idle:   the partner never touches the controls
@@ -12,10 +15,12 @@ itself keeps the bot from depending on conventions only it would follow
 (Strouse et al. 2021, "Collaborating with Humans without Human Data").
 
 The reward is cooperative: a ship's own terms plus half of its partner's
-(score, lives lost, shield damage), so protecting the partner pays. Full
-charges get a bonus that fades out (--charge-bonus over --charge-anneal
-updates): a charge costs ~2 s of fire before it pays, so the bot would
-hardly try one otherwise.
+(score, lives lost, shield damage). The support also pays for its
+partner's damage and deaths (--protect) and for bomb volleys that score
+nothing; the lead gets a bonus for volleys that score and for money, and
+a smaller death penalty. Full charges get a bonus that fades out
+(--charge-bonus over --charge-anneal updates): a charge costs ~2 s of
+fire before it pays, so the bot would hardly try one otherwise.
 
 Usage: uv run python train.py --run NAME [--envs 256 ...]
 """
@@ -31,10 +36,12 @@ import numpy as np
 import torch
 
 from envclient import (EnvServer, I_DAMAGE, I_DEATHS, I_DSCORE, I_END, I_LEVEL_DONE, I_LEVELS_DONE, I_PROGRESS,
-                       I_PSTATS, I_START_LEVEL, I_TICKS, P_CHARGES, PSTATS, S_INGAME, S_LATCH)
+                       I_PSTATS, I_START_LEVEL, I_TICKS, P_CHARGES, P_HITS, P_MISSES, P_MONEY, P_VOLLEYS, P_WCHANGES,
+                       PSTATS, S_INGAME, S_LATCH, S_ROLE)
 from model import Policy, evaluate, export, masked_logp, pack_actions, sample
 
-MODES = ["self", "past", "camper", "idle", "noisy"]
+MODES = ["duo", "past", "camper", "idle", "noisy"]
+ROLES = ["support", "lead"]
 
 
 def parse():
@@ -59,6 +66,11 @@ def parse():
     p.add_argument("--level", type=float, default=3.0)
     p.add_argument("--jitter", type=float, default=0.01, help="cost of changing direction (or letting go)")
     p.add_argument("--cycle-cost", type=float, default=0.005)
+    p.add_argument("--protect", type=float, default=0.5, help="support: extra weight of the partner's damage and deaths")
+    p.add_argument("--bomb-miss", type=float, default=0.05, help="support: cost of a bomb volley that scores nothing")
+    p.add_argument("--bomb-hit", type=float, default=0.05, help="lead: bonus for a bomb volley that scores")
+    p.add_argument("--coin", type=float, default=0.02, help="lead: bonus per unit of money")
+    p.add_argument("--lead-death", type=float, default=2.0)
     p.add_argument("--charge-bonus", type=float, default=0.1, help="per full charge let go, fading out")
     p.add_argument("--charge-anneal", type=int, default=1500, help="updates over which the charge bonus fades")
     p.add_argument("--ent-heads", default="1,1,1,2", help="entropy weight per head (direction, air, ground, cycle)")
@@ -175,6 +187,7 @@ def main():
     probs /= probs.sum()
     mode = np.zeros(n, np.int64)
     learner = np.zeros((n, 2), bool)
+    role = np.zeros((n, 2), np.int64)
     ent_heads = torch.tensor([float(x) for x in a.ent_heads.split(",")], device=dev)
     snap_of = np.zeros(n, np.int64)
     scripted = Scripted(n, rng)
@@ -185,11 +198,16 @@ def main():
         if MODES[m] == "past" and not partner_models:
             m = 0
         mode[e] = m
-        if MODES[m] == "self":
+        s = rng.integers(0, 2)
+        if MODES[m] == "duo":
             learner[e] = (True, True)
+            role[e] = (1, 0) if s == 0 else (0, 1)
         else:
-            s = rng.integers(0, 2)
+            # The support learns; a past snapshot partner plays lead.
             learner[e] = (s == 0, s == 1)
+            role[e] = (0, 1) if s == 0 else (1, 0)
+            if MODES[m] != "past":
+                role[e] = 0
         snap_of[e] = rng.integers(0, max(1, len(partner_models)))
         scripted.reset(e)
 
@@ -200,7 +218,7 @@ def main():
     ret_acc = np.zeros(A)
     obs = env.read()
     ep_stats = collections.defaultdict(list)
-    ep_acc = {"score": np.zeros(n), "deaths": np.zeros((n, 2)), "rew": np.zeros(A)}
+    ep_acc = {"score": np.zeros(n), "deaths": np.zeros((n, 2)), "rew": np.zeros(A), "pst": np.zeros((n, 2, PSTATS))}
     prev_dir = np.zeros(A, np.int64)
     log = open(os.path.join(run_dir, "log.jsonl"), "a")
 
@@ -234,6 +252,8 @@ def main():
         t_env = 0.0
         cbonus = a.charge_bonus * max(0.0, 1.0 - (update - start_update) / max(1, a.charge_anneal))
         for t in range(T):
+            obs["self"] = obs["self"].copy()
+            obs["self"][:, :, S_ROLE] = role
             o = to_dev(obs, dev)
             air_mask = o[2][:, S_LATCH] > 0.5
             with torch.no_grad():
@@ -278,14 +298,21 @@ def main():
 
             # Rewards.
             own = np.zeros((n, 2), np.float32)
+            harm = np.zeros((n, 2), np.float32)
             pst = np.zeros((n, 2, PSTATS), np.float32)
             for p in range(2):
                 b = p * 8
                 pst[:, p] = info[:, I_PSTATS + PSTATS * p:I_PSTATS + PSTATS * (p + 1)]
-                own[:, p] = (a.score * info[:, b + I_DSCORE] - a.death * info[:, b + I_DEATHS]
-                             - a.damage * info[:, b + I_DAMAGE] / 100.0 + cbonus * pst[:, p, P_CHARGES])
+                lead = role[:, p] == 1
+                harm[:, p] = a.death * info[:, b + I_DEATHS] + a.damage * info[:, b + I_DAMAGE] / 100.0
+                own[:, p] = (a.score * info[:, b + I_DSCORE]
+                             - np.where(lead, a.lead_death, a.death) * info[:, b + I_DEATHS]
+                             - a.damage * info[:, b + I_DAMAGE] / 100.0
+                             + np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY],
+                                        -a.bomb_miss * pst[:, p, P_MISSES])
+                             + cbonus * pst[:, p, P_CHARGES])
             own += a.level * info[:, [I_LEVEL_DONE]]
-            r = own + a.team * own[:, ::-1]
+            r = own + a.team * own[:, ::-1] - np.where(role == 0, a.protect * harm[:, ::-1], 0.0)
             r = r.reshape(-1)
             dirs = acts[:, 0].cpu().numpy()
             r -= a.jitter * (dirs != prev_dir)
@@ -302,6 +329,7 @@ def main():
             ep_acc["rew"] += r
             ep_acc["score"] += info[:, I_DSCORE] + info[:, 8 + I_DSCORE]
             ep_acc["deaths"] += info[:, [I_DEATHS, 8 + I_DEATHS]]
+            ep_acc["pst"] += pst
             for e in np.nonzero(done)[0]:
                 md = MODES[mode[e]]
                 ls = [p for p in range(2) if learner[e, p]]
@@ -310,10 +338,21 @@ def main():
                 ep_stats[md + "/progress"].append(info[e, I_PROGRESS])
                 ep_stats[md + "/ticks"].append(info[e, I_TICKS])
                 ep_stats[md + "/learner_deaths"].append(np.mean([ep_acc["deaths"][e, p] for p in ls]))
-                ep_stats[md + "/partner_deaths"].append(np.mean([ep_acc["deaths"][e, 1 - p] for p in ls]) if md != "self" else np.mean(ep_acc["deaths"][e]))
+                ep_stats[md + "/partner_deaths"].append(np.mean([ep_acc["deaths"][e, 1 - p] for p in ls]) if md != "duo" else np.mean(ep_acc["deaths"][e]))
                 ep_stats[md + "/end"].append(info[e, I_END])
                 ep_stats[md + "/start_level"].append(info[e, I_START_LEVEL])
                 ep_stats["all/reward"].append(np.mean([ep_acc["rew"][e * 2 + p] for p in ls]))
+                mins = max(info[e, I_TICKS], 1) / 1800
+                for p in ls:
+                    rn = ROLES[role[e, p]]
+                    ps = ep_acc["pst"][e, p]
+                    ep_stats[rn + "/charges_pm"].append(ps[P_CHARGES] / mins)
+                    ep_stats[rn + "/wchanges_pm"].append(ps[P_WCHANGES] / mins)
+                    ep_stats[rn + "/volleys_pm"].append(ps[P_VOLLEYS] / mins)
+                    ep_stats[rn + "/misses_pm"].append(ps[P_MISSES] / mins)
+                    ep_stats[rn + "/money_pm"].append(ps[P_MONEY] / mins)
+                    ep_stats[rn + "/deaths"].append(ep_acc["deaths"][e, p])
+                ep_acc["pst"][e] = 0
                 ep_acc["score"][e] = 0
                 ep_acc["deaths"][e] = 0
                 ep_acc["rew"][e * 2:e * 2 + 2] = 0
@@ -323,6 +362,8 @@ def main():
 
         t_roll = time.time() - t0
         # GAE.
+        obs["self"] = obs["self"].copy()
+        obs["self"][:, :, S_ROLE] = role
         with torch.no_grad():
             _, last_v = model(*to_dev(obs, dev))
         vals = buf_val.cpu().numpy()

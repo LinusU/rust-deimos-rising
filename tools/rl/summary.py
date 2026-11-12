@@ -8,7 +8,7 @@ for l in open(sys.argv[1] + "/log.jsonl"):
     rows[r["update"]] = r  # a resumed run may repeat updates; keep the last
 rows = [rows[k] for k in sorted(rows)]
 every = int(sys.argv[2]) if len(sys.argv) > 2 else 10
-keys = ["self/score", "self/progress", "self/levels", "self/learner_deaths", "camper/score", "camper/progress", "camper/levels",
+keys = ["duo/score", "duo/progress", "duo/levels", "support/charges_pm", "support/wchanges_pm", "support/misses_pm", "lead/volleys_pm", "lead/money_pm", "camper/score", "camper/progress", "camper/levels",
         "camper/partner_deaths", "idle/progress", "noisy/progress", "past/progress", "all/reward"]
 print("upd    Msteps " + " ".join(f"{k.replace('/', ':')[:13]:>13}" for k in keys) + "  ent")
 for i in range(0, len(rows), every):
