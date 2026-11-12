@@ -20,7 +20,9 @@ partner's damage and deaths (--protect) and for bomb volleys that score
 nothing; the lead gets a bonus for volleys that score and for money, and
 a smaller death penalty. Full charges get a bonus that fades out
 (--charge-bonus over --charge-anneal updates): a charge costs ~2 s of
-fire before it pays, so the bot would hardly try one otherwise.
+fire before it pays, so the bot would hardly try one otherwise. Every air
+weapon change costs a little (--change-cost), against switching faster
+than a person would.
 
 Usage: uv run python train.py --run NAME [--envs 256 ...]
 """
@@ -65,7 +67,8 @@ def parse():
     p.add_argument("--score", type=float, default=1e-3, help="per point")
     p.add_argument("--level", type=float, default=3.0)
     p.add_argument("--jitter", type=float, default=0.01, help="cost of changing direction (or letting go)")
-    p.add_argument("--cycle-cost", type=float, default=0.005)
+    p.add_argument("--cycle-cost", type=float, default=0.0, help="per decision holding weapon select")
+    p.add_argument("--change-cost", type=float, default=0.05, help="per air weapon change")
     p.add_argument("--protect", type=float, default=0.5, help="support: extra weight of the partner's damage and deaths")
     p.add_argument("--bomb-miss", type=float, default=0.05, help="support: cost of a bomb volley that scores nothing")
     p.add_argument("--bomb-hit", type=float, default=0.05, help="lead: bonus for a bomb volley that scores")
@@ -73,7 +76,7 @@ def parse():
     p.add_argument("--lead-death", type=float, default=2.0)
     p.add_argument("--charge-bonus", type=float, default=0.1, help="per full charge let go, fading out")
     p.add_argument("--charge-anneal", type=int, default=1500, help="updates over which the charge bonus fades")
-    p.add_argument("--ent-heads", default="1,1,1,2", help="entropy weight per head (direction, air, ground, cycle)")
+    p.add_argument("--ent-heads", default="1,1,1,1", help="entropy weight per head (direction, air, ground, cycle)")
     p.add_argument("--init", default=None, help="warm start from an older run's checkpoint")
     p.add_argument("--mode-probs", default="0.45,0.2,0.15,0.05,0.15")
     p.add_argument("--snapshot-every", type=int, default=25, help="updates between partner-pool snapshots")
@@ -346,6 +349,7 @@ def main():
                              + np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY],
                                         -a.bomb_miss * pst[:, p, P_MISSES])
                              + cbonus * pst[:, p, P_CHARGES])
+            own -= a.change_cost * pst[:, :, P_WCHANGES]
             own += a.level * info[:, [I_LEVEL_DONE]]
             r = own + a.team * own[:, ::-1] - np.where(role == 0, a.protect * harm[:, ::-1], 0.0)
             r = r.reshape(-1)
