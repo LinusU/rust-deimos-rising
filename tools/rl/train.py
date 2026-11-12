@@ -74,6 +74,7 @@ def parse():
     p.add_argument("--charge-bonus", type=float, default=0.1, help="per full charge let go, fading out")
     p.add_argument("--charge-anneal", type=int, default=1500, help="updates over which the charge bonus fades")
     p.add_argument("--ent-heads", default="1,1,1,2", help="entropy weight per head (direction, air, ground, cycle)")
+    p.add_argument("--init", default=None, help="warm start from an older run's checkpoint")
     p.add_argument("--mode-probs", default="0.45,0.2,0.15,0.05,0.15")
     p.add_argument("--snapshot-every", type=int, default=25, help="updates between partner-pool snapshots")
     p.add_argument("--save-every", type=int, default=50, help="updates between kept checkpoints")
@@ -145,6 +146,38 @@ class Scripted:
         return (d | np.where(self.air[es], 16, 0) | np.where(r.random(n) < 0.05, 32, 0)).astype(np.uint8)
 
 
+def warm_start(model, path):
+    """Loads an older run's weights into `model`: new self inputs (charge
+    running, role) start at zero weight, the new air option (charge) and a
+    reset weapon-select head start rarely chosen."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    old, new = ck["model"], model.state_dict()
+    S0, S1 = ck["cfg"]["S"], model.cfg["S"]
+    out = {}
+    for k, v in old.items():
+        if k == "self_in.weight":
+            w = torch.zeros_like(new[k])
+            w[:, :S0] = v[:, :S0]
+            w[:, S1:] = v[:, S0:]
+            out[k] = w
+        elif k in ("pi.weight", "pi.bias"):
+            # old rows: dir 0-8, air 9-10, ground 11-12, cycle 13-14
+            off, fire, g0, g1, c0, c1 = v[9], v[10], v[11], v[12], v[13], v[14]
+            charge = off.clone()
+            if k == "pi.bias":
+                charge = charge - 3.5
+                cm = (c0 + c1) / 2
+                c0, c1 = cm, cm - 4.5
+            else:
+                cm = (c0 + c1) / 2
+                c0, c1 = cm, cm
+            out[k] = torch.cat([v[:9], torch.stack([off, fire, charge, g0, g1, c0, c1])])
+        else:
+            out[k] = v
+    model.load_state_dict(out)
+    return ck.get("update", 0)
+
+
 def to_dev(obs, dev):
     n = obs["ent"].shape[0]
     A = n * 2
@@ -173,6 +206,8 @@ def main():
     start_update = 0
     pool = []  # (update, state_dict on cpu)
     total_steps = 0
+    if a.init and not a.resume:
+        print(f"warm start from {a.init} (update {warm_start(model, a.init)})")
     if a.resume:
         ck = torch.load(a.resume, map_location="cpu", weights_only=False)
         model.load_state_dict(ck["model"])
