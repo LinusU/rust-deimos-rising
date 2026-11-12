@@ -20,9 +20,11 @@ partner's damage and deaths (--protect) and for bomb volleys that score
 nothing; the lead gets a bonus for volleys that score and for money, and
 a smaller death penalty. Full charges get a bonus that fades out
 (--charge-bonus over --charge-anneal updates): a charge costs ~2 s of
-fire before it pays, so the bot would hardly try one otherwise. Every air
-weapon change costs a little (--change-cost), against switching faster
-than a person would.
+fire before it pays, so the bot would hardly try one otherwise. A charge
+let go in a lull (no points by either ship for --quiet-secs) keeps a
+bonus (--quiet-charge): laying the Rear Gun's bubbles before a wave is
+what good players do with downtime. Every air weapon change costs a
+little (--change-cost), against switching faster than a person would.
 
 Usage: uv run python train.py --run NAME [--envs 256 ...]
 """
@@ -69,12 +71,14 @@ def parse():
     p.add_argument("--jitter", type=float, default=0.01, help="cost of changing direction (or letting go)")
     p.add_argument("--cycle-cost", type=float, default=0.0, help="per decision holding weapon select")
     p.add_argument("--change-cost", type=float, default=0.05, help="per air weapon change")
+    p.add_argument("--quiet-charge", type=float, default=0.15, help="per full charge let go in a lull")
+    p.add_argument("--quiet-secs", type=float, default=1.5, help="seconds without points that make a lull")
     p.add_argument("--protect", type=float, default=0.5, help="support: extra weight of the partner's damage and deaths")
     p.add_argument("--bomb-miss", type=float, default=0.05, help="support: cost of a bomb volley that scores nothing")
     p.add_argument("--bomb-hit", type=float, default=0.05, help="lead: bonus for a bomb volley that scores")
     p.add_argument("--coin", type=float, default=0.02, help="lead: bonus per unit of money")
     p.add_argument("--lead-death", type=float, default=2.0)
-    p.add_argument("--charge-bonus", type=float, default=0.1, help="per full charge let go, fading out")
+    p.add_argument("--charge-bonus", type=float, default=0.0, help="per full charge let go, fading out")
     p.add_argument("--charge-anneal", type=int, default=1500, help="updates over which the charge bonus fades")
     p.add_argument("--ent-heads", default="1,1,1,1", help="entropy weight per head (direction, air, ground, cycle)")
     p.add_argument("--init", default=None, help="warm start from an older run's checkpoint")
@@ -258,6 +262,8 @@ def main():
     ep_stats = collections.defaultdict(list)
     ep_acc = {"score": np.zeros(n), "deaths": np.zeros((n, 2)), "rew": np.zeros(A), "pst": np.zeros((n, 2, PSTATS))}
     prev_dir = np.zeros(A, np.int64)
+    quiet = np.zeros(n, np.int64)  # decisions since either ship scored
+    quiet_steps = int(round(a.quiet_secs * 10))
     log = open(os.path.join(run_dir, "log.jsonl"), "a")
 
     T = a.steps
@@ -349,7 +355,9 @@ def main():
                              + np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY],
                                         -a.bomb_miss * pst[:, p, P_MISSES])
                              + cbonus * pst[:, p, P_CHARGES])
-            own -= a.change_cost * pst[:, :, P_WCHANGES]
+            quiet = np.where(info[:, I_DSCORE] + info[:, 8 + I_DSCORE] > 0, 0, quiet + 1)
+            lull = (quiet >= quiet_steps)[:, None]
+            own += np.where(lull, a.quiet_charge, 0.0) * pst[:, :, P_CHARGES] - a.change_cost * pst[:, :, P_WCHANGES]
             own += a.level * info[:, [I_LEVEL_DONE]]
             r = own + a.team * own[:, ::-1] - np.where(role == 0, a.protect * harm[:, ::-1], 0.0)
             r = r.reshape(-1)
@@ -396,6 +404,7 @@ def main():
                 ep_acc["deaths"][e] = 0
                 ep_acc["rew"][e * 2:e * 2 + 2] = 0
                 prev_dir[e * 2:e * 2 + 2] = 0
+                quiet[e] = 0
                 new_episode(e)
             total_steps += int(buf_valid[t].sum())
 
