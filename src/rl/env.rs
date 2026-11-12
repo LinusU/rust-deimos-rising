@@ -69,6 +69,9 @@ pub struct Env {
     delay: usize,
     pub info: [f32; INFO],
     pub latch: [Latch; 2],
+    /// Weapon changes still to press at the start (each game starts on a
+    /// random air weapon, so every one is seen).
+    cycles_pending: [u32; 2],
     launch_seen: [u32; 2],
     volley_tick: [u32; 2],
     /// Volleys waiting for points: the tick each one stops counting.
@@ -104,6 +107,7 @@ impl Env {
             delay: 0,
             info: [0.0; INFO],
             latch: [Latch::default(); 2],
+            cycles_pending: [0; 2],
             launch_seen: [0; 2],
             volley_tick: [0; 2],
             bombs: [Vec::new(), Vec::new()],
@@ -149,6 +153,7 @@ impl Env {
         self.delay = cfg.delay;
         self.latch = [Latch::default(); 2];
         for i in 0..2 {
+            self.cycles_pending[i] = (self.next_rand() % 4) as u32;
             self.launch_seen[i] = last_launch(&self.s, i);
             self.volley_tick[i] = 0;
             self.bombs[i].clear();
@@ -212,6 +217,12 @@ impl Env {
             for i in 0..2 {
                 if let Some(hold) = self.latch[i].tick(&self.s, i) {
                     inputs[i][5] = hold;
+                }
+                if self.cycles_pending[i] > 0 && last[i].state == 4 {
+                    inputs[i][6] = self.ticks % 2 == 0;
+                    if inputs[i][6] {
+                        self.cycles_pending[i] -= 1;
+                    }
                 }
             }
             self.s.tick(inputs);

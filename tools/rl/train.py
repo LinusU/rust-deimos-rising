@@ -55,7 +55,8 @@ def parse():
     p.add_argument("--score", type=float, default=1e-3, help="per point")
     p.add_argument("--level", type=float, default=3.0)
     p.add_argument("--jitter", type=float, default=0.01, help="cost of changing direction (or letting go)")
-    p.add_argument("--cycle-cost", type=float, default=0.02)
+    p.add_argument("--cycle-cost", type=float, default=0.005)
+    p.add_argument("--ent-heads", default="1,1,1,2", help="entropy weight per head (direction, air, ground, cycle)")
     p.add_argument("--mode-probs", default="0.45,0.2,0.15,0.05,0.15")
     p.add_argument("--snapshot-every", type=int, default=25, help="updates between partner-pool snapshots")
     p.add_argument("--save-every", type=int, default=50, help="updates between kept checkpoints")
@@ -169,6 +170,7 @@ def main():
     probs /= probs.sum()
     mode = np.zeros(n, np.int64)
     learner = np.zeros((n, 2), bool)
+    ent_heads = torch.tensor([float(x) for x in a.ent_heads.split(",")], device=dev)
     snap_of = np.zeros(n, np.int64)
     scripted = Scripted(n, rng)
     partner_models = []
@@ -357,7 +359,7 @@ def main():
                 pg = -torch.min(ratio * ad, ratio.clamp(1 - a.clip, 1 + a.clip) * ad).mean()
                 vc = b_val[ix] + (v - b_val[ix]).clamp(-a.clip * 5, a.clip * 5)
                 vl = 0.5 * torch.max((v - b_ret[ix]) ** 2, (vc - b_ret[ix]) ** 2).mean()
-                ent_m = ent.sum(-1).mean()
+                ent_m = (ent * ent_heads).sum(-1).mean()
                 loss = pg + a.vf * vl - a.ent * ent_m
                 opt.zero_grad()
                 loss.backward()
