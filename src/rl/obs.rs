@@ -13,7 +13,8 @@
 //!   translucency and hit flash;
 //! - [`S`] floats about the player itself, its partner and the level, as
 //!   the score bar and the screen show them, plus its own previous action;
-//! - the sprite ids of the three air weapon slots on the score bar.
+//! - the three air weapon slots on the score bar (current, next, the one
+//!   after), each embedded by its picture (sprite and frame).
 
 use std::collections::HashMap;
 
@@ -117,11 +118,20 @@ pub struct Obs {
     pub ent_id: Vec<i32>,  // K * 2
     pub selfv: Vec<f32>,   // S
     pub self_id: Vec<i32>, // SELF_IDS * 2
+    /// The weapon slots as observation version 1 embedded them (the
+    /// sprite alone: the same for every weapon), for older policies.
+    pub self_id_v1: Vec<i32>,
 }
 
 impl Default for Obs {
     fn default() -> Self {
-        Obs { ent: vec![0.0; K * F], ent_id: vec![0; K * 2], selfv: vec![0.0; S], self_id: vec![0; SELF_IDS * 2] }
+        Obs {
+            ent: vec![0.0; K * F],
+            ent_id: vec![0; K * 2],
+            selfv: vec![0.0; S],
+            self_id: vec![0; SELF_IDS * 2],
+            self_id_v1: vec![0; SELF_IDS * 2],
+        }
     }
 }
 
@@ -290,13 +300,18 @@ impl Tracker {
         v[10] = pa.invulnerable as i32 as f32;
         v[11] = pa.in_game as i32 as f32;
         for w in 0..3 {
-            let (id, ammo) = bar.weapons[w];
+            // Every air weapon shares one score bar sprite; the frame
+            // tells them apart.
+            let (id, frame) = bar.weapons[w];
             let present = id != 0 && id != crate::game::og::view::NONE;
             v[12 + w] = present as i32 as f32;
-            v[15 + w] = if present { (ammo as f32 / 100.0).clamp(-1.0, 4.0) } else { 0.0 };
-            let (a, b) = if present { id_buckets(id) } else { (0, 0) };
+            v[15 + w] = if present { (frame as f32 / 4.0).clamp(-1.0, 4.0) } else { 0.0 };
+            let (a, b) = if present { id_buckets(id ^ (frame as u32 + 1).wrapping_mul(0x9e37_79b9)) } else { (0, 0) };
             out.self_id[w * 2] = a;
             out.self_id[w * 2 + 1] = b;
+            let (a, b) = if present { id_buckets(id) } else { (0, 0) };
+            out.self_id_v1[w * 2] = a;
+            out.self_id_v1[w * 2 + 1] = b;
         }
         v[18] = pb.in_game as i32 as f32;
         v[19] = (pb.x - sx) / 208.0;

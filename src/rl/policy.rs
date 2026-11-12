@@ -59,6 +59,8 @@ struct Block {
 }
 
 pub struct Policy {
+    /// Observation version: 1 embedded the weapon slots by sprite alone.
+    obs_v: usize,
     d: usize,
     heads: usize,
     emb: usize,
@@ -138,6 +140,7 @@ impl Policy {
         if cfg_int(&cfg, "F") != Some(F) || cfg_int(&cfg, "S") != Some(S) || cfg_int(&cfg, "self_ids") != Some(SELF_IDS) {
             return Err(format!("policy was trained for another observation layout: {cfg}"));
         }
+        let obs_v = cfg_int(&cfg, "obs").unwrap_or(1);
         let mut blocks = Vec::new();
         for i in 0..layers {
             let p = format!("blocks.{i}");
@@ -151,6 +154,7 @@ impl Policy {
             });
         }
         Ok(Policy {
+            obs_v,
             d,
             heads,
             emb,
@@ -186,8 +190,15 @@ impl Policy {
         // The self token.
         let mut sin = vec![0.0; S + self.emb];
         sin[..S].copy_from_slice(&o.selfv);
+        let ids = if self.obs_v >= 2 { &o.self_id } else { &o.self_id_v1 };
+        if self.obs_v < 2 {
+            // Version 1 scaled the weapon slots' frames by 1/100.
+            for x in sin[15..18].iter_mut() {
+                *x *= 4.0 / 100.0;
+            }
+        }
         for w in 0..SELF_IDS {
-            self.add_embed(o.self_id[w * 2], o.self_id[w * 2 + 1], &mut sin[S..]);
+            self.add_embed(ids[w * 2], ids[w * 2 + 1], &mut sin[S..]);
         }
         self.self_in.apply(&sin, &mut tmp);
         tmp.iter_mut().for_each(|v| *v = v.max(0.0));

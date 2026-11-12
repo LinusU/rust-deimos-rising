@@ -247,7 +247,13 @@ pub fn parity(args: &[String]) {
     let nl = rd_i(&mut o, 1)[0] as usize;
     let mut worst = 0f32;
     for _ in 0..n {
-        let ob = Obs { ent: rd_f(&mut o, K * F), ent_id: rd_i(&mut o, K * 2), selfv: rd_f(&mut o, S), self_id: rd_i(&mut o, SELF_IDS * 2) };
+        let ob = Obs {
+            ent: rd_f(&mut o, K * F),
+            ent_id: rd_i(&mut o, K * 2),
+            selfv: rd_f(&mut o, S),
+            self_id: rd_i(&mut o, SELF_IDS * 2),
+            ..Obs::default()
+        };
         let want = rd_f(&mut o, nl + 1);
         let (lg, v) = pol.forward(&ob);
         for j in 0..nl {
