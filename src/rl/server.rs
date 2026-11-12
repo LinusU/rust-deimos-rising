@@ -203,6 +203,7 @@ pub fn bench(args: &[String], exe: Vec<u8>, paks: PathBuf) {
     let mut r: u32 = 1;
     let mut eps = 0;
     let mut max_ent = 0;
+    let mut stats = [0f32; INFO - 25];
     for _ in 0..steps {
         r = r.wrapping_mul(1103515245).wrapping_add(12345);
         let a0 = Action::from_byte(((r >> 16) as u8 % 9) | 16 | 32 | if (r >> 24) % 16 == 0 { 128 } else { 0 });
@@ -215,6 +216,9 @@ pub fn bench(args: &[String], exe: Vec<u8>, paks: PathBuf) {
             eps += 1;
             eprintln!("episode end: {:?}", &e.info[..]);
         }
+        for (k, v) in stats.iter_mut().enumerate() {
+            *v += e.info[25 + k];
+        }
         let n_ent = (e.obs[0].selfv[46] * K as f32).round() as usize;
         max_ent = max_ent.max(n_ent);
     }
@@ -224,6 +228,7 @@ pub fn bench(args: &[String], exe: Vec<u8>, paks: PathBuf) {
         steps as f64 * repeat as f64 / dt,
         e.s.g.m.heap_used() / 1024
     );
+    eprintln!("per player [volleys, hits, misses, charges, weapon changes, money]: {:?}", stats);
 }
 
 /// `deimos --rl-parity <policy.bin> <dump>`: compares this forward pass

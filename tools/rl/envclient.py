@@ -12,6 +12,9 @@ BIN = os.path.join(ROOT, "target", "release", "deimos")
 # info columns (src/rl/env.rs fill_info): per player p at 8*p
 I_DSCORE, I_LIVES, I_SHIELDS, I_STATE, I_INGAME, I_DEATHS, I_DAMAGE, I_SCORE = range(8)
 I_LEVEL, I_LEVELS_DONE, I_LEVEL_DONE, I_END, I_TIME, I_TICKS, I_START_LEVEL, I_PROGRESS, I_COMPLETE = range(16, 25)
+# then per player p at I_PSTATS + PSTATS * p
+I_PSTATS, PSTATS = 25, 6
+P_VOLLEYS, P_HITS, P_MISSES, P_CHARGES, P_WCHANGES, P_MONEY = range(6)
 # self columns the trainer reads or sets
 S_INGAME, S_LATCH, S_ROLE = 11, 48, 49
 

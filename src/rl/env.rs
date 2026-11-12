@@ -7,8 +7,37 @@ use std::path::Path;
 use super::obs::{own_knowledge, Action, Latch, Obs, Tracker};
 use crate::game::og::session::{EndReason, Session};
 
-/// Floats of per-env info: 8 per player then 9 for the game.
-pub const INFO: usize = 25;
+/// Floats of per-env info: 8 per player, 9 for the game, then
+/// [`PSTATS`] more per player at `25 + PSTATS * p`.
+pub const INFO: usize = 25 + 2 * PSTATS;
+/// Per player: bomb volleys launched, volleys followed by points (hits),
+/// volleys that scored nothing (misses), full charges let go, air weapon
+/// changes, money gained.
+pub const PSTATS: usize = 6;
+/// Ticks after a bomb volley within which points count it as a hit.
+const BOMB_WINDOW: u32 = 45;
+/// Bombs launched this soon after a volley belong to it (the burst a
+/// press launches on later levels).
+const VOLLEY_TICKS: u32 = 15;
+
+/// The air weapon handler inside a `G_Player`.
+fn handler(s: &Session, i: usize) -> u32 {
+    s.g.m.r32(crate::game::og::game::PLAYERS + i as u32 * 4) + 0x235
+}
+/// When its ground weapon last launched.
+fn last_launch(s: &Session, i: usize) -> u32 {
+    s.g.m.r32(handler(s, i) + 0x7b)
+}
+/// Its air weapon (the queued one when a change waits).
+fn air_weapon(s: &Session, i: usize) -> u32 {
+    let h = handler(s, i);
+    let q = s.g.m.r32(h + 0x55);
+    if q != 0 {
+        q
+    } else {
+        s.g.m.r32(h + 0x5d)
+    }
+}
 
 pub struct EnvConfig {
     /// Ticks per decision.
@@ -40,6 +69,11 @@ pub struct Env {
     delay: usize,
     pub info: [f32; INFO],
     pub latch: [Latch; 2],
+    launch_seen: [u32; 2],
+    volley_tick: [u32; 2],
+    /// Volleys waiting for points: the tick each one stops counting.
+    bombs: [Vec<u32>; 2],
+    weapon_seen: [u32; 2],
 }
 
 #[derive(Clone, Copy, Default)]
@@ -70,6 +104,10 @@ impl Env {
             delay: 0,
             info: [0.0; INFO],
             latch: [Latch::default(); 2],
+            launch_seen: [0; 2],
+            volley_tick: [0; 2],
+            bombs: [Vec::new(), Vec::new()],
+            weapon_seen: [0; 2],
         })
     }
 
@@ -110,9 +148,15 @@ impl Env {
         self.hist.clear();
         self.delay = cfg.delay;
         self.latch = [Latch::default(); 2];
+        for i in 0..2 {
+            self.launch_seen[i] = last_launch(&self.s, i);
+            self.volley_tick[i] = 0;
+            self.bombs[i].clear();
+            self.weapon_seen[i] = air_weapon(&self.s, i);
+        }
         self.observe();
         self.info = [0.0; INFO];
-        self.fill_info(&[PStat::default(); 2], [0; 2], [0.0; 2], 0.0);
+        self.fill_info(&[PStat::default(); 2], [0; 2], [0.0; 2], 0.0, &[[0.0; PSTATS]; 2]);
         Ok(())
     }
 
@@ -152,7 +196,9 @@ impl Env {
     pub fn step(&mut self, cfg: &EnvConfig, actions: [Action; 2], learners: [bool; 2]) -> Result<bool, String> {
         let mut deaths = [0i32; 2];
         let mut damage = [0f32; 2];
+        let mut st = [[0f32; PSTATS]; 2];
         let before = [self.pstat(0), self.pstat(1)];
+        let released = [self.latch[0].released, self.latch[1].released];
         let mut last = before;
         let mut actions = actions;
         for i in 0..2 {
@@ -178,6 +224,29 @@ impl Env {
                 if now.shields < last[i].shields && now.state == 4 {
                     damage[i] += last[i].shields - now.shields;
                 }
+                // Bomb volleys and whether points follow them.
+                let l = last_launch(&self.s, i);
+                if l != self.launch_seen[i] {
+                    self.launch_seen[i] = l;
+                    if self.ticks > self.volley_tick[i] + VOLLEY_TICKS || self.bombs[i].is_empty() && self.volley_tick[i] == 0 {
+                        self.volley_tick[i] = self.ticks;
+                        self.bombs[i].push(self.ticks + BOMB_WINDOW);
+                        st[i][0] += 1.0;
+                    }
+                }
+                if now.score > last[i].score {
+                    st[i][1] += self.bombs[i].len() as f32;
+                    self.bombs[i].clear();
+                }
+                let t = self.ticks;
+                let n = self.bombs[i].len();
+                self.bombs[i].retain(|&d| d > t);
+                st[i][2] += (n - self.bombs[i].len()) as f32;
+                let w = air_weapon(&self.s, i);
+                if w != self.weapon_seen[i] {
+                    self.weapon_seen[i] = w;
+                    st[i][4] += 1.0;
+                }
                 last[i] = now;
             }
             if self.s.is_ended() {
@@ -200,7 +269,11 @@ impl Env {
         } else if (learners[0] || learners[1]) && !((learners[0] && last[0].in_game) || (learners[1] && last[1].in_game)) {
             end = 1.0;
         }
-        self.fill_info(&before, deaths, damage, level_done);
+        for i in 0..2 {
+            st[i][3] = (self.latch[i].released - released[i]) as f32;
+            st[i][5] = (last[i].money - before[i].money).max(0) as f32;
+        }
+        self.fill_info(&before, deaths, damage, level_done, &st);
         if end > 0.0 {
             self.info[19] = end;
             self.reset_keep_info(cfg)?;
@@ -217,7 +290,7 @@ impl Env {
         Ok(())
     }
 
-    fn fill_info(&mut self, before: &[PStat; 2], deaths: [i32; 2], damage: [f32; 2], level_done: f32) {
+    fn fill_info(&mut self, before: &[PStat; 2], deaths: [i32; 2], damage: [f32; 2], level_done: f32, st: &[[f32; PSTATS]; 2]) {
         for i in 0..2 {
             let p = self.pstat(i);
             let o = i * 8;
@@ -241,5 +314,8 @@ impl Env {
         let b = &f.background;
         self.info[23] = if b.height > 0 { 1.0 - b.scroll_y as f32 / b.height as f32 } else { 0.0 };
         self.info[24] = self.s.is_level_complete() as i32 as f32;
+        for i in 0..2 {
+            self.info[25 + PSTATS * i..25 + PSTATS * (i + 1)].copy_from_slice(&st[i]);
+        }
     }
 }
