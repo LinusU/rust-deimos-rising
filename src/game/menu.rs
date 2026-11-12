@@ -9,7 +9,7 @@
 //! The layout helpers (`title_hit`, `sector_hit`, ...) are shared with the
 //! flow system in `render.rs`, which owns the menu state and its input.
 
-use super::input::{key_label, KeyBindings, ACTIONS};
+use super::input::{button_label, key_label, KeyBindings, PadBindings, ACTIONS};
 use super::render::{
     frame_image_blend, image16_handle, layout_text, pf, to_world_z, Blit, Flow, FlowState,
     HighScores, TextureBook, FONT, PLAY_LEFT,
@@ -140,21 +140,29 @@ pub fn sector_hit(assets: &GameAssets, pos: Vec2) -> Option<SectorHit> {
         .map(|(_, hit)| *hit)
 }
 
-/// Rows and columns of the Controls screen: one row per action, one
-/// column per player.
+/// Rows and columns of the Controls screen: one row per action; per
+/// player a key column and a pad column (see `controls_cell`).
 pub const CONTROLS_ROWS: usize = ACTIONS.len();
+pub const CONTROLS_COLS: usize = 4;
 const CONTROLS_TOP: f32 = 150.0;
 const CONTROLS_GAP: f32 = 22.0;
-const CONTROLS_LABEL_X: f32 = 110.0;
-const CONTROLS_KEY_X: [f32; 2] = [340.0, 460.0];
+const CONTROLS_LABEL_X: f32 = 90.0;
+const CONTROLS_COL_X: [f32; CONTROLS_COLS] = [280.0, 350.0, 440.0, 510.0];
+const CONTROLS_COL_W: f32 = 70.0;
 
-/// The Controls cell (row, player column) under `pos`, if any.
+/// The player and whether it is the pad binding, for a Controls column.
+pub fn controls_cell(col: usize) -> (usize, bool) {
+    (col / 2, col % 2 == 1)
+}
+
+/// The Controls cell (row, column) under `pos`, if any.
 pub fn controls_hit(pos: Vec2) -> Option<(usize, usize)> {
     let row = ((pos.y - CONTROLS_TOP + 4.0) / CONTROLS_GAP).floor();
     if row < 0.0 || row >= CONTROLS_ROWS as f32 {
         return None;
     }
-    let col = (0..2).find(|&c| pos.x >= CONTROLS_KEY_X[c] - 10.0 && pos.x < CONTROLS_KEY_X[c] + 110.0)?;
+    let col = (0..CONTROLS_COLS)
+        .find(|&c| pos.x >= CONTROLS_COL_X[c] - 5.0 && pos.x < CONTROLS_COL_X[c] + CONTROLS_COL_W - 5.0)?;
     Some((row as usize, col))
 }
 
@@ -370,6 +378,7 @@ pub fn sync_menu(
     flow: Res<Flow>,
     scores: Res<HighScores>,
     bindings: Res<KeyBindings>,
+    pad_bindings: Res<PadBindings>,
     pointer: Res<MenuPointer>,
     mut assets: ResMut<GameAssets>,
     mut images: ResMut<Assets<Image>>,
@@ -383,7 +392,7 @@ pub fn sync_menu(
         FlowState::Briefing => briefing(&mut p, &flow),
         FlowState::Scores | FlowState::NameEntry => score_table(&mut p, &flow, &scores),
         FlowState::Credits => credits(&mut p, &flow),
-        FlowState::Controls => controls(&mut p, &flow, &bindings),
+        FlowState::Controls => controls(&mut p, &flow, &bindings, &pad_bindings),
         FlowState::Playing => overlay(&mut p, &flow),
     }
     let draws = p.out;
@@ -622,28 +631,36 @@ fn credits(p: &mut Painter, flow: &Flow) {
     }
 }
 
-/// Controls: every action with each player's key. Not an original screen
-/// (Windows used a native dialog), so it borrows the credits' formats.
-fn controls(p: &mut Painter, flow: &Flow, bindings: &KeyBindings) {
+/// Controls: every action with each player's key and pad button. Not an
+/// original screen (Windows used a native dialog), so it borrows the
+/// credits' formats.
+fn controls(p: &mut Painter, flow: &Flow, bindings: &KeyBindings, pads: &PadBindings) {
     p.image(id("back"), SCREEN_CENTER);
     let title = text_style(p.assets, "crti");
     let body = text_style(p.assets, "crno");
     let hilite = text_style(p.assets, "lsnn").color.unwrap_or(Color::srgb(1.0, 0.0, 0.0));
     p.text(&title.at(CONTROLS_LABEL_X, CONTROLS_TOP - 50.0), "Controls");
-    for (col, name) in ["Player 1", "Player 2"].iter().enumerate() {
-        p.text(&title.at(CONTROLS_KEY_X[col], CONTROLS_TOP - 26.0), name);
+    for (player, name) in ["Player 1", "Player 2"].iter().enumerate() {
+        p.text(&title.at(CONTROLS_COL_X[player * 2], CONTROLS_TOP - 44.0), name);
+    }
+    for col in 0..CONTROLS_COLS {
+        let name = if controls_cell(col).1 { "Pad" } else { "Key" };
+        p.text(&body.at(CONTROLS_COL_X[col], CONTROLS_TOP - 24.0), name);
     }
     for (row, (_, label)) in ACTIONS.iter().enumerate() {
         let y = CONTROLS_TOP + CONTROLS_GAP * row as f32;
         p.text(&body.at(CONTROLS_LABEL_X, y), label);
-        for col in 0..2 {
+        for col in 0..CONTROLS_COLS {
+            let (player, pad) = controls_cell(col);
             let selected = flow.controls_sel == (row, col);
             let text = if selected && flow.rebinding {
-                "Press a key".to_string()
+                "?".to_string()
+            } else if pad {
+                button_label(pads.buttons[player][row]).to_string()
             } else {
-                key_label(bindings.keys[col][row])
+                key_label(bindings.keys[player][row])
             };
-            let style = body.at(CONTROLS_KEY_X[col], y);
+            let style = body.at(CONTROLS_COL_X[col], y);
             if selected {
                 p.text(&style.colored(hilite), &text);
             } else {
@@ -652,12 +669,13 @@ fn controls(p: &mut Painter, flow: &Flow, bindings: &KeyBindings) {
         }
     }
     let hint = text_style(p.assets, "inco");
-    let text = if flow.rebinding && flow.key_in_use {
-        "That key is already in use!"
-    } else if flow.rebinding {
-        "Press the new key, or Esc to keep the old one"
-    } else {
-        "Arrows choose  -  Enter changes the key  -  Esc returns"
+    let pad = controls_cell(flow.controls_sel.1).1;
+    let text = match (flow.rebinding, flow.key_in_use, pad) {
+        (true, true, false) => "That key is already in use!",
+        (true, true, true) => "That button is already in use!",
+        (true, false, false) => "Press the new key, or Esc to keep the old one",
+        (true, false, true) => "Press the new button, or Start to keep the old one",
+        (false, ..) => "Arrows choose  -  Enter changes it  -  Esc returns",
     };
     p.text(&hint, text);
 }

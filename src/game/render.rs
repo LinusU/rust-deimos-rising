@@ -79,9 +79,9 @@ pub struct Flow {
     pub menu_sel: usize,
     /// Selected (action row, player column) on the Controls screen.
     pub controls_sel: (usize, usize),
-    /// Controls screen is waiting for the key to bind.
+    /// Controls screen is waiting for the key or pad button to bind.
     pub rebinding: bool,
-    /// The last key pressed while rebinding was already in use.
+    /// The last key or button pressed while rebinding was already in use.
     pub key_in_use: bool,
     /// Page of the credits being shown.
     pub credits_page: usize,
@@ -455,7 +455,7 @@ pub fn snap_sprites(images: Res<Assets<Image>>, mut q: Query<(&Sprite, &mut Tran
 // ---------------------------------------------------------------------------
 
 use bevy::window::{Window, WindowPlugin, WindowResolution};
-use crate::game::input::KeyBindings;
+use crate::game::input::{KeyBindings, PadBindings};
 use crate::game::menu::{MenuPointer, SectorHit, TitleItem, TITLE_ITEMS};
 
 /// Menu/flow state machine. Drives title → sectors → briefing → play →
@@ -471,6 +471,7 @@ pub fn flow_system(
     mut audio: Option<ResMut<crate::game::audio::AudioEngine>>,
     pointer: Res<MenuPointer>,
     mut bindings: ResMut<KeyBindings>,
+    mut pad_bindings: ResMut<PadBindings>,
     mut exit: MessageWriter<AppExit>,
     time: Res<Time>,
     shot: Option<Res<ShotPlan>>,
@@ -820,22 +821,41 @@ pub fn flow_system(
         FlowState::Controls => {
             let (mut row, mut col) = flow.controls_sel;
             if flow.rebinding {
-                if esc {
-                    flow.rebinding = false;
-                    flow.key_in_use = false;
-                } else if let Some(key) = keys
-                    .get_just_pressed()
-                    .copied()
-                    .find(|k| crate::game::input::is_bindable(*k))
-                {
-                    if bindings.bind(col, row, key) {
-                        bindings.save();
+                let (player, pad) = crate::game::menu::controls_cell(col);
+                // A pad cell takes any bindable button, B included, so
+                // only Start (or Esc) cancels it.
+                let cancel = keys.just_pressed(KeyCode::Escape)
+                    || if pad { pads.menu.start } else { pads.menu.back };
+                let bound = if cancel {
+                    None
+                } else if pad {
+                    pads.new_button.map(|b| {
+                        let ok = pad_bindings.bind(player, row, b);
+                        if ok {
+                            pad_bindings.save();
+                        }
+                        ok
+                    })
+                } else {
+                    keys.get_just_pressed()
+                        .copied()
+                        .find(|k| crate::game::input::is_bindable(*k))
+                        .map(|k| {
+                            let ok = bindings.bind(player, row, k);
+                            if ok {
+                                bindings.save();
+                            }
+                            ok
+                        })
+                };
+                match (cancel, bound) {
+                    (true, _) | (_, Some(true)) => {
                         flow.rebinding = false;
                         flow.key_in_use = false;
-                        click = true;
-                    } else {
-                        flow.key_in_use = true;
+                        click = bound.is_some();
                     }
+                    (_, Some(false)) => flow.key_in_use = true,
+                    _ => {}
                 }
             } else {
                 let rows = crate::game::menu::CONTROLS_ROWS;
@@ -845,8 +865,12 @@ pub fn flow_system(
                 if down {
                     row = (row + 1) % rows;
                 }
-                if left || right {
-                    col = 1 - col;
+                let cols = crate::game::menu::CONTROLS_COLS;
+                if left {
+                    col = (col + cols - 1) % cols;
+                }
+                if right {
+                    col = (col + 1) % cols;
                 }
                 let hover = pointer.pos.and_then(crate::game::menu::controls_hit);
                 if pointer.moved || pointer.clicked {
@@ -1139,6 +1163,7 @@ pub fn run(
         .insert_resource(flow)
         .insert_resource(HighScores::load())
         .insert_resource(crate::game::input::KeyBindings::load())
+        .insert_resource(crate::game::input::PadBindings::load())
         .insert_resource(crate::game::input::Pads::default())
         .insert_resource(MenuPointer::default())
         .insert_resource(demo)

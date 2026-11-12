@@ -145,13 +145,148 @@ impl KeyBindings {
     }
 }
 
+const PAD_PATH: &str = "deimos-pad.txt";
+
+/// The pad button bound to each action, per player. The left stick moves
+/// as well whatever the movement buttons are, as the original's joystick
+/// axes always did.
+#[derive(Resource, Clone, PartialEq)]
+pub struct PadBindings {
+    pub buttons: [[GamepadButton; 7]; 2],
+}
+
+impl Default for PadBindings {
+    fn default() -> Self {
+        // The original's joystick defaults: the POV hat moves, buttons 1, 2
+        // and 3 fire the air weapon, fire the ground weapon and select the
+        // air weapon.
+        let pad = [
+            GamepadButton::DPadUp,
+            GamepadButton::DPadDown,
+            GamepadButton::DPadLeft,
+            GamepadButton::DPadRight,
+            GamepadButton::South,
+            GamepadButton::East,
+            GamepadButton::West,
+        ];
+        PadBindings { buttons: [pad; 2] }
+    }
+}
+
+impl PadBindings {
+    /// Load saved bindings, falling back to the defaults for anything
+    /// missing or unreadable.
+    pub fn load() -> Self {
+        let mut b = PadBindings::default();
+        if let Ok(text) = std::fs::read_to_string(PAD_PATH) {
+            b.apply(&text);
+        }
+        b
+    }
+
+    /// Apply `p<N>.<action> = <ButtonName>` lines; unknown lines are ignored.
+    pub fn apply(&mut self, text: &str) {
+        for line in text.lines() {
+            let Some((lhs, rhs)) = line.split_once('=') else { continue };
+            let Some((player, action)) = lhs.trim().split_once('.') else { continue };
+            let slot = match player {
+                "p1" => 0,
+                "p2" => 1,
+                _ => continue,
+            };
+            let Some(index) = ACTIONS.iter().position(|a| a.0 == action) else { continue };
+            if let Some(button) = button_from_name(rhs.trim()) {
+                self.buttons[slot][index] = button;
+            }
+        }
+    }
+
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        for (slot, buttons) in self.buttons.iter().enumerate() {
+            for (index, button) in buttons.iter().enumerate() {
+                out.push_str(&format!("p{}.{} = {:?}\n", slot + 1, ACTIONS[index].0, button));
+            }
+        }
+        out
+    }
+
+    pub fn save(&self) {
+        let _ = std::fs::write(PAD_PATH, self.to_text());
+    }
+
+    /// Bind `button` to one of a player's actions. Each player has a pad
+    /// of their own, so only that player's other actions can clash; like
+    /// the keys, a button already in use is refused.
+    pub fn bind(&mut self, slot: usize, index: usize, button: GamepadButton) -> bool {
+        if (0..7).any(|i| i != index && self.buttons[slot][i] == button) {
+            return false;
+        }
+        self.buttons[slot][index] = button;
+        true
+    }
+}
+
+/// Pad buttons that may be bound. Start and the guide button are left
+/// out: Start drives the menus.
+const BINDABLE_BUTTONS: &[GamepadButton] = &[
+    GamepadButton::South,
+    GamepadButton::East,
+    GamepadButton::North,
+    GamepadButton::West,
+    GamepadButton::C,
+    GamepadButton::Z,
+    GamepadButton::LeftTrigger,
+    GamepadButton::RightTrigger,
+    GamepadButton::LeftTrigger2,
+    GamepadButton::RightTrigger2,
+    GamepadButton::LeftThumb,
+    GamepadButton::RightThumb,
+    GamepadButton::Select,
+    GamepadButton::DPadUp,
+    GamepadButton::DPadDown,
+    GamepadButton::DPadLeft,
+    GamepadButton::DPadRight,
+];
+
+/// Parse a button by the name `PadBindings::to_text` writes.
+pub fn button_from_name(name: &str) -> Option<GamepadButton> {
+    BINDABLE_BUTTONS.iter().copied().find(|b| format!("{:?}", b) == name)
+}
+
+/// Name of a pad button on the Controls screen, by its place on an Xbox
+/// style pad.
+pub fn button_label(button: GamepadButton) -> &'static str {
+    use GamepadButton::*;
+    match button {
+        South => "A",
+        East => "B",
+        North => "Y",
+        West => "X",
+        C => "C",
+        Z => "Z",
+        LeftTrigger => "LB",
+        RightTrigger => "RB",
+        LeftTrigger2 => "LT",
+        RightTrigger2 => "RT",
+        LeftThumb => "L3",
+        RightThumb => "R3",
+        Select => "Back",
+        Start => "Start",
+        Mode => "Guide",
+        DPadUp => "D-Up",
+        DPadDown => "D-Down",
+        DPadLeft => "D-Left",
+        DPadRight => "D-Right",
+        _ => "?",
+    }
+}
+
 /// Game controllers, read the way the original reads joysticks
 /// (G_Input_CachePlayerInputs with the U_Prefs defaults): the first
 /// connected pad plays player 1, the second player 2. The left stick
-/// counts past 20% of its travel (`JoystickSetDigital(.., 20)`) and the
-/// D-pad (the original's POV hat) moves too; button 1 (A) fires the air
-/// weapon, button 2 (B) the ground weapon and button 3 (X) selects the
-/// air weapon.
+/// moves once past 20% of its travel (`JoystickSetDigital(.., 20)`); the
+/// buttons are those of `PadBindings`.
 #[derive(Resource, Default)]
 pub struct Pads {
     /// Per player, per action in `ACTIONS` order: held this frame.
@@ -162,6 +297,9 @@ pub struct Pads {
     pub menu: MenuPad,
     /// Stick directions held last frame, any pad, in `MenuPad` order.
     stick_prev: [bool; 4],
+    /// The first bindable button newly pressed this frame, any pad: what
+    /// the Controls screen binds.
+    pub new_button: Option<GamepadButton>,
 }
 
 /// A pad's menu buttons, newly pressed: the D-pad or left stick for the
@@ -175,6 +313,8 @@ pub struct MenuPad {
     pub right: bool,
     pub ok: bool,
     pub back: bool,
+    /// Start alone, which also counts as `ok`.
+    pub start: bool,
 }
 
 /// Stick deflection the original counts as a press.
@@ -199,11 +339,12 @@ fn stick_dirs(pad: &Gamepad) -> [bool; 4] {
 }
 
 /// Samples the connected pads once a frame.
-pub fn read_pads(mut pads: ResMut<Pads>, q: Query<(Entity, &Gamepad)>) {
+pub fn read_pads(mut pads: ResMut<Pads>, bindings: Res<PadBindings>, q: Query<(Entity, &Gamepad)>) {
     pads.prev = pads.now;
     pads.now = [[false; 7]; 2];
     let mut menu = MenuPad::default();
     let mut stick = [false; 4];
+    let mut new_button = None;
     let mut list: Vec<(Entity, &Gamepad)> = q.iter().collect();
     list.sort_by_key(|(e, _)| *e);
     for (slot, (_, pad)) in list.iter().enumerate() {
@@ -217,17 +358,17 @@ pub fn read_pads(mut pads: ResMut<Pads>, q: Query<(Entity, &Gamepad)>) {
         menu.right |= pad.just_pressed(GamepadButton::DPadRight);
         menu.ok |= pad.just_pressed(GamepadButton::South) || pad.just_pressed(GamepadButton::Start);
         menu.back |= pad.just_pressed(GamepadButton::East);
+        menu.start |= pad.just_pressed(GamepadButton::Start);
+        new_button = new_button
+            .or_else(|| BINDABLE_BUTTONS.iter().copied().find(|b| pad.just_pressed(*b)));
         if slot >= 2 {
             continue;
         }
-        let mut a = [false; 7];
-        a[UP] = dirs[0] || pad.pressed(GamepadButton::DPadUp);
-        a[DOWN] = dirs[1] || pad.pressed(GamepadButton::DPadDown);
-        a[LEFT] = dirs[2] || pad.pressed(GamepadButton::DPadLeft);
-        a[RIGHT] = dirs[3] || pad.pressed(GamepadButton::DPadRight);
-        a[FIRE] = pad.pressed(GamepadButton::South);
-        a[BOMB] = pad.pressed(GamepadButton::East);
-        a[CYCLE] = pad.pressed(GamepadButton::West);
+        let mut a = std::array::from_fn(|i| pad.pressed(bindings.buttons[slot][i]));
+        a[UP] |= dirs[0];
+        a[DOWN] |= dirs[1];
+        a[LEFT] |= dirs[2];
+        a[RIGHT] |= dirs[3];
         pads.now[slot] = a;
     }
     let newly = |d: usize| stick[d] && !pads.stick_prev[d];
@@ -237,6 +378,7 @@ pub fn read_pads(mut pads: ResMut<Pads>, q: Query<(Entity, &Gamepad)>) {
     menu.right |= newly(3);
     pads.stick_prev = stick;
     pads.menu = menu;
+    pads.new_button = new_button;
 }
 
 /// Keys that may be bound. Escape, Enter and the function keys are left
@@ -374,6 +516,31 @@ mod tests {
         assert_eq!(key_label(KeyCode::Numpad8), "KPad8");
         assert_eq!(key_label(KeyCode::PageDown), "PgDn");
         assert_eq!(key_label(KeyCode::KeyQ), "Q");
+    }
+
+    #[test]
+    fn pad_bindings_round_trip_through_text() {
+        let mut b = PadBindings::default();
+        assert!(b.bind(0, FIRE, GamepadButton::RightTrigger2));
+        assert!(b.bind(1, CYCLE, GamepadButton::North));
+        let mut loaded = PadBindings::default();
+        loaded.apply(&b.to_text());
+        assert!(loaded == b);
+    }
+
+    #[test]
+    fn pad_buttons_clash_only_within_a_player() {
+        let mut b = PadBindings::default();
+        // B is player 1's ground weapon.
+        assert!(!b.bind(0, FIRE, GamepadButton::East));
+        assert_eq!(b.buttons[0][FIRE], GamepadButton::South);
+        // Each player has a pad of their own: both may use the same button.
+        assert!(b.bind(1, CYCLE, GamepadButton::RightTrigger));
+        assert!(b.bind(0, CYCLE, GamepadButton::RightTrigger));
+        // Start drives the menus and is never read back.
+        let mut loaded = PadBindings::default();
+        loaded.apply("p1.fire = Start\n");
+        assert!(loaded == PadBindings::default());
     }
 
     #[test]
