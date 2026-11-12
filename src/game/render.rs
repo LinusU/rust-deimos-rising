@@ -692,8 +692,9 @@ pub fn flow_system(
             }
         }
         FlowState::Playing => {
-            // Esc leaves the game for the title.
-            if esc && shot.is_none() {
+            // Esc leaves the game for the title. Only the key: the pad's
+            // menu Back button (B) is a weapon in play.
+            if keys.just_pressed(KeyCode::Escape) && shot.is_none() {
                 og.stop();
                 flow.state = FlowState::Title;
                 flow.ticks = 0;
