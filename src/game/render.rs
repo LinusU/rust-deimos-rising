@@ -534,18 +534,16 @@ pub fn flow_system(
     // A pad drives the menus like the keyboard: D-pad or stick for the
     // arrows, A or Start for Enter, B for Esc (a remake convenience; the
     // original's menus took the mouse).
-    use crate::game::input::{BOMB, DOWN, FIRE, LEFT, RIGHT, UP};
     let enter = keys.just_pressed(KeyCode::Enter)
         || keys.just_pressed(KeyCode::NumpadEnter)
-        || pads.any_just_pressed(FIRE)
-        || pads.start;
+        || pads.menu.ok;
     let space = keys.just_pressed(KeyCode::Space);
     let any = enter || space || pointer.clicked;
-    let up = keys.just_pressed(KeyCode::ArrowUp) || pads.any_just_pressed(UP);
-    let down = keys.just_pressed(KeyCode::ArrowDown) || pads.any_just_pressed(DOWN);
-    let left = keys.just_pressed(KeyCode::ArrowLeft) || pads.any_just_pressed(LEFT);
-    let right = keys.just_pressed(KeyCode::ArrowRight) || pads.any_just_pressed(RIGHT);
-    let esc = keys.just_pressed(KeyCode::Escape) || pads.any_just_pressed(BOMB);
+    let up = keys.just_pressed(KeyCode::ArrowUp) || pads.menu.up;
+    let down = keys.just_pressed(KeyCode::ArrowDown) || pads.menu.down;
+    let left = keys.just_pressed(KeyCode::ArrowLeft) || pads.menu.left;
+    let right = keys.just_pressed(KeyCode::ArrowRight) || pads.menu.right;
+    let esc = keys.just_pressed(KeyCode::Escape) || pads.menu.back;
     // Set when a menu choice should play the button sound (perm sound 2).
     let mut click = false;
 

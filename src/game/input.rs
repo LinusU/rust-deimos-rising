@@ -158,8 +158,23 @@ pub struct Pads {
     pub now: [[bool; 7]; 2],
     /// The same for the previous frame.
     pub prev: [[bool; 7]; 2],
-    /// Start pressed this frame, any pad.
-    pub start: bool,
+    /// Menu buttons newly pressed this frame, any pad.
+    pub menu: MenuPad,
+    /// Stick directions held last frame, any pad, in `MenuPad` order.
+    stick_prev: [bool; 4],
+}
+
+/// A pad's menu buttons, newly pressed: the D-pad or left stick for the
+/// arrows, A or Start for Enter, B for Esc. Fixed, whatever the game's
+/// pad bindings, so the menus always work the same.
+#[derive(Clone, Copy, Default)]
+pub struct MenuPad {
+    pub up: bool,
+    pub down: bool,
+    pub left: bool,
+    pub right: bool,
+    pub ok: bool,
+    pub back: bool,
 }
 
 /// Stick deflection the original counts as a press.
@@ -174,33 +189,54 @@ impl Pads {
         self.now[slot][action] && !self.prev[slot][action]
     }
 
-    /// Any pad's action newly pressed.
-    pub fn any_just_pressed(&self, action: usize) -> bool {
-        (0..2).any(|s| self.just_pressed(s, action))
-    }
+}
+
+/// Left stick directions past the threshold: up, down, left, right.
+fn stick_dirs(pad: &Gamepad) -> [bool; 4] {
+    let x = pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0);
+    let y = pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0);
+    [y > STICK_THRESHOLD, y < -STICK_THRESHOLD, x < -STICK_THRESHOLD, x > STICK_THRESHOLD]
 }
 
 /// Samples the connected pads once a frame.
 pub fn read_pads(mut pads: ResMut<Pads>, q: Query<(Entity, &Gamepad)>) {
     pads.prev = pads.now;
     pads.now = [[false; 7]; 2];
-    pads.start = false;
+    let mut menu = MenuPad::default();
+    let mut stick = [false; 4];
     let mut list: Vec<(Entity, &Gamepad)> = q.iter().collect();
     list.sort_by_key(|(e, _)| *e);
-    for (slot, (_, pad)) in list.iter().take(2).enumerate() {
-        let x = pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0);
-        let y = pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0);
+    for (slot, (_, pad)) in list.iter().enumerate() {
+        let dirs = stick_dirs(pad);
+        for d in 0..4 {
+            stick[d] |= dirs[d];
+        }
+        menu.up |= pad.just_pressed(GamepadButton::DPadUp);
+        menu.down |= pad.just_pressed(GamepadButton::DPadDown);
+        menu.left |= pad.just_pressed(GamepadButton::DPadLeft);
+        menu.right |= pad.just_pressed(GamepadButton::DPadRight);
+        menu.ok |= pad.just_pressed(GamepadButton::South) || pad.just_pressed(GamepadButton::Start);
+        menu.back |= pad.just_pressed(GamepadButton::East);
+        if slot >= 2 {
+            continue;
+        }
         let mut a = [false; 7];
-        a[UP] = y > STICK_THRESHOLD || pad.pressed(GamepadButton::DPadUp);
-        a[DOWN] = y < -STICK_THRESHOLD || pad.pressed(GamepadButton::DPadDown);
-        a[LEFT] = x < -STICK_THRESHOLD || pad.pressed(GamepadButton::DPadLeft);
-        a[RIGHT] = x > STICK_THRESHOLD || pad.pressed(GamepadButton::DPadRight);
+        a[UP] = dirs[0] || pad.pressed(GamepadButton::DPadUp);
+        a[DOWN] = dirs[1] || pad.pressed(GamepadButton::DPadDown);
+        a[LEFT] = dirs[2] || pad.pressed(GamepadButton::DPadLeft);
+        a[RIGHT] = dirs[3] || pad.pressed(GamepadButton::DPadRight);
         a[FIRE] = pad.pressed(GamepadButton::South);
         a[BOMB] = pad.pressed(GamepadButton::East);
         a[CYCLE] = pad.pressed(GamepadButton::West);
         pads.now[slot] = a;
-        pads.start |= pad.just_pressed(GamepadButton::Start);
     }
+    let newly = |d: usize| stick[d] && !pads.stick_prev[d];
+    menu.up |= newly(0);
+    menu.down |= newly(1);
+    menu.left |= newly(2);
+    menu.right |= newly(3);
+    pads.stick_prev = stick;
+    pads.menu = menu;
 }
 
 /// Keys that may be bound. Escape, Enter and the function keys are left
