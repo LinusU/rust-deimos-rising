@@ -5,6 +5,7 @@ deimos-hi-scores.txt
 deimos-demo.bin
 deimos-progress.txt
 deimos-keys.txt
+deimos-pad.txt
 deimos-copilot.bin
 /tools/rl/runs/
 /tools/rl/.venv/
