@@ -300,6 +300,10 @@ pub struct Pads {
     /// The first bindable button newly pressed this frame, any pad: what
     /// the Controls screen binds.
     pub new_button: Option<GamepadButton>,
+    /// Per player, the share of the ship's top speed along x and y, from
+    /// how far the left stick is pushed (`stick_share`); 1.0 when the
+    /// stick is centred on the axis or a button moves along it.
+    pub move_scale: [[f32; 2]; 2],
 }
 
 /// A pad's menu buttons, newly pressed: the D-pad or left stick for the
@@ -331,6 +335,16 @@ impl Pads {
 
 }
 
+/// Stick deflection that already counts as full speed: pads rarely
+/// reach 1.0, least of all on a diagonal.
+const STICK_FULL: f32 = 0.9;
+
+/// The share of the top speed for a stick pushed `amount` (0..=1) along
+/// an axis: proportional, reaching 1.0 at `STICK_FULL`.
+pub fn stick_share(amount: f32) -> f32 {
+    (amount.abs() / STICK_FULL).min(1.0)
+}
+
 /// Left stick directions past the threshold: up, down, left, right.
 fn stick_dirs(pad: &Gamepad) -> [bool; 4] {
     let x = pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0);
@@ -342,6 +356,7 @@ fn stick_dirs(pad: &Gamepad) -> [bool; 4] {
 pub fn read_pads(mut pads: ResMut<Pads>, bindings: Res<PadBindings>, q: Query<(Entity, &Gamepad)>) {
     pads.prev = pads.now;
     pads.now = [[false; 7]; 2];
+    pads.move_scale = [[1.0; 2]; 2];
     let mut menu = MenuPad::default();
     let mut stick = [false; 4];
     let mut new_button = None;
@@ -364,7 +379,16 @@ pub fn read_pads(mut pads: ResMut<Pads>, bindings: Res<PadBindings>, q: Query<(E
         if slot >= 2 {
             continue;
         }
-        let mut a = std::array::from_fn(|i| pad.pressed(bindings.buttons[slot][i]));
+        let mut a: [bool; 7] = std::array::from_fn(|i| pad.pressed(bindings.buttons[slot][i]));
+        // A stick alone on an axis steers at its share of the top speed.
+        let x = pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0);
+        let y = pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0);
+        if !a[LEFT] && !a[RIGHT] && (dirs[2] || dirs[3]) {
+            pads.move_scale[slot][0] = stick_share(x);
+        }
+        if !a[UP] && !a[DOWN] && (dirs[0] || dirs[1]) {
+            pads.move_scale[slot][1] = stick_share(y);
+        }
         a[UP] |= dirs[0];
         a[DOWN] |= dirs[1];
         a[LEFT] |= dirs[2];
@@ -541,6 +565,14 @@ mod tests {
         let mut loaded = PadBindings::default();
         loaded.apply("p1.fire = Start\n");
         assert!(loaded == PadBindings::default());
+    }
+
+    #[test]
+    fn stick_share_is_proportional_up_to_full() {
+        assert_eq!(stick_share(0.45), 0.5);
+        assert_eq!(stick_share(-0.45), 0.5);
+        assert_eq!(stick_share(STICK_FULL), 1.0);
+        assert_eq!(stick_share(1.0), 1.0);
     }
 
     #[test]

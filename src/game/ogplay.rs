@@ -633,6 +633,22 @@ fn render(og: &mut OgGame, assets: &mut GameAssets, out: &mut Vec<u8>, between: 
 #[derive(Component)]
 pub struct OgScreen;
 
+/// Each player's speed share along x and y: the pad's stick share
+/// unless a key moves the ship along that axis.
+fn slot_move_scale(keys: &ButtonInput<KeyCode>, b: &KeyBindings, pads: &Pads) -> [[f32; 2]; 2] {
+    let mut out = pads.move_scale;
+    for p in 0..2 {
+        let k = &b.keys[p];
+        if keys.pressed(k[LEFT]) || keys.pressed(k[RIGHT]) {
+            out[p][0] = 1.0;
+        }
+        if keys.pressed(k[UP]) || keys.pressed(k[DOWN]) {
+            out[p][1] = 1.0;
+        }
+    }
+    out
+}
+
 fn slot_inputs(keys: &ButtonInput<KeyCode>, b: &KeyBindings, pads: &Pads, latch: &mut [bool; 2], first: bool) -> [[bool; 7]; 2] {
     let mut out = [[false; 7]; 2];
     for p in 0..2 {
@@ -689,6 +705,7 @@ pub fn og_system(
             n as u32
         };
         for i in 0..n {
+            let live = og.mode != OgMode::Film && og.script.is_none();
             let inputs = if og.mode == OgMode::Film {
                 [[false; 7]; 2]
             } else if let Some(sc) = &og.script {
@@ -698,12 +715,17 @@ pub fn og_system(
                 slot_inputs(&keys, &bindings, &pads, &mut og.cycle_latch, i == 0)
             };
             let mut inputs = inputs;
+            let mut scale = if live { slot_move_scale(&keys, &bindings, &pads) } else { [[1.0; 2]; 2] };
             if og.copilot_flying() {
                 if let (Some(c), Some(s)) = (og.copilot.as_mut(), og.session.as_mut()) {
                     if s.is_playing() {
                         inputs[c.slot] = c.input(s);
+                        scale[c.slot] = [1.0; 2];
                     }
                 }
+            }
+            if let Some(s) = og.session.as_mut() {
+                s.set_move_scale(scale);
             }
             if og.session.as_ref().map(|s| s.is_playing()).unwrap_or(false) {
                 og.tick(&mut assets, inputs);

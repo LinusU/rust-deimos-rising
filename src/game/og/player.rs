@@ -1042,6 +1042,21 @@ pub fn G_Player_Priv_GetInputs(g: &mut G, this: u32, a0: u32, a1: i32) {
     }
 }
 
+/// Remake extension for analog sticks (not in the original): move the
+/// velocity at `v` one `step` toward `dir * scale * limit`, the stick's
+/// share of the top speed, so easing the stick back slows the ship down
+/// as gradually as it sped up.
+fn analog_steer(g: &mut G, v: u32, step: f32, limit: f32, scale: f32, dir: f64) {
+    let target = dir * scale as f64 * limit as f64;
+    let cur = g.m.rf32(v) as f64;
+    let next = if cur < target {
+        (cur + step as f64).min(target)
+    } else {
+        (cur - step as f64).max(target)
+    };
+    g.m.wf32(v, next as f32);
+}
+
 /// `G_Player::Process` — 0x432820. The registration check at the top
 /// (0x432839..0x433f89) is not ported: it only runs for the registered
 /// build (`+0x233` set from `RT3_IsRegistered`) on the tick that equals the
@@ -1148,34 +1163,47 @@ pub fn G_Player_Process(g: &mut G, this: u32, a0: bool, a1: bool, a2: i32, a3: u
     let def = g.m.r32(this + 0x8a);
     let step = g.m.rf32(def + 0xd6);
     let (vx, vy) = (this + 0x10, this + 0x14);
-    if up {
-        let v = (g.m.rf32(vy) as f64 - step as f64) as f32;
-        g.m.wf32(vy, v);
-        let lim = -limit;
-        if g.m.rf32(vy) < lim {
-            g.m.wf32(vy, lim);
+    let n = g.m.ri32(this + 0xc2).clamp(0, 1) as usize;
+    let [scale_x, scale_y] = g.live_move_scale[n];
+    // Remake extension: a stick pushed part way along an axis moves the
+    // ship at that share of the top speed. Keys, the D-pad and films keep
+    // the original's movement in the `else` arms.
+    if scale_y < 1.0 && (up != down) {
+        analog_steer(g, vy, step, limit, scale_y, if up { -1.0 } else { 1.0 });
+    } else {
+        if up {
+            let v = (g.m.rf32(vy) as f64 - step as f64) as f32;
+            g.m.wf32(vy, v);
+            let lim = -limit;
+            if g.m.rf32(vy) < lim {
+                g.m.wf32(vy, lim);
+            }
+        }
+        if down {
+            let v = (g.m.rf32(vy) as f64 + step as f64) as f32;
+            g.m.wf32(vy, v);
+            if g.m.rf32(vy) > limit {
+                g.m.wf32(vy, limit);
+            }
         }
     }
-    if down {
-        let v = (g.m.rf32(vy) as f64 + step as f64) as f32;
-        g.m.wf32(vy, v);
-        if g.m.rf32(vy) > limit {
-            g.m.wf32(vy, limit);
+    if scale_x < 1.0 && (left != right) {
+        analog_steer(g, vx, step, limit, scale_x, if left { -1.0 } else { 1.0 });
+    } else {
+        if left {
+            let v = (g.m.rf32(vx) as f64 - step as f64) as f32;
+            g.m.wf32(vx, v);
+            let lim = -limit;
+            if g.m.rf32(vx) < lim {
+                g.m.wf32(vx, lim);
+            }
         }
-    }
-    if left {
-        let v = (g.m.rf32(vx) as f64 - step as f64) as f32;
-        g.m.wf32(vx, v);
-        let lim = -limit;
-        if g.m.rf32(vx) < lim {
-            g.m.wf32(vx, lim);
-        }
-    }
-    if right {
-        let v = (g.m.rf32(vx) as f64 + step as f64) as f32;
-        g.m.wf32(vx, v);
-        if g.m.rf32(vx) > limit {
-            g.m.wf32(vx, limit);
+        if right {
+            let v = (g.m.rf32(vx) as f64 + step as f64) as f32;
+            g.m.wf32(vx, v);
+            if g.m.rf32(vx) > limit {
+                g.m.wf32(vx, limit);
+            }
         }
     }
     // Friction when no key is held on the axis.

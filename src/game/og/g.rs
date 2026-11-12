@@ -71,6 +71,11 @@ pub struct G {
     /// [3]=left [4]=ground weapon [5]=air weapon [6]=cycle). Zero during
     /// film replays, where the film supplies the inputs.
     pub live_inputs: [u8; 14],
+    /// Live play, a remake extension: per player, how far an analog stick
+    /// is pushed along x and y (0..=1) while it alone moves the ship on
+    /// that axis; the ship's top speed on the axis is scaled by it. 1.0
+    /// (always during film replays) is the original's digital movement.
+    pub live_move_scale: [[f32; 2]; 2],
     /// Live play: `U_Sprite_RenderLists_Add` appends here (see view.rs)
     /// while it is `Some`; film replays leave it `None` and draw nothing.
     pub draw_sink: Option<Vec<super::view::DrawItem>>,
@@ -78,7 +83,7 @@ pub struct G {
 
 impl G {
     pub fn new(m: Mem, host: Box<dyn Host>) -> G {
-        G { m, rand_state: 1, host, rand_log: None, live_inputs: [0; 14], draw_sink: None }
+        G { m, rand_state: 1, host, rand_log: None, live_inputs: [0; 14], live_move_scale: [[1.0; 2]; 2], draw_sink: None }
     }
 
     /// Record an oracle trace line (only while tracing).

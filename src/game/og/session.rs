@@ -253,6 +253,12 @@ impl Session {
         self.replay
     }
 
+    /// Scale each player's top speed along x and y for the ticks that
+    /// follow (see [`G::live_move_scale`]). Film replays ignore it.
+    pub fn set_move_scale(&mut self, scale: [[f32; 2]; 2]) {
+        self.g.live_move_scale = scale;
+    }
+
     /// One pass of `G_Game_Play`'s loop. `inputs[player]` is [up, right,
     /// down, left, ground weapon, air weapon, cycle]. Does nothing when the
     /// game is not running.
@@ -261,6 +267,9 @@ impl Session {
             return;
         }
         let g = &mut self.g;
+        if self.replay {
+            g.live_move_scale = [[1.0; 2]; 2];
+        }
         for p in 0..2 {
             for k in 0..7 {
                 g.live_inputs[p * 7 + k] = inputs[p][k] as u8;
