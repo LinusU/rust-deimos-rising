@@ -18,7 +18,8 @@ import os
 import numpy as np
 import torch
 
-from envclient import EnvServer, I_DSCORE, I_END, I_LEVEL, I_LEVELS_DONE, I_PROGRESS, I_TICKS
+from envclient import (EnvServer, I_DSCORE, I_END, I_LEVEL, I_LEVELS_DONE, I_PROGRESS, I_PSTATS, I_TICKS, P_CHARGES,
+                       P_WCHANGES, PSTATS)
 from model import Policy, pack_actions, sample
 from train import Scripted, to_dev
 
@@ -41,6 +42,7 @@ def evaluate(ck_path, games, dev, temperature=1.0, seed=123):
     learner = np.zeros((n, 2), bool)
     learner[:, 1] = True
     learner[~camper, 0] = True
+    support_stats = np.zeros((n, 2))  # charges, weapon changes of player 2
     finished = np.zeros(n, bool)
     res = [None] * n
     score = np.zeros(n)
@@ -58,13 +60,15 @@ def evaluate(ck_path, games, dev, temperature=1.0, seed=123):
         obs = env.step(b.reshape(n, 2), learner)
         info = obs["info"]
         live = ~finished
+        o2 = I_PSTATS + PSTATS
+        support_stats[live] += info[live][:, [o2 + P_CHARGES, o2 + P_WCHANGES]]
         score[live] += info[live, I_DSCORE] + info[live, 8 + I_DSCORE]
         max_level[live] = np.maximum(max_level[live], info[live, I_LEVEL])
         for e in np.nonzero(live & (info[:, I_END] > 0))[0]:
             finished[e] = True
             res[e] = dict(levels=float(info[e, I_LEVELS_DONE]), end=float(info[e, I_END]), score=float(score[e]),
                           minutes=float(info[e, I_TICKS]) / 30 / 60, progress=float(info[e, I_PROGRESS]),
-                          level=float(max_level[e]))
+                          level=float(max_level[e]), charges=float(support_stats[e, 0]), wchanges=float(support_stats[e, 1]))
     env.close()
     out = {}
     for name, sel in (("camper", camper), ("duo", ~camper)):
@@ -76,6 +80,8 @@ def evaluate(ck_path, games, dev, temperature=1.0, seed=123):
             "won": float(np.mean([r["end"] == 2 for r in rs])),
             "score": float(np.mean([r["score"] for r in rs])),
             "minutes": float(np.mean([r["minutes"] for r in rs])),
+            "support_charges_pm": float(np.sum([r["charges"] for r in rs]) / max(1e-6, np.sum([r["minutes"] for r in rs]))),
+            "support_wchanges_pm": float(np.sum([r["wchanges"] for r in rs]) / max(1e-6, np.sum([r["minutes"] for r in rs]))),
         }
     return out
 
@@ -109,7 +115,8 @@ def main():
             f.write(json.dumps(rec) + "\n")
         print(f"{key[0]} T={a.temperature}  camper: levels {r['camper']['levels_mean']:.2f} (max {r['camper']['levels_max']:.0f}) "
               f"won {r['camper']['won']:.2f} score {r['camper']['score']:.0f}  |  duo: levels {r['duo']['levels_mean']:.2f} "
-              f"(max {r['duo']['levels_max']:.0f}) won {r['duo']['won']:.2f} score {r['duo']['score']:.0f}", flush=True)
+              f"(max {r['duo']['levels_max']:.0f}) won {r['duo']['won']:.2f} score {r['duo']['score']:.0f}  |  support charges/min "
+              f"{r['duo']['support_charges_pm']:.2f} weapon changes/min {r['duo']['support_wchanges_pm']:.2f}", flush=True)
 
 
 if __name__ == "__main__":

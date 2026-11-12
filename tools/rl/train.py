@@ -12,7 +12,10 @@ itself keeps the bot from depending on conventions only it would follow
 (Strouse et al. 2021, "Collaborating with Humans without Human Data").
 
 The reward is cooperative: a ship's own terms plus half of its partner's
-(score, lives lost, shield damage), so protecting the partner pays.
+(score, lives lost, shield damage), so protecting the partner pays. Full
+charges get a bonus that fades out (--charge-bonus over --charge-anneal
+updates): a charge costs ~2 s of fire before it pays, so the bot would
+hardly try one otherwise.
 
 Usage: uv run python train.py --run NAME [--envs 256 ...]
 """
@@ -28,7 +31,7 @@ import numpy as np
 import torch
 
 from envclient import (EnvServer, I_DAMAGE, I_DEATHS, I_DSCORE, I_END, I_LEVEL_DONE, I_LEVELS_DONE, I_PROGRESS,
-                       I_START_LEVEL, I_TICKS, S_INGAME, S_LATCH)
+                       I_PSTATS, I_START_LEVEL, I_TICKS, P_CHARGES, PSTATS, S_INGAME, S_LATCH)
 from model import Policy, evaluate, export, masked_logp, pack_actions, sample
 
 MODES = ["self", "past", "camper", "idle", "noisy"]
@@ -56,6 +59,8 @@ def parse():
     p.add_argument("--level", type=float, default=3.0)
     p.add_argument("--jitter", type=float, default=0.01, help="cost of changing direction (or letting go)")
     p.add_argument("--cycle-cost", type=float, default=0.005)
+    p.add_argument("--charge-bonus", type=float, default=0.1, help="per full charge let go, fading out")
+    p.add_argument("--charge-anneal", type=int, default=1500, help="updates over which the charge bonus fades")
     p.add_argument("--ent-heads", default="1,1,1,2", help="entropy weight per head (direction, air, ground, cycle)")
     p.add_argument("--mode-probs", default="0.45,0.2,0.15,0.05,0.15")
     p.add_argument("--snapshot-every", type=int, default=25, help="updates between partner-pool snapshots")
@@ -227,6 +232,7 @@ def main():
             snap_of[:] = rng.integers(0, len(partner_models), size=n)
         model.eval()
         t_env = 0.0
+        cbonus = a.charge_bonus * max(0.0, 1.0 - (update - start_update) / max(1, a.charge_anneal))
         for t in range(T):
             o = to_dev(obs, dev)
             air_mask = o[2][:, S_LATCH] > 0.5
@@ -272,10 +278,12 @@ def main():
 
             # Rewards.
             own = np.zeros((n, 2), np.float32)
+            pst = np.zeros((n, 2, PSTATS), np.float32)
             for p in range(2):
                 b = p * 8
+                pst[:, p] = info[:, I_PSTATS + PSTATS * p:I_PSTATS + PSTATS * (p + 1)]
                 own[:, p] = (a.score * info[:, b + I_DSCORE] - a.death * info[:, b + I_DEATHS]
-                             - a.damage * info[:, b + I_DAMAGE] / 100.0)
+                             - a.damage * info[:, b + I_DAMAGE] / 100.0 + cbonus * pst[:, p, P_CHARGES])
             own += a.level * info[:, [I_LEVEL_DONE]]
             r = own + a.team * own[:, ::-1]
             r = r.reshape(-1)
@@ -387,6 +395,7 @@ def main():
             "ent": [round(float(x), 3) for x in np.mean(stats["ent"], 0)],
             "rew_std": rew_std.std,
             "pool": len(pool),
+            "charge_bonus": round(cbonus, 4),
         }
         for k, v in ep_stats.items():
             rec[k] = round(float(np.mean(v)), 3)
