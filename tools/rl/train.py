@@ -17,9 +17,10 @@ itself keeps the bot from depending on conventions only it would follow
 The reward is cooperative: a ship's own terms plus half of its partner's
 (score, lives lost, shield damage). The support also pays for its
 partner's damage and deaths (--protect) and for bomb volleys that score
-nothing; the lead gets a bonus for volleys that score and for money, and
-a smaller death penalty. These bombing and money terms are not shared
-with the partner. Full charges get a bonus that fades out
+nothing; the lead gets a bonus for volleys that score and for money, pays
+a little for volleys that miss, and has a smaller death penalty. These
+bombing and money terms are not shared with the partner. Full charges
+get a bonus that fades out
 (--charge-bonus over --charge-anneal updates): a charge costs ~2 s of
 fire before it pays, so the bot would hardly try one otherwise. A charge
 let go in a lull (no points by either ship for --quiet-secs) keeps a
@@ -77,6 +78,7 @@ def parse():
     p.add_argument("--protect", type=float, default=0.5, help="support: extra weight of the partner's damage and deaths")
     p.add_argument("--bomb-miss", type=float, default=0.05, help="support: cost of a bomb volley that scores nothing")
     p.add_argument("--bomb-hit", type=float, default=0.15, help="lead: bonus for a bomb volley that scores")
+    p.add_argument("--lead-bomb-miss", type=float, default=0.05, help="lead: cost of a bomb volley that scores nothing")
     p.add_argument("--coin", type=float, default=0.02, help="lead: bonus per unit of money")
     p.add_argument("--lead-death", type=float, default=2.0)
     p.add_argument("--charge-bonus", type=float, default=0.0, help="per full charge let go, fading out")
@@ -355,8 +357,8 @@ def main():
                              - np.where(lead, a.lead_death, a.death) * info[:, b + I_DEATHS]
                              - a.damage * info[:, b + I_DAMAGE] / 100.0
                              + cbonus * pst[:, p, P_CHARGES])
-                shape[:, p] = np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY],
-                                       -a.bomb_miss * pst[:, p, P_MISSES])
+                shape[:, p] = np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY]
+                                       - a.lead_bomb_miss * pst[:, p, P_MISSES], -a.bomb_miss * pst[:, p, P_MISSES])
             quiet = np.where(info[:, I_DSCORE] + info[:, 8 + I_DSCORE] > 0, 0, quiet + 1)
             lull = (quiet >= quiet_steps)[:, None]
             own += np.where(lull, a.quiet_charge, 0.0) * pst[:, :, P_CHARGES] - a.change_cost * pst[:, :, P_WCHANGES]
