@@ -649,14 +649,24 @@ fn slot_move_scale(keys: &ButtonInput<KeyCode>, b: &KeyBindings, pads: &Pads) ->
     out
 }
 
+/// Latches this frame's cycle presses. Runs once per rendered frame, not per
+/// game tick: `just_pressed` lasts a single frame and most frames run no
+/// tick, so latching inside the tick loop dropped about half the presses.
+fn latch_cycle(keys: &ButtonInput<KeyCode>, b: &KeyBindings, pads: &Pads, latch: &mut [bool; 2]) {
+    for p in 0..2 {
+        if keys.just_pressed(b.keys[p][CYCLE]) || pads.just_pressed(p, CYCLE) {
+            latch[p] = true;
+        }
+    }
+}
+
+/// Reads the held buttons for one tick. The latched cycle press goes to the
+/// first tick of a frame only, so the game sees a one-tick pulse.
 fn slot_inputs(keys: &ButtonInput<KeyCode>, b: &KeyBindings, pads: &Pads, latch: &mut [bool; 2], first: bool) -> [[bool; 7]; 2] {
     let mut out = [[false; 7]; 2];
     for p in 0..2 {
         let k = &b.keys[p];
         let held = |a: usize| keys.pressed(k[a]) || pads.pressed(p, a);
-        if keys.just_pressed(k[CYCLE]) || pads.just_pressed(p, CYCLE) {
-            latch[p] = true;
-        }
         out[p] = [held(UP), held(RIGHT), held(DOWN), held(LEFT), held(BOMB), held(FIRE), first && latch[p]];
         if first {
             latch[p] = false;
@@ -692,6 +702,9 @@ pub fn og_system(
     }
     let og = &mut *og;
     if !flow.paused {
+        if og.mode != OgMode::Film && og.script.is_none() {
+            latch_cycle(&keys, &bindings, &pads, &mut og.cycle_latch);
+        }
         let n = if shot.is_some() {
             1
         } else {
