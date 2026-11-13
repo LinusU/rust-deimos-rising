@@ -18,7 +18,8 @@ The reward is cooperative: a ship's own terms plus half of its partner's
 (score, lives lost, shield damage). The support also pays for its
 partner's damage and deaths (--protect) and for bomb volleys that score
 nothing; the lead gets a bonus for volleys that score and for money, and
-a smaller death penalty. Full charges get a bonus that fades out
+a smaller death penalty. These bombing and money terms are not shared
+with the partner. Full charges get a bonus that fades out
 (--charge-bonus over --charge-anneal updates): a charge costs ~2 s of
 fire before it pays, so the bot would hardly try one otherwise. A charge
 let go in a lull (no points by either ship for --quiet-secs) keeps a
@@ -344,6 +345,7 @@ def main():
             own = np.zeros((n, 2), np.float32)
             harm = np.zeros((n, 2), np.float32)
             pst = np.zeros((n, 2, PSTATS), np.float32)
+            shape = np.zeros((n, 2), np.float32)  # bombing and coin terms, not shared with the partner
             for p in range(2):
                 b = p * 8
                 pst[:, p] = info[:, I_PSTATS + PSTATS * p:I_PSTATS + PSTATS * (p + 1)]
@@ -352,14 +354,14 @@ def main():
                 own[:, p] = (a.score * info[:, b + I_DSCORE]
                              - np.where(lead, a.lead_death, a.death) * info[:, b + I_DEATHS]
                              - a.damage * info[:, b + I_DAMAGE] / 100.0
-                             + np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY],
-                                        -a.bomb_miss * pst[:, p, P_MISSES])
                              + cbonus * pst[:, p, P_CHARGES])
+                shape[:, p] = np.where(lead, a.bomb_hit * pst[:, p, P_HITS] + a.coin * pst[:, p, P_MONEY],
+                                       -a.bomb_miss * pst[:, p, P_MISSES])
             quiet = np.where(info[:, I_DSCORE] + info[:, 8 + I_DSCORE] > 0, 0, quiet + 1)
             lull = (quiet >= quiet_steps)[:, None]
             own += np.where(lull, a.quiet_charge, 0.0) * pst[:, :, P_CHARGES] - a.change_cost * pst[:, :, P_WCHANGES]
             own += a.level * info[:, [I_LEVEL_DONE]]
-            r = own + a.team * own[:, ::-1] - np.where(role == 0, a.protect * harm[:, ::-1], 0.0)
+            r = own + shape + a.team * own[:, ::-1] - np.where(role == 0, a.protect * harm[:, ::-1], 0.0)
             r = r.reshape(-1)
             dirs = acts[:, 0].cpu().numpy()
             r -= a.jitter * (dirs != prev_dir)
